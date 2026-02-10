@@ -16,6 +16,7 @@ pub struct GraphInstrumentation {
 mod ast_utils;
 pub mod editor;
 mod formula_analysis;
+pub(crate) mod indirect_folding;
 mod names;
 mod range_deps;
 mod sheets;
@@ -612,6 +613,16 @@ impl DependencyGraph {
 
     pub(crate) fn data_store(&self) -> &DataStore {
         &self.data_store
+    }
+
+    /// Read-only access to the vertex store for topology analysis.
+    pub fn store_ref(&self) -> &VertexStore {
+        &self.store
+    }
+
+    /// Read-only access to the edge storage for topology analysis.
+    pub fn edges_ref(&self) -> &CsrMutableEdges {
+        &self.edges
     }
 
     /// Converts a `CellRef` to a fully qualified A1-style string (e.g., "SheetName!A1").
