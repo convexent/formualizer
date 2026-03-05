@@ -2,8 +2,8 @@
 
 An open‑source, embeddable spreadsheet engine. Formualizer parses, evaluates, and mutates Excel‑style workbooks at speed — with a modern Rust core, Arrow‑powered storage, deferred/demand evaluation, and first‑class Python and WASM bindings.
 
-[![CI](https://github.com/psu3d0/formualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/psu3d0/formualizer/actions/workflows/ci.yml)
-![Coverage](https://raw.githubusercontent.com/psu3d0/formualizer/badges/coverage.svg)
+[![CI](https://github.com/convexent/formualizer/actions/workflows/ci.yml/badge.svg)](https://github.com/convexent/formualizer/actions/workflows/ci.yml)
+[![Release](https://github.com/convexent/formualizer/actions/workflows/release.yml/badge.svg)](https://github.com/convexent/formualizer/actions/workflows/release.yml)
 
 ## Overview
 
@@ -90,11 +90,17 @@ console.log(await wb.evaluateCell('S', 1, 3)) // 12
 
 ## CI & Release
 
-- CI runs Rust tests + clippy + fmt, builds Python wheels via maturin, generates Python stubs, and runs Python tests.
-- WASM workflow builds the package and runs wasm‑pack tests on Node.
-- Publishing is set up for artifacts; configure PyPI/NPM tokens on tag release to publish.
+- **CI** runs Rust tests + clippy + fmt, builds Python wheels via maturin, generates Python stubs, and runs Python tests.
+- **WASM** workflow builds the package and runs wasm‑pack tests on Node.
+- **Release** is triggered by pushing a `v*` tag. It verifies version consistency across manifests, builds Python wheels for all platforms (Linux x86_64/aarch64, macOS x86_64/arm64, Windows), and publishes them as GitHub Release assets.
 
-See `.github/workflows/ci.yml` and `.github/workflows/wasm.yml`.
+### Releasing a new version
+
+1. Update version in `crates/formualizer/Cargo.toml`, `bindings/python/pyproject.toml`, and `bindings/wasm/package.json`
+2. Commit: `git commit -am "Bump to v0.X.Y"`
+3. Tag and push: `git tag v0.X.Y && git push origin main v0.X.Y`
+4. Wait ~10 minutes for the release workflow to build wheels and create the GitHub Release
+5. Downstream consumers (e.g. supermod) update their version pin and `find-links` URL
 
 ## Performance & Excel Parity
 
