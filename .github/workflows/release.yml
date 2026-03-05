@@ -327,7 +327,7 @@ jobs:
 
   build-wheels:
     if: startsWith(github.ref_name, 'v')
-    needs: publish-product-crates
+    needs: verify-product
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -363,7 +363,7 @@ jobs:
 
   build-sdist:
     if: startsWith(github.ref_name, 'v')
-    needs: publish-product-crates
+    needs: verify-product
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -441,9 +441,6 @@ jobs:
   github-release:
     if: startsWith(github.ref_name, 'v')
     needs:
-      - publish-product-crates
-      - publish-pypi
-      - publish-npm
       - build-wheels
       - build-sdist
     runs-on: ubuntu-latest
