@@ -444,13 +444,23 @@ jobs:
       - publish-product-crates
       - publish-pypi
       - publish-npm
+      - build-wheels
+      - build-sdist
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          files: dist/*
