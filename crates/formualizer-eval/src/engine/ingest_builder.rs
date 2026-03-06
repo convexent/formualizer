@@ -21,6 +21,7 @@ struct SheetStage {
     name: String,
     id: SheetId,
     formulas: Vec<(u32, u32, ASTNode, bool)>, // volatile flag
+    has_indirect: bool,
 }
 
 impl SheetStage {
@@ -29,6 +30,7 @@ impl SheetStage {
             name,
             id,
             formulas: Vec::new(),
+            has_indirect: false,
         }
     }
 }
@@ -74,6 +76,10 @@ impl<'g> BulkIngestBuilder<'g> {
             .or_insert_with(|| SheetStage::new(self.g.sheet_name(sheet).to_string(), sheet));
         for (r, c, ast) in formulas {
             let vol = Self::is_ast_volatile(&ast);
+            if !stage.has_indirect {
+                stage.has_indirect =
+                    crate::engine::graph::indirect_folding::contains_indirect(&ast);
+            }
             stage.formulas.push((r, c, ast, vol));
         }
     }
@@ -143,6 +149,18 @@ impl<'g> BulkIngestBuilder<'g> {
             let mut n_range_deps = 0usize;
             if dbg {
                 eprintln!("[fz][ingest] sheet '{}' begin", stage.name);
+            }
+            // 0) INDIRECT constant-folding: rewrite ASTs before dependency planning
+            if stage.has_indirect {
+                for (_r, _c, ast, _vol) in &mut stage.formulas {
+                    self.g.try_fold_indirect(ast, stage.id);
+                }
+                if dbg {
+                    eprintln!(
+                        "[fz][ingest] sheet '{}' INDIRECT folding pass done",
+                        stage.name
+                    );
+                }
             }
             // 1) Build plan for formulas on this sheet
             if !stage.formulas.is_empty() {

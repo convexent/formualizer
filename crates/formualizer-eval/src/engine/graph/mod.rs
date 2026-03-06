@@ -22,6 +22,7 @@ pub struct GraphInstrumentation {
 mod ast_utils;
 pub mod editor;
 mod formula_analysis;
+pub(crate) mod indirect_folding;
 mod names;
 mod range_deps;
 mod sheets;

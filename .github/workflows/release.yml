@@ -4,15 +4,12 @@ on:
   push:
     tags:
       - "v*"
-      - "parse-v*"
-      - "sheetport-spec-v*"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify-product:
-    if: startsWith(github.ref_name, 'v')
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify product tag versions match manifests
+      - name: Verify tag versions match manifests
         shell: bash
         run: |
           set -euo pipefail
@@ -551,3 +548,4 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          files: dist/*

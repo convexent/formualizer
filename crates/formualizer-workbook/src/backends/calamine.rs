@@ -184,6 +184,72 @@ impl CalamineAdapter {
         map_error_code(kind)
     }
 
+    /// Extract defined names from the calamine workbook into NamedRange structs.
+    fn collect_defined_names(workbook: &Xlsx<BufReader<File>>) -> Vec<NamedRange> {
+        let mut ranges = Vec::new();
+        for (name, address) in workbook.defined_names() {
+            let trimmed = address.trim();
+            // Skip empty, multi-area (comma-separated), or error values
+            if trimmed.is_empty() || trimmed.contains(',') || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let reference = match ReferenceType::from_string(trimmed) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let (sheet_name, start_row, start_col, end_row, end_col) = match reference {
+                ReferenceType::Cell {
+                    sheet, row, col, ..
+                } => {
+                    let sheet = match sheet {
+                        Some(s) => s,
+                        None => continue, // skip names without sheet context
+                    };
+                    (sheet, row, col, row, col)
+                }
+                ReferenceType::Range {
+                    sheet,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    ..
+                } => {
+                    let sheet = match sheet {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let sr = match start_row {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let sc = match start_col {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let er = end_row.unwrap_or(sr);
+                    let ec = end_col.unwrap_or(sc);
+                    (sheet, sr, sc, er, ec)
+                }
+                _ => continue, // skip external refs, tables, etc.
+            };
+
+            let addr = match RangeAddress::new(sheet_name, start_row, start_col, end_row, end_col) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            ranges.push(NamedRange {
+                name: name.clone(),
+                scope: NamedRangeScope::Workbook, // calamine doesn't expose scope info
+                address: addr,
+            });
+        }
+        ranges
+    }
+
     fn range_to_cells(
         range: &Range<Data>,
         formulas: Option<&Range<String>>,
