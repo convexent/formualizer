@@ -230,8 +230,10 @@ mod tests {
     /// has an off-by-one due to different epoch constants:
     ///   - eval/serial.rs uses base 1899-12-31
     ///   - common/value.rs uses EXCEL_EPOCH 1899-12-30
-    /// This causes RangeView::get_cell to return Date values shifted by ±1 day when
-    /// reading back DateTime-tagged Arrow cells. See date_parts_native.json DAY tests.
+    ///
+    /// This causes RangeView::get_cell to return Date values shifted by ±1 day
+    /// when reading back DateTime-tagged Arrow cells.
+    /// See date_parts_native.json DAY tests.
     #[test]
     fn date_serial_roundtrip_eval_crate() {
         let d = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();

@@ -1150,6 +1150,31 @@ class Workbook:
         """
     def set_values_batch(self, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, data: list) -> None: ...
     def set_formulas_batch(self, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, formulas: list) -> None: ...
+    def define_named_range(self, name: builtins.str, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, end_row: typing.Optional[builtins.int] = None, end_col: typing.Optional[builtins.int] = None, scope: builtins.str = 'workbook') -> None:
+        r"""
+        Define a named range.
+        
+        Args:
+            name: The name to define (e.g., "SalesData", "TotalRevenue").
+            sheet: The sheet the range resides on.
+            start_row: Start row (1-based).
+            start_col: Start column (1-based).
+            end_row: End row (1-based). Defaults to start_row for a single cell.
+            end_col: End column (1-based). Defaults to start_col for a single cell.
+            scope: "workbook" (default) or "sheet".
+        """
+    def list_defined_names(self) -> typing.Any:
+        r"""
+        List all defined names and their addresses.
+        
+        Returns a list of dicts, each with keys: name, sheet, start_row, start_col, end_row, end_col, scope.
+        """
+    def named_range_address(self, name: builtins.str) -> typing.Optional[RangeAddress]:
+        r"""
+        Resolve a named range to its address.
+        
+        Returns a RangeAddress if the name exists, or None.
+        """
     def __getitem__(self, name: builtins.str) -> Sheet:
         r"""
         Indexing to get a Sheet view (compatibility)
