@@ -201,8 +201,8 @@ impl Function for TextFn {
             _ => 0.0,
         };
         // Strip currency prefix if present
-        let (currency_prefix, fmt_inner) = if fmt.starts_with('$') {
-            ("$", &fmt[1..])
+        let (currency_prefix, fmt_inner) = if let Some(stripped) = fmt.strip_prefix('$') {
+            ("$", stripped)
         } else {
             ("", fmt.as_str())
         };

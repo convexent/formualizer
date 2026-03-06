@@ -954,6 +954,7 @@ impl PyWorkbook {
     ///     end_col: End column (1-based). Defaults to start_col for a single cell.
     ///     scope: "workbook" (default) or "sheet".
     #[pyo3(signature = (name, sheet, start_row, start_col, end_row=None, end_col=None, scope="workbook"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn define_named_range(
         &self,
         name: &str,
