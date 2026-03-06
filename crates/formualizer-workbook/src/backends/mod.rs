@@ -14,4 +14,10 @@ pub use json::JsonAdapter;
 pub mod umya;
 
 #[cfg(feature = "umya")]
-pub use umya::UmyaAdapter;
+pub use umya::{FormulaCacheUpdate, FormulaCacheUpdateRef, UmyaAdapter};
+
+#[cfg(feature = "csv")]
+pub mod csv;
+
+#[cfg(feature = "csv")]
+pub use csv::CsvAdapter;

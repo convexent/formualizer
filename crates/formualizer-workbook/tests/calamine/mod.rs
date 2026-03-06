@@ -3,6 +3,10 @@
 mod common;
 
 #[cfg(feature = "calamine")]
+mod date_arithmetic;
+#[cfg(feature = "calamine")]
+mod dates;
+#[cfg(feature = "calamine")]
 mod deltas;
 #[cfg(feature = "calamine")]
 mod engine;
@@ -16,3 +20,5 @@ mod large;
 mod named_ranges;
 #[cfg(feature = "calamine")]
 mod offsets;
+#[cfg(feature = "calamine")]
+mod row_visibility;

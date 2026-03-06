@@ -1,27 +1,44 @@
-# Formualizer SheetPort Runtime
+![Formualizer banner](https://raw.githubusercontent.com/psu3d0/formualizer/main/assets/formualizer-banner.png)
 
-`formualizer-sheetport` binds SheetPort manifests to concrete workbooks. It
-resolves selectors, enforces schemas, and provides deterministic read/write
-primitives so a workbook plus manifest behaves like a pure function.
+# formualizer-sheetport
 
-## Scope
+![Arrow Powered](https://img.shields.io/badge/Arrow-Powered-0A66C2?logo=apache&logoColor=white)
 
-- Enforce manifest conformance profile (`core-v0` only; `full-v0` rejected).
-- Resolve supported selectors under `core-v0` (`a1`, named ranges, header-based
-  layouts) into workbook coordinates.
-- Coerce values into typed inputs/outputs in accordance with manifest schemas,
-  including default application and constraint checking. Violations surface as
-  `SheetPortError::ConstraintViolation` with detailed paths so callers can
-  highlight the offending cells or fields.
-- Provide ergonomic APIs for loading manifests, reading inputs/outputs, writing
-  inputs, and triggering evaluation through the existing Formualizer engine.
-- Batch execution helpers (`BatchExecutor`) fan scenarios across a shared
-  workbook while reapplying the baseline manifest between runs.
+**SheetPort runtime — treat any spreadsheet as a typed, deterministic function.**
 
-## Non-goals (for now)
+`formualizer-sheetport` binds SheetPort YAML manifests to workbooks, resolves selectors, enforces schemas, and provides deterministic read/write/evaluate primitives. A workbook plus manifest behaves like a pure function: write typed inputs, recalculate, read typed outputs.
 
-- Delta/patch authoring or merge orchestration.
-- Heuristic sheet analysis, agent runtimes, or policy enforcement layers.
+## When to use this crate
 
-These capabilities will layer on top of the runtime crate once the core I/O
-surface is stable.
+Use `formualizer-sheetport` when you want to:
+- Expose a spreadsheet as a typed API with schema validation
+- Run batch scenarios through a financial model
+- Give AI agents safe, typed access to spreadsheet logic
+- Enforce constraints and defaults on spreadsheet inputs/outputs
+
+## How it works
+
+1. **Define a manifest** (YAML) that declares typed input and output ports with locations and schemas.
+2. **Bind** the manifest to a workbook — selectors (`a1`, named ranges, header-based layouts) are resolved to workbook coordinates.
+3. **Write inputs** — values are validated against the manifest schema, with defaults and constraints enforced.
+4. **Evaluate** — the workbook is recalculated deterministically.
+5. **Read outputs** — results are extracted and coerced to the declared output types.
+
+## Features
+
+- **Manifest conformance** — enforces `core-v0` profile with selector validation.
+- **Schema enforcement** — type coercion, defaults, and constraint checking with detailed violation paths.
+- **Deterministic evaluation** — freeze volatile functions, inject timestamps, seed RNG.
+- **Batch execution** — `BatchExecutor` fans scenarios across a shared workbook with baseline reset between runs.
+- **Selector resolution** — `a1` references, named ranges, and header-based table layouts.
+
+## Documentation
+
+- [What Is SheetPort?](https://www.formualizer.dev/docs/sheetport/what-is-sheetport)
+- [Manifest Format (FIO Spec)](https://www.formualizer.dev/docs/sheetport/manifest-format)
+- [SheetPort Quickstart](https://www.formualizer.dev/docs/sheetport/quickstart)
+- [Sessions and Evaluation](https://www.formualizer.dev/docs/sheetport/sessions-and-evaluation)
+
+## License
+
+Dual-licensed under MIT or Apache-2.0, at your option.

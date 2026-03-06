@@ -1,4 +1,8 @@
+![Formualizer banner](https://raw.githubusercontent.com/psu3d0/formualizer/main/assets/formualizer-banner.png)
+
 # sheetport-spec (FIO / SheetPort)
+
+![Arrow Powered](https://img.shields.io/badge/Arrow-Powered-0A66C2?logo=apache&logoColor=white)
 
 `sheetport-spec` defines the Formualizer I/O (FIO) manifest format used by SheetPort.
 
@@ -55,3 +59,8 @@ cargo run -p sheetport-spec --bin fio-lint -- tests/fixtures/supply_planning.yam
 
 - `spec_version` in the manifest is the authoritative spec version.
 - The crate version is expected to track the supported spec version.
+
+## Documentation
+
+- [What Is SheetPort?](https://www.formualizer.dev/docs/sheetport/what-is-sheetport)
+- [Manifest Format (FIO Spec)](https://www.formualizer.dev/docs/sheetport/manifest-format)

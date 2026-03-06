@@ -1,4 +1,5 @@
 use crate::engine::range_view::RangeView;
+use crate::engine::row_visibility::VisibilityMaskMode;
 pub use crate::function::Function;
 use crate::interpreter::Interpreter;
 use crate::reference::CellRef;
@@ -82,10 +83,34 @@ impl Range for Box<dyn Range> {
 
 pub type CowValue<'a> = Cow<'a, LiteralValue>;
 
-#[derive(Debug, Clone)]
+pub trait CustomCallable: Send + Sync {
+    fn arity(&self) -> usize;
+
+    fn invoke<'ctx>(
+        &self,
+        interp: &Interpreter<'ctx>,
+        args: &[LiteralValue],
+    ) -> Result<CalcValue<'ctx>, ExcelError>;
+}
+
+#[derive(Clone)]
 pub enum CalcValue<'a> {
     Scalar(LiteralValue),
     Range(RangeView<'a>),
+    Callable(Arc<dyn CustomCallable>),
+}
+
+impl<'a> std::fmt::Debug for CalcValue<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CalcValue::Scalar(v) => f.debug_tuple("Scalar").field(v).finish(),
+            CalcValue::Range(rv) => {
+                let (r, c) = rv.dims();
+                f.debug_tuple("Range").field(&(r, c)).finish()
+            }
+            CalcValue::Callable(_) => f.write_str("Callable(<opaque>)"),
+        }
+    }
 }
 
 impl<'a> CalcValue<'a> {
@@ -107,6 +132,9 @@ impl<'a> CalcValue<'a> {
                     LiteralValue::Array(data)
                 }
             }
+            CalcValue::Callable(_) => LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+            ),
         }
     }
 
@@ -120,6 +148,13 @@ impl<'a> CalcValue<'a> {
     pub fn as_range(&self) -> Option<&RangeView<'a>> {
         match self {
             CalcValue::Range(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    pub fn as_callable(&self) -> Option<&Arc<dyn CustomCallable>> {
+        match self {
+            CalcValue::Callable(c) => Some(c),
             _ => None,
         }
     }
@@ -162,6 +197,7 @@ impl<'a> PartialEq<LiteralValue> for CalcValue<'a> {
                     rows == 1 && cols == 1 && &rv.get_cell(0, 0) == other
                 }
             },
+            CalcValue::Callable(_) => false,
         }
     }
 }
@@ -237,6 +273,30 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 .interp
                 .evaluate_arena_ast(*id, data_store, sheet_registry),
         }
+    }
+
+    pub fn value_with_env(
+        &self,
+        env: crate::interpreter::LocalEnv,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let scoped = self.interp.with_local_env(env);
+        match &self.expr {
+            ArgumentExpr::Ast(node) => {
+                if let ASTNodeType::Literal(ref v) = node.node_type {
+                    return Ok(crate::traits::CalcValue::Scalar(v.clone()));
+                }
+                scoped.evaluate_ast(node)
+            }
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => scoped.evaluate_arena_ast(*id, data_store, sheet_registry),
+        }
+    }
+
+    pub fn current_env(&self) -> crate::interpreter::LocalEnv {
+        self.interp.local_env().clone()
     }
 
     pub fn inline_array_literal(&self) -> Result<Option<Vec<Vec<LiteralValue>>>, ExcelError> {
@@ -1100,19 +1160,49 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         Err(ExcelError::new(ExcelErrorKind::NImpl))
     }
 
+    /// Resolve a single-cell reference as a scalar value.
+    ///
+    /// Default implementation preserves existing reference semantics by routing through
+    /// `resolve_range_view` and extracting a 1x1 value.
+    fn resolve_cell_reference_value(
+        &self,
+        sheet: Option<&str>,
+        row: u32,
+        col: u32,
+        current_sheet: &str,
+    ) -> Result<LiteralValue, ExcelError> {
+        let reference = ReferenceType::Cell {
+            sheet: sheet.map(str::to_string),
+            row,
+            col,
+            row_abs: true,
+            col_abs: true,
+        };
+        let view = self.resolve_range_view(&reference, current_sheet)?;
+        Ok(view.as_1x1().unwrap_or(LiteralValue::Empty))
+    }
+
     /// Locale provider: invariant by default
     fn locale(&self) -> crate::locale::Locale {
         crate::locale::Locale::invariant()
     }
 
-    /// Timezone provider for date/time functions
-    /// Default: Local (Excel-compatible behavior)
-    /// Functions should use local timezone when this returns Local
-    fn timezone(&self) -> &crate::timezone::TimeZoneSpec {
-        // Static default to avoid allocation
-        static DEFAULT_TZ: std::sync::OnceLock<crate::timezone::TimeZoneSpec> =
+    /// Clock provider for volatile date/time builtins.
+    ///
+    /// Default: SystemClock(Local) for Excel-compatible behavior.
+    fn clock(&self) -> &dyn crate::timezone::ClockProvider {
+        static DEFAULT_CLOCK: std::sync::OnceLock<crate::timezone::SystemClock> =
             std::sync::OnceLock::new();
-        DEFAULT_TZ.get_or_init(crate::timezone::TimeZoneSpec::default)
+        DEFAULT_CLOCK.get_or_init(|| {
+            crate::timezone::SystemClock::new(crate::timezone::TimeZoneSpec::default())
+        })
+    }
+
+    /// Timezone spec for date/time functions.
+    ///
+    /// Default: derived from `clock()`.
+    fn timezone(&self) -> &crate::timezone::TimeZoneSpec {
+        self.clock().timezone()
     }
 
     /// Volatile granularity. Default Always for backwards compatibility.
@@ -1187,6 +1277,16 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: Build row-visibility mask aligned to `view` rows.
+    /// Returns None if not supported by the underlying context.
+    fn build_row_visibility_mask(
+        &self,
+        _view: &RangeView<'_>,
+        _mode: VisibilityMaskMode,
+    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
+        None
+    }
 }
 
 /// Minimal backend capability descriptor for planning and adapters.
@@ -1220,6 +1320,7 @@ pub enum VolatileLevel {
 pub trait FunctionContext<'ctx> {
     fn locale(&self) -> crate::locale::Locale;
     fn timezone(&self) -> &crate::timezone::TimeZoneSpec;
+    fn clock(&self) -> &dyn crate::timezone::ClockProvider;
     fn thread_pool(&self) -> Option<&std::sync::Arc<rayon::ThreadPool>>;
     fn cancellation_token(&self) -> Option<Arc<std::sync::atomic::AtomicBool>>;
     fn chunk_hint(&self) -> Option<usize>;
@@ -1272,6 +1373,15 @@ pub trait FunctionContext<'ctx> {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: Build row-visibility mask aligned to `view` rows.
+    fn get_row_visibility_mask(
+        &self,
+        _view: &RangeView<'_>,
+        _mode: VisibilityMaskMode,
+    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
+        None
+    }
 }
 
 /// Default adapter that wraps an EvaluationContext and provides the narrow FunctionContext.
@@ -1313,6 +1423,10 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     }
     fn timezone(&self) -> &crate::timezone::TimeZoneSpec {
         self.base.timezone()
+    }
+
+    fn clock(&self) -> &dyn crate::timezone::ClockProvider {
+        self.base.clock()
     }
     fn thread_pool(&self) -> Option<&std::sync::Arc<rayon::ThreadPool>> {
         self.base.thread_pool()
@@ -1358,5 +1472,13 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         pred: &crate::args::CriteriaPredicate,
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         self.base.build_criteria_mask(view, col_in_view, pred)
+    }
+
+    fn get_row_visibility_mask(
+        &self,
+        view: &RangeView<'_>,
+        mode: VisibilityMaskMode,
+    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
+        self.base.build_row_visibility_mask(view, mode)
     }
 }

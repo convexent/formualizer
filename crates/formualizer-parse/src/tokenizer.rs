@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::FormulaDialect;
 
-const TOKEN_ENDERS: &str = ",;}) +-*/^&=><%";
+const TOKEN_ENDERS: &str = ",;}) +-*/^&=><%@";
 
 const fn build_token_enders() -> [bool; 256] {
     let mut tbl = [false; 256];
@@ -50,6 +50,69 @@ pub enum Associativity {
 pub struct TokenizerError {
     pub message: String,
     pub pos: usize,
+}
+
+/// Recovering action taken for a malformed span.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecoveryAction {
+    /// Unmatched closer was emitted as a recovery span and scanning continued.
+    SkippedUnmatchedCloser,
+    /// Unterminated string was emitted as one recovery span.
+    UnterminatedString,
+    /// Unmatched opening '[' was emitted as a recovery span.
+    UnmatchedBracket,
+    /// Invalid # literal was emitted as a recovery span.
+    InvalidErrorLiteral,
+    /// Unmatched opener was recorded at end-of-input.
+    UnmatchedOpener,
+}
+
+/// Token-level diagnostic emitted by best-effort tokenization.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenDiagnostic {
+    pub span: TokenSpan,
+    pub message: String,
+    pub recovery: RecoveryAction,
+}
+
+impl TokenDiagnostic {
+    fn new(span: TokenSpan, message: String, recovery: RecoveryAction) -> Self {
+        Self {
+            span,
+            message,
+            recovery,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SpanTokenizerError {
+    kind: SpanTokenizerErrorKind,
+    pos: usize,
+    message: String,
+    span_start: Option<usize>,
+    span_end: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpanTokenizerErrorKind {
+    NoMatchingOpener,
+    UnmatchedOpening,
+    UnterminatedString,
+    UnmatchedBracket,
+    MismatchedPair,
+    InvalidErrorLiteral,
+}
+
+impl From<SpanTokenizerError> for TokenizerError {
+    fn from(value: SpanTokenizerError) -> Self {
+        TokenizerError {
+            message: value.message,
+            pos: value.pos,
+        }
+    }
 }
 
 impl fmt::Display for TokenizerError {
@@ -359,6 +422,7 @@ impl Token {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TokenSpan {
     pub token_type: TokenType,
@@ -383,6 +447,7 @@ pub struct TokenStream {
     source: Arc<str>,
     pub spans: Vec<TokenSpan>,
     dialect: FormulaDialect,
+    diagnostics: Vec<TokenDiagnostic>,
 }
 
 impl TokenStream {
@@ -400,7 +465,51 @@ impl TokenStream {
             source,
             spans,
             dialect,
+            diagnostics: Vec::new(),
         })
+    }
+
+    pub fn new_best_effort(formula: &str) -> Self {
+        Self::new_best_effort_with_dialect(formula, FormulaDialect::Excel)
+    }
+
+    pub fn new_best_effort_with_dialect(formula: &str, dialect: FormulaDialect) -> Self {
+        let source: Arc<str> = Arc::from(formula);
+        let mut tokenizer = SpanTokenizer::new(source.as_ref(), dialect);
+        let spans = tokenizer.parse_best_effort();
+        let diagnostics = tokenizer.diagnostics;
+        TokenStream {
+            source,
+            spans,
+            dialect,
+            diagnostics,
+        }
+    }
+
+    pub fn diagnostics(&self) -> Vec<TokenDiagnostic> {
+        self.diagnostics.clone()
+    }
+
+    pub fn diagnostics_ref(&self) -> &[TokenDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.diagnostics.is_empty()
+    }
+
+    pub fn invalid_spans_iter(&self) -> impl Iterator<Item = &TokenSpan> {
+        self.spans.iter().filter(|span| {
+            self.diagnostics.iter().any(|diag| {
+                diag.span.start == span.start
+                    && diag.span.end == span.end
+                    && diag.span.token_type == span.token_type
+            })
+        })
+    }
+
+    pub fn invalid_spans(&self) -> Vec<&TokenSpan> {
+        self.invalid_spans_iter().collect()
     }
 
     pub fn source(&self) -> &str {
@@ -439,6 +548,10 @@ impl TokenStream {
             .collect()
     }
 
+    /// Reconstruct the tokenized payload from spans.
+    ///
+    /// For formulas that start with '=', this intentionally omits the leading
+    /// '=' to preserve historical `TokenStream::render()` behavior.
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(self.source.len());
         for span in &self.spans {
@@ -447,6 +560,15 @@ impl TokenStream {
             }
         }
         out
+    }
+
+    /// Reconstruct the full input formula, including a leading '=' when present.
+    pub fn render_formula(&self) -> String {
+        if self.source.as_bytes().first() == Some(&b'=') {
+            format!("={}", self.render())
+        } else {
+            self.render()
+        }
     }
 }
 
@@ -481,6 +603,7 @@ struct SpanTokenizer<'a> {
     token_start: usize,
     token_end: usize,
     dialect: FormulaDialect,
+    diagnostics: Vec<TokenDiagnostic>,
 }
 
 impl<'a> SpanTokenizer<'a> {
@@ -493,6 +616,7 @@ impl<'a> SpanTokenizer<'a> {
             token_start: 0,
             token_end: 0,
             dialect,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -590,6 +714,15 @@ impl<'a> SpanTokenizer<'a> {
     }
 
     fn parse(&mut self) -> Result<(), TokenizerError> {
+        self.parse_with_recovery(false).map_err(Into::into)
+    }
+
+    pub(crate) fn parse_best_effort(&mut self) -> Vec<TokenSpan> {
+        let _ = self.parse_with_recovery(true);
+        self.spans.clone()
+    }
+
+    fn parse_with_recovery(&mut self, best_effort: bool) -> Result<(), SpanTokenizerError> {
         if self.formula.is_empty() {
             return Ok(());
         }
@@ -619,23 +752,32 @@ impl<'a> SpanTokenizer<'a> {
                 self.start_token();
             }
 
-            match curr_byte {
-                b'"' | b'\'' => self.parse_string()?,
-                b'[' => self.parse_brackets()?,
-                b'#' => self.parse_error()?,
-                b' ' | b'\n' => self.parse_whitespace()?,
-                b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'>' | b'<' | b'%' => {
-                    self.parse_operator()?
+            let parse_result = match curr_byte {
+                b'"' | b'\'' => self.parse_string(),
+                b'[' => self.parse_brackets(),
+                b'#' => self.parse_error(),
+                b' ' | b'\n' => self.parse_whitespace(),
+                b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'>' | b'<' | b'%' | b'@' => {
+                    self.parse_operator()
                 }
-                b'{' | b'(' => self.parse_opener()?,
-                b')' | b'}' => self.parse_closer()?,
-                b';' | b',' => self.parse_separator()?,
+                b'{' | b'(' => self.parse_opener(),
+                b')' | b'}' => self.parse_closer(),
+                b';' | b',' => self.parse_separator(),
                 _ => {
                     if !self.has_token() {
                         self.start_token();
                     }
                     self.offset += 1;
                     self.extend_token();
+                    Ok(())
+                }
+            };
+
+            if let Err(err) = parse_result {
+                if best_effort {
+                    self.recover_from_error(err);
+                } else {
+                    return Err(err);
                 }
             }
         }
@@ -645,16 +787,132 @@ impl<'a> SpanTokenizer<'a> {
         }
 
         if !self.token_stack.is_empty() {
-            return Err(TokenizerError {
-                message: "Unmatched opening parenthesis or bracket".to_string(),
-                pos: self.offset,
-            });
+            if best_effort {
+                while let Some(open_token) = self.token_stack.pop() {
+                    if let Some(span) = self.spans.iter().find(|span| {
+                        span.start == open_token.start
+                            && span.end == open_token.end
+                            && span.token_type == open_token.token_type
+                            && span.subtype == open_token.subtype
+                    }) {
+                        self.diagnostics.push(TokenDiagnostic::new(
+                            *span,
+                            "Unmatched opening parenthesis or bracket".to_string(),
+                            RecoveryAction::UnmatchedOpener,
+                        ));
+                    }
+                }
+            } else {
+                return Err(SpanTokenizerError {
+                    kind: SpanTokenizerErrorKind::UnmatchedOpening,
+                    pos: self.offset,
+                    message: "Unmatched opening parenthesis or bracket".to_string(),
+                    span_start: None,
+                    span_end: None,
+                });
+            }
         }
 
         Ok(())
     }
 
-    fn parse_string(&mut self) -> Result<(), TokenizerError> {
+    fn recover_from_error(&mut self, error: SpanTokenizerError) {
+        match error.kind {
+            SpanTokenizerErrorKind::NoMatchingOpener => {
+                let span = TokenSpan {
+                    token_type: TokenType::Operand,
+                    subtype: TokenSubType::None,
+                    start: error.pos,
+                    end: error.pos + 1,
+                };
+                self.push_span(TokenType::Operand, TokenSubType::None, span.start, span.end);
+                self.offset = span.end;
+                self.start_token();
+                self.diagnostics.push(TokenDiagnostic::new(
+                    span,
+                    format!("No matching opener for closer at position {}", error.pos),
+                    RecoveryAction::SkippedUnmatchedCloser,
+                ));
+            }
+            SpanTokenizerErrorKind::UnmatchedOpening => {
+                debug_assert!(
+                    false,
+                    "UnmatchedOpening is handled at end-of-input and should not be routed through recover_from_error"
+                );
+            }
+            SpanTokenizerErrorKind::UnterminatedString => {
+                let start = error.span_start.unwrap_or(error.pos);
+                let span = TokenSpan {
+                    token_type: TokenType::Operand,
+                    subtype: TokenSubType::None,
+                    start,
+                    end: self.formula.len(),
+                };
+                self.push_span(TokenType::Operand, TokenSubType::None, span.start, span.end);
+                self.offset = span.end;
+                self.start_token();
+                self.diagnostics.push(TokenDiagnostic::new(
+                    span,
+                    "Reached end of formula while parsing string".to_string(),
+                    RecoveryAction::UnterminatedString,
+                ));
+            }
+            SpanTokenizerErrorKind::UnmatchedBracket => {
+                let start = error.span_start.unwrap_or(error.pos);
+                let end = error.span_end.unwrap_or(self.formula.len());
+                let span = TokenSpan {
+                    token_type: TokenType::Operand,
+                    subtype: TokenSubType::None,
+                    start,
+                    end,
+                };
+                self.push_span(TokenType::Operand, TokenSubType::None, span.start, span.end);
+                self.offset = span.end;
+                self.start_token();
+                self.diagnostics.push(TokenDiagnostic::new(
+                    span,
+                    "Encountered unmatched '['".to_string(),
+                    RecoveryAction::UnmatchedBracket,
+                ));
+            }
+            SpanTokenizerErrorKind::MismatchedPair => {
+                let span = TokenSpan {
+                    token_type: TokenType::Operand,
+                    subtype: TokenSubType::None,
+                    start: error.pos,
+                    end: error.pos + 1,
+                };
+                self.push_span(TokenType::Operand, TokenSubType::None, span.start, span.end);
+                self.offset = span.end;
+                self.start_token();
+                self.diagnostics.push(TokenDiagnostic::new(
+                    span,
+                    "Mismatched ( and { pair".to_string(),
+                    RecoveryAction::SkippedUnmatchedCloser,
+                ));
+            }
+            SpanTokenizerErrorKind::InvalidErrorLiteral => {
+                let start = error.span_start.unwrap_or(error.pos);
+                let end = error.span_end.unwrap_or(error.pos + 1);
+                let span = TokenSpan {
+                    token_type: TokenType::Operand,
+                    subtype: TokenSubType::None,
+                    start,
+                    end,
+                };
+                self.push_span(TokenType::Operand, TokenSubType::None, span.start, span.end);
+                self.offset = span.end;
+                self.start_token();
+                self.diagnostics.push(TokenDiagnostic::new(
+                    span,
+                    "Invalid error code".to_string(),
+                    RecoveryAction::InvalidErrorLiteral,
+                ));
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<(), SpanTokenizerError> {
         let delim = self.formula.as_bytes()[self.offset];
         assert!(delim == b'"' || delim == b'\'');
 
@@ -701,19 +959,23 @@ impl<'a> SpanTokenizer<'a> {
             }
         }
 
-        Err(TokenizerError {
-            message: "Reached end of formula while parsing string".to_string(),
+        Err(SpanTokenizerError {
+            kind: SpanTokenizerErrorKind::UnterminatedString,
             pos: self.offset,
+            message: "Reached end of formula while parsing string".to_string(),
+            span_start: Some(string_start),
+            span_end: Some(self.formula.len()),
         })
     }
 
-    fn parse_brackets(&mut self) -> Result<(), TokenizerError> {
+    fn parse_brackets(&mut self) -> Result<(), SpanTokenizerError> {
         assert_eq!(self.formula.as_bytes()[self.offset], b'[');
 
         if !self.has_token() {
             self.start_token();
         }
 
+        let bracket_start = self.offset;
         let mut open_count = 1;
         self.offset += 1;
 
@@ -733,13 +995,16 @@ impl<'a> SpanTokenizer<'a> {
             self.offset += 1;
         }
 
-        Err(TokenizerError {
-            message: "Encountered unmatched '['".to_string(),
+        Err(SpanTokenizerError {
+            kind: SpanTokenizerErrorKind::UnmatchedBracket,
             pos: self.offset,
+            message: "Encountered unmatched '['".to_string(),
+            span_start: Some(bracket_start),
+            span_end: Some(self.formula.len()),
         })
     }
 
-    fn parse_error(&mut self) -> Result<(), TokenizerError> {
+    fn parse_error(&mut self) -> Result<(), SpanTokenizerError> {
         if self.has_token()
             && self.token_end > 0
             && self.formula.as_bytes()[self.token_end - 1] != b'!'
@@ -758,7 +1023,7 @@ impl<'a> SpanTokenizer<'a> {
             let err_bytes = err_code.as_bytes();
             if self.offset + err_bytes.len() <= self.formula.len() {
                 let slice = &self.formula.as_bytes()[self.offset..self.offset + err_bytes.len()];
-                if slice == err_bytes {
+                if slice.eq_ignore_ascii_case(err_bytes) {
                     self.push_span(
                         TokenType::Operand,
                         TokenSubType::Error,
@@ -772,13 +1037,33 @@ impl<'a> SpanTokenizer<'a> {
             }
         }
 
-        Err(TokenizerError {
-            message: format!("Invalid error code at position {}", self.offset),
+        let mut end = self.offset + 1;
+        while end < self.formula.len() {
+            let ch = self.formula.as_bytes()[end];
+            if is_token_ender(ch)
+                || ch == b' '
+                || ch == b'\n'
+                || ch == b'('
+                || ch == b'{'
+                || ch == b'['
+                || ch == b'"'
+                || ch == b'\''
+            {
+                break;
+            }
+            end += 1;
+        }
+
+        Err(SpanTokenizerError {
+            kind: SpanTokenizerErrorKind::InvalidErrorLiteral,
             pos: self.offset,
+            message: format!("Invalid error code at position {}", self.offset),
+            span_start: Some(error_start),
+            span_end: Some(end),
         })
     }
 
-    fn parse_whitespace(&mut self) -> Result<(), TokenizerError> {
+    fn parse_whitespace(&mut self) -> Result<(), SpanTokenizerError> {
         self.save_token();
 
         let ws_start = self.offset;
@@ -806,7 +1091,7 @@ impl<'a> SpanTokenizer<'a> {
             .find(|t| t.token_type != TokenType::Whitespace)
     }
 
-    fn parse_operator(&mut self) -> Result<(), TokenizerError> {
+    fn parse_operator(&mut self) -> Result<(), SpanTokenizerError> {
         self.save_token();
 
         if self.offset + 1 < self.formula.len() {
@@ -826,6 +1111,7 @@ impl<'a> SpanTokenizer<'a> {
 
         let curr_byte = self.formula.as_bytes()[self.offset];
         let token_type = match curr_byte {
+            b'@' => TokenType::OpPrefix,
             b'%' => TokenType::OpPostfix,
             b'+' | b'-' => {
                 if self.spans.is_empty() {
@@ -855,7 +1141,7 @@ impl<'a> SpanTokenizer<'a> {
         Ok(())
     }
 
-    fn parse_opener(&mut self) -> Result<(), TokenizerError> {
+    fn parse_opener(&mut self) -> Result<(), SpanTokenizerError> {
         let curr_byte = self.formula.as_bytes()[self.offset];
         assert!(curr_byte == b'(' || curr_byte == b'{');
 
@@ -893,25 +1179,29 @@ impl<'a> SpanTokenizer<'a> {
         Ok(())
     }
 
-    fn parse_closer(&mut self) -> Result<(), TokenizerError> {
+    fn parse_closer(&mut self) -> Result<(), SpanTokenizerError> {
         self.save_token();
 
         let curr_byte = self.formula.as_bytes()[self.offset];
         assert!(curr_byte == b')' || curr_byte == b'}');
 
-        if let Some(open_token) = self.token_stack.pop() {
+        if let Some(open_token) = self.token_stack.last().copied() {
             let expected = if open_token.token_type == TokenType::Array {
                 b'}'
             } else {
                 b')'
             };
             if curr_byte != expected {
-                return Err(TokenizerError {
-                    message: "Mismatched ( and { pair".to_string(),
+                return Err(SpanTokenizerError {
+                    kind: SpanTokenizerErrorKind::MismatchedPair,
                     pos: self.offset,
+                    message: "Mismatched ( and { pair".to_string(),
+                    span_start: Some(self.offset),
+                    span_end: Some(self.offset + 1),
                 });
             }
 
+            self.token_stack.pop();
             self.push_span(
                 open_token.token_type,
                 TokenSubType::Close,
@@ -919,9 +1209,12 @@ impl<'a> SpanTokenizer<'a> {
                 self.offset + 1,
             );
         } else {
-            return Err(TokenizerError {
-                message: format!("No matching opener for closer at position {}", self.offset),
+            return Err(SpanTokenizerError {
+                kind: SpanTokenizerErrorKind::NoMatchingOpener,
                 pos: self.offset,
+                message: format!("No matching opener for closer at position {}", self.offset),
+                span_start: Some(self.offset),
+                span_end: Some(self.offset + 1),
             });
         }
 
@@ -930,7 +1223,7 @@ impl<'a> SpanTokenizer<'a> {
         Ok(())
     }
 
-    fn parse_separator(&mut self) -> Result<(), TokenizerError> {
+    fn parse_separator(&mut self) -> Result<(), SpanTokenizerError> {
         self.save_token();
 
         let curr_byte = self.formula.as_bytes()[self.offset];
@@ -987,6 +1280,17 @@ impl Tokenizer {
     /// Create a new tokenizer and immediately parse the formula.
     pub fn new(formula: &str) -> Result<Self, TokenizerError> {
         Self::new_with_dialect(formula, FormulaDialect::Excel)
+    }
+
+    /// Create a new tokenizer with best-effort parsing (never fails).
+    pub fn new_best_effort(formula: &str) -> Self {
+        Self::new_best_effort_with_dialect(formula, FormulaDialect::Excel)
+    }
+
+    /// Create a new tokenizer with best-effort parsing for the specified dialect.
+    pub fn new_best_effort_with_dialect(formula: &str, dialect: FormulaDialect) -> Self {
+        let stream = TokenStream::new_best_effort_with_dialect(formula, dialect);
+        Self::from_token_stream(&stream)
     }
 
     /// Create a new tokenizer for the specified formula dialect.
@@ -1086,7 +1390,7 @@ impl Tokenizer {
                 b'#' => self.parse_error()?,
                 b' ' | b'\n' => self.parse_whitespace()?,
                 // operator characters
-                b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'>' | b'<' | b'%' => {
+                b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'>' | b'<' | b'%' | b'@' => {
                     self.parse_operator()?
                 }
                 b'{' | b'(' => self.parse_opener()?,
@@ -1292,7 +1596,7 @@ impl Tokenizer {
             let err_bytes = err_code.as_bytes();
             if self.offset + err_bytes.len() <= self.formula.len() {
                 let slice = &self.formula.as_bytes()[self.offset..self.offset + err_bytes.len()];
-                if slice == err_bytes {
+                if slice.eq_ignore_ascii_case(err_bytes) {
                     let token = Token::make_operand_from_slice(
                         &self.formula,
                         error_start,
@@ -1358,6 +1662,7 @@ impl Tokenizer {
 
         let curr_byte = self.formula.as_bytes()[self.offset];
         let token_type = match curr_byte {
+            b'@' => TokenType::OpPrefix,
             b'%' => TokenType::OpPostfix,
             b'+' | b'-' => {
                 // Determine if prefix or infix

@@ -5,13 +5,776 @@ use formualizer_common::{
     LiteralValue, RangeAddress,
     error::{ExcelError, ExcelErrorKind},
 };
+use formualizer_eval::engine::RowVisibilitySource;
 use formualizer_eval::engine::eval::EvalPlan;
 use formualizer_eval::engine::named_range::{NameScope, NamedDefinition};
-use std::collections::BTreeMap;
+use parking_lot::RwLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+#[cfg(feature = "wasm_plugins")]
+use wasmparser::{Parser, Payload};
+
+#[cfg(all(feature = "wasm_runtime_wasmtime", not(target_arch = "wasm32")))]
+use crate::wasm_runtime_wasmtime::new_wasmtime_runtime;
+
+fn normalize_custom_fn_name(name: &str) -> Result<String, ExcelError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(
+            ExcelError::new(ExcelErrorKind::Name).with_message("Function name cannot be empty")
+        );
+    }
+    Ok(trimmed.to_ascii_uppercase())
+}
+
+pub const WASM_MANIFEST_SCHEMA_V1: &str = "formualizer.udf.module/v1";
+pub const WASM_MANIFEST_SECTION_V1: &str = "formualizer.udf.manifest.v1";
+pub const WASM_ABI_VERSION_V1: u32 = 1;
+pub const WASM_CODEC_VERSION_V1: u32 = 1;
+
+fn normalize_wasm_module_id(module_id: &str) -> Result<String, ExcelError> {
+    let trimmed = module_id.trim();
+    if trimmed.is_empty() {
+        return Err(
+            ExcelError::new(ExcelErrorKind::Value).with_message("WASM module_id cannot be empty")
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_wasm_file_bytes(path: &std::path::Path) -> Result<Vec<u8>, ExcelError> {
+    std::fs::read(path).map_err(|err| {
+        ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "Failed to read WASM module file {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_wasm_files_in_dir(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, ExcelError> {
+    if !dir.is_dir() {
+        return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "WASM module directory does not exist or is not a directory: {}",
+            dir.display()
+        )));
+    }
+
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|err| {
+        ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "Failed to read WASM module directory {}: {err}",
+            dir.display()
+        ))
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "Failed to iterate WASM module directory {}: {err}",
+                dir.display()
+            ))
+        })?;
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+
+        if ext.eq_ignore_ascii_case("wasm") {
+            files.push(path);
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn stable_fn_salt(name: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for b in name.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn validate_custom_arity(name: &str, options: &CustomFnOptions) -> Result<(), ExcelError> {
+    if let Some(max_args) = options.max_args
+        && max_args < options.min_args
+    {
+        return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "Invalid arity for {name}: max_args ({max_args}) < min_args ({})",
+            options.min_args
+        )));
+    }
+    Ok(())
+}
+
+fn validate_wasm_spec(spec: &WasmFunctionSpec) -> Result<(), ExcelError> {
+    if spec.module_id.trim().is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("WASM function module_id cannot be empty"));
+    }
+    if spec.export_name.trim().is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("WASM function export_name cannot be empty"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFnOptions {
+    pub min_args: usize,
+    pub max_args: Option<usize>,
+    pub volatile: bool,
+    pub thread_safe: bool,
+    pub deterministic: bool,
+    pub allow_override_builtin: bool,
+}
+
+impl Default for CustomFnOptions {
+    fn default() -> Self {
+        Self {
+            min_args: 0,
+            max_args: None,
+            volatile: false,
+            thread_safe: false,
+            deterministic: true,
+            allow_override_builtin: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFnInfo {
+    pub name: String,
+    pub options: CustomFnOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmFunctionSpec {
+    pub module_id: String,
+    pub export_name: String,
+    pub codec_version: u32,
+    pub runtime_hint: Option<WasmRuntimeHint>,
+    pub reserved: BTreeMap<String, String>,
+}
+
+impl WasmFunctionSpec {
+    pub fn new(
+        module_id: impl Into<String>,
+        export_name: impl Into<String>,
+        codec_version: u32,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            export_name: export_name.into(),
+            codec_version,
+            runtime_hint: None,
+            reserved: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasmRuntimeHint {
+    pub fuel_limit: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmModuleInfo {
+    pub module_id: String,
+    pub version: String,
+    pub abi_version: u32,
+    pub codec_version: u32,
+    pub function_count: usize,
+    pub module_size_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmModuleManifest {
+    pub schema: String,
+    pub module: WasmManifestModule,
+    pub functions: Vec<WasmManifestFunction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmManifestModule {
+    pub id: String,
+    pub version: String,
+    pub abi: u32,
+    pub codec: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmManifestFunction {
+    pub id: u32,
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(rename = "export")]
+    pub export_name: String,
+    pub min_args: usize,
+    #[serde(default)]
+    pub max_args: Option<usize>,
+    #[serde(default)]
+    pub volatile: bool,
+    #[serde(default = "default_true")]
+    pub deterministic: bool,
+    #[serde(default)]
+    pub thread_safe: bool,
+    #[serde(default)]
+    pub params: Vec<WasmManifestParam>,
+    #[serde(default)]
+    pub returns: Option<WasmManifestReturn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmManifestParam {
+    pub name: String,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasmManifestReturn {
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub trait WasmUdfRuntime: Send + Sync {
+    fn can_bind_functions(&self) -> bool {
+        true
+    }
+
+    fn validate_module(
+        &self,
+        _module_id: &str,
+        _wasm_bytes: &[u8],
+        _manifest: &WasmModuleManifest,
+    ) -> Result<(), ExcelError> {
+        Ok(())
+    }
+
+    fn invoke(
+        &self,
+        module_id: &str,
+        export_name: &str,
+        function_name: &str,
+        codec_version: u32,
+        args: &[LiteralValue],
+        runtime_hint: Option<&WasmRuntimeHint>,
+    ) -> Result<LiteralValue, ExcelError>;
+}
+
+#[cfg(feature = "wasm_plugins")]
+#[derive(Default)]
+struct PendingWasmRuntime;
+
+#[cfg(feature = "wasm_plugins")]
+impl WasmUdfRuntime for PendingWasmRuntime {
+    fn can_bind_functions(&self) -> bool {
+        false
+    }
+
+    fn invoke(
+        &self,
+        module_id: &str,
+        export_name: &str,
+        function_name: &str,
+        codec_version: u32,
+        _args: &[LiteralValue],
+        _runtime_hint: Option<&WasmRuntimeHint>,
+    ) -> Result<LiteralValue, ExcelError> {
+        Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+            "WASM plugin runtime integration is pending for {function_name} (module_id={module_id}, export_name={export_name}, codec_version={codec_version})"
+        )))
+    }
+}
+
+pub fn validate_wasm_manifest(manifest: &WasmModuleManifest) -> Result<(), ExcelError> {
+    if manifest.schema != WASM_MANIFEST_SCHEMA_V1 {
+        return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "Unsupported WASM manifest schema: {}",
+            manifest.schema
+        )));
+    }
+
+    let module_id = normalize_wasm_module_id(&manifest.module.id)?;
+    if module_id != manifest.module.id {
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("WASM manifest module.id must not have leading/trailing whitespace"));
+    }
+
+    if manifest.module.version.trim().is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("WASM manifest module.version cannot be empty"));
+    }
+
+    if manifest.module.abi != WASM_ABI_VERSION_V1 {
+        return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+            "Unsupported WASM ABI version {} (expected {})",
+            manifest.module.abi, WASM_ABI_VERSION_V1
+        )));
+    }
+
+    if manifest.module.codec != WASM_CODEC_VERSION_V1 {
+        return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+            "Unsupported WASM codec version {} (expected {})",
+            manifest.module.codec, WASM_CODEC_VERSION_V1
+        )));
+    }
+
+    if manifest.functions.is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("WASM manifest must define at least one function"));
+    }
+
+    let mut function_ids = BTreeSet::new();
+    let mut export_names = BTreeSet::new();
+    let mut names_and_aliases = BTreeSet::new();
+
+    for function in &manifest.functions {
+        if !function_ids.insert(function.id) {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "Duplicate WASM manifest function id {}",
+                function.id
+            )));
+        }
+
+        if function.export_name.trim().is_empty() {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "WASM function {} has empty export name",
+                function.id
+            )));
+        }
+
+        if !export_names.insert(function.export_name.clone()) {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "Duplicate WASM export name: {}",
+                function.export_name
+            )));
+        }
+
+        let canonical_name = normalize_custom_fn_name(&function.name)?;
+        if !names_and_aliases.insert(canonical_name.clone()) {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "Duplicate WASM function name or alias: {}",
+                function.name
+            )));
+        }
+
+        if let Some(max_args) = function.max_args
+            && max_args < function.min_args
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "Invalid WASM function arity for {}: max_args ({max_args}) < min_args ({})",
+                function.name, function.min_args
+            )));
+        }
+
+        for alias in &function.aliases {
+            let canonical_alias = normalize_custom_fn_name(alias)?;
+            if !names_and_aliases.insert(canonical_alias.clone()) {
+                return Err(ExcelError::new(ExcelErrorKind::Value)
+                    .with_message(format!("Duplicate WASM function alias: {alias}")));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "wasm_plugins")]
+pub fn parse_wasm_manifest_json(bytes: &[u8]) -> Result<WasmModuleManifest, ExcelError> {
+    let manifest = serde_json::from_slice::<WasmModuleManifest>(bytes).map_err(|err| {
+        ExcelError::new(ExcelErrorKind::Value)
+            .with_message(format!("Failed to parse WASM manifest JSON: {err}"))
+    })?;
+    validate_wasm_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+#[cfg(feature = "wasm_plugins")]
+pub fn extract_wasm_manifest_json_from_module(wasm_bytes: &[u8]) -> Result<Vec<u8>, ExcelError> {
+    let mut found: Option<Vec<u8>> = None;
+
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload.map_err(|err| {
+            ExcelError::new(ExcelErrorKind::Value)
+                .with_message(format!("Invalid WASM module bytes: {err}"))
+        })?;
+
+        if let Payload::CustomSection(section) = payload
+            && section.name() == WASM_MANIFEST_SECTION_V1
+        {
+            if found.is_some() {
+                return Err(ExcelError::new(ExcelErrorKind::Value).with_message(
+                    "WASM module has multiple formualizer manifest custom sections",
+                ));
+            }
+            found = Some(section.data().to_vec());
+        }
+    }
+
+    found.ok_or_else(|| {
+        ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+            "WASM module is missing required custom section: {WASM_MANIFEST_SECTION_V1}"
+        ))
+    })
+}
+
+#[cfg(feature = "wasm_plugins")]
+fn wasm_module_info_from_manifest(
+    module_id: String,
+    module_size_bytes: usize,
+    manifest: &WasmModuleManifest,
+) -> WasmModuleInfo {
+    WasmModuleInfo {
+        module_id,
+        version: manifest.module.version.clone(),
+        abi_version: manifest.module.abi,
+        codec_version: manifest.module.codec,
+        function_count: manifest.functions.len(),
+        module_size_bytes,
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredWasmModule {
+    info: WasmModuleInfo,
+    #[allow(dead_code)]
+    manifest: WasmModuleManifest,
+    wasm_bytes: Arc<Vec<u8>>,
+}
+
+#[cfg_attr(not(feature = "wasm_plugins"), derive(Default))]
+struct WasmPluginManager {
+    modules: BTreeMap<String, RegisteredWasmModule>,
+    #[cfg(feature = "wasm_plugins")]
+    runtime: Arc<dyn WasmUdfRuntime>,
+}
+
+#[cfg(feature = "wasm_plugins")]
+impl Default for WasmPluginManager {
+    fn default() -> Self {
+        Self {
+            modules: BTreeMap::new(),
+            runtime: Arc::new(PendingWasmRuntime),
+        }
+    }
+}
+
+impl WasmPluginManager {
+    #[cfg(feature = "wasm_plugins")]
+    fn set_runtime(&mut self, runtime: Arc<dyn WasmUdfRuntime>) {
+        self.runtime = runtime;
+    }
+
+    #[cfg(feature = "wasm_plugins")]
+    fn runtime(&self) -> Arc<dyn WasmUdfRuntime> {
+        self.runtime.clone()
+    }
+    fn list_module_infos(&self) -> Vec<WasmModuleInfo> {
+        self.modules
+            .values()
+            .map(|registered| {
+                let mut info = registered.info.clone();
+                info.module_size_bytes = registered.wasm_bytes.len();
+                info
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "wasm_plugins")]
+    fn get(&self, module_id: &str) -> Option<&RegisteredWasmModule> {
+        self.modules.get(module_id)
+    }
+
+    #[cfg(feature = "wasm_plugins")]
+    fn unregister_module(&mut self, module_id: &str) -> Result<(), ExcelError> {
+        if self.modules.remove(module_id).is_none() {
+            return Err(ExcelError::new(ExcelErrorKind::Name)
+                .with_message(format!("WASM module {module_id} is not registered")));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wasm_plugins")]
+    fn register_module_bytes(
+        &mut self,
+        requested_module_id: &str,
+        wasm_bytes: &[u8],
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        if self.modules.contains_key(requested_module_id) {
+            return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                "WASM module {requested_module_id} is already registered"
+            )));
+        }
+
+        let manifest_json = extract_wasm_manifest_json_from_module(wasm_bytes)?;
+        let manifest = parse_wasm_manifest_json(&manifest_json)?;
+
+        if manifest.module.id != requested_module_id {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "WASM manifest module id mismatch: requested {requested_module_id}, manifest {}",
+                manifest.module.id
+            )));
+        }
+
+        self.runtime
+            .validate_module(requested_module_id, wasm_bytes, &manifest)?;
+
+        let info = wasm_module_info_from_manifest(
+            requested_module_id.to_string(),
+            wasm_bytes.len(),
+            &manifest,
+        );
+
+        self.modules.insert(
+            requested_module_id.to_string(),
+            RegisteredWasmModule {
+                info: info.clone(),
+                manifest,
+                wasm_bytes: Arc::new(wasm_bytes.to_vec()),
+            },
+        );
+
+        Ok(info)
+    }
+}
+
+pub trait CustomFnHandler: Send + Sync {
+    fn call(&self, args: &[LiteralValue]) -> Result<LiteralValue, ExcelError>;
+
+    fn call_batch(&self, _rows: &[Vec<LiteralValue>]) -> Option<Result<LiteralValue, ExcelError>> {
+        None
+    }
+}
+
+impl<F> CustomFnHandler for F
+where
+    F: Fn(&[LiteralValue]) -> Result<LiteralValue, ExcelError> + Send + Sync,
+{
+    fn call(&self, args: &[LiteralValue]) -> Result<LiteralValue, ExcelError> {
+        (self)(args)
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredCustomFn {
+    info: CustomFnInfo,
+    function: Arc<dyn formualizer_eval::function::Function>,
+}
+
+type CustomFnRegistry = BTreeMap<String, RegisteredCustomFn>;
+
+struct WorkbookCustomFunction {
+    canonical_name: String,
+    options: CustomFnOptions,
+    handler: Arc<dyn CustomFnHandler>,
+}
+
+impl WorkbookCustomFunction {
+    fn new(name: String, options: CustomFnOptions, handler: Arc<dyn CustomFnHandler>) -> Self {
+        Self {
+            canonical_name: name,
+            options,
+            handler,
+        }
+    }
+
+    fn validate_arity(&self, provided: usize) -> Result<(), ExcelError> {
+        if provided < self.options.min_args {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "{} expects at least {} argument(s), got {}",
+                self.canonical_name, self.options.min_args, provided
+            )));
+        }
+        if let Some(max) = self.options.max_args
+            && provided > max
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "{} expects at most {} argument(s), got {}",
+                self.canonical_name, max, provided
+            )));
+        }
+        Ok(())
+    }
+
+    fn materialize_arg<'a, 'b>(
+        arg: &formualizer_eval::traits::ArgumentHandle<'a, 'b>,
+    ) -> Result<LiteralValue, ExcelError> {
+        match arg.value_or_range()? {
+            formualizer_eval::traits::EvaluatedArg::LiteralValue(v) => Ok(v.into_owned()),
+            formualizer_eval::traits::EvaluatedArg::Range(r) => {
+                Ok(LiteralValue::Array(r.materialise().into_owned()))
+            }
+        }
+    }
+}
+
+impl formualizer_eval::function::Function for WorkbookCustomFunction {
+    fn caps(&self) -> formualizer_eval::function::FnCaps {
+        let mut caps = formualizer_eval::function::FnCaps::empty();
+        if self.options.volatile {
+            caps |= formualizer_eval::function::FnCaps::VOLATILE;
+        } else if self.options.deterministic {
+            caps |= formualizer_eval::function::FnCaps::PURE;
+        }
+        caps
+    }
+
+    fn name(&self) -> &'static str {
+        "__WORKBOOK_CUSTOM__"
+    }
+
+    fn function_salt(&self) -> u64 {
+        stable_fn_salt(&self.canonical_name)
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [formualizer_eval::traits::ArgumentHandle<'a, 'b>],
+        _ctx: &dyn formualizer_eval::traits::FunctionContext<'b>,
+    ) -> Result<formualizer_eval::traits::CalcValue<'b>, ExcelError> {
+        self.validate_arity(args.len())?;
+
+        let mut materialized = Vec::with_capacity(args.len());
+        for arg in args {
+            materialized.push(Self::materialize_arg(arg)?);
+        }
+
+        let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handler.call(&materialized)
+        }));
+
+        match callback_result {
+            Ok(Ok(value)) => Ok(formualizer_eval::traits::CalcValue::Scalar(value)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("Custom function callback panicked")),
+        }
+    }
+}
+
+#[cfg(feature = "wasm_plugins")]
+struct WorkbookWasmFunction {
+    canonical_name: String,
+    options: CustomFnOptions,
+    module_id: String,
+    export_name: String,
+    codec_version: u32,
+    runtime_hint: Option<WasmRuntimeHint>,
+    runtime: Arc<dyn WasmUdfRuntime>,
+}
+
+#[cfg(feature = "wasm_plugins")]
+impl WorkbookWasmFunction {
+    fn validate_arity(&self, provided: usize) -> Result<(), ExcelError> {
+        if provided < self.options.min_args {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "{} expects at least {} argument(s), got {}",
+                self.canonical_name, self.options.min_args, provided
+            )));
+        }
+        if let Some(max) = self.options.max_args
+            && provided > max
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message(format!(
+                "{} expects at most {} argument(s), got {}",
+                self.canonical_name, max, provided
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasm_plugins")]
+impl formualizer_eval::function::Function for WorkbookWasmFunction {
+    fn caps(&self) -> formualizer_eval::function::FnCaps {
+        let mut caps = formualizer_eval::function::FnCaps::empty();
+        if self.options.volatile {
+            caps |= formualizer_eval::function::FnCaps::VOLATILE;
+        } else if self.options.deterministic {
+            caps |= formualizer_eval::function::FnCaps::PURE;
+        }
+        caps
+    }
+
+    fn name(&self) -> &'static str {
+        "__WORKBOOK_WASM__"
+    }
+
+    fn function_salt(&self) -> u64 {
+        stable_fn_salt(&self.canonical_name)
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [formualizer_eval::traits::ArgumentHandle<'a, 'b>],
+        _ctx: &dyn formualizer_eval::traits::FunctionContext<'b>,
+    ) -> Result<formualizer_eval::traits::CalcValue<'b>, ExcelError> {
+        self.validate_arity(args.len())?;
+
+        let mut materialized = Vec::with_capacity(args.len());
+        for arg in args {
+            materialized.push(WorkbookCustomFunction::materialize_arg(arg)?);
+        }
+
+        let runtime_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.invoke(
+                &self.module_id,
+                &self.export_name,
+                &self.canonical_name,
+                self.codec_version,
+                &materialized,
+                self.runtime_hint.as_ref(),
+            )
+        }));
+
+        match runtime_result {
+            Ok(Ok(value)) => Ok(formualizer_eval::traits::CalcValue::Scalar(value)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("WASM function runtime panicked")),
+        }
+    }
+}
 
 /// Minimal resolver for engine-backed workbook (cells/ranges via graph/arrow; functions via registry).
-#[derive(Default, Debug, Clone, Copy)]
-pub struct WBResolver;
+#[derive(Clone)]
+pub struct WBResolver {
+    custom_functions: Arc<RwLock<CustomFnRegistry>>,
+}
+
+impl Default for WBResolver {
+    fn default() -> Self {
+        Self {
+            custom_functions: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl WBResolver {
+    fn new(custom_functions: Arc<RwLock<CustomFnRegistry>>) -> Self {
+        Self { custom_functions }
+    }
+}
 
 impl formualizer_eval::traits::ReferenceResolver for WBResolver {
     fn resolve_cell_reference(
@@ -45,7 +808,8 @@ impl formualizer_eval::traits::NamedRangeResolver for WBResolver {
         &self,
         _name: &str,
     ) -> Result<Vec<Vec<LiteralValue>>, formualizer_common::error::ExcelError> {
-        Err(ExcelError::new(ExcelErrorKind::Name))
+        Err(ExcelError::new(ExcelErrorKind::Name)
+            .with_message(format!("Undefined name: {}", _name)))
     }
 }
 impl formualizer_eval::traits::TableResolver for WBResolver {
@@ -66,6 +830,12 @@ impl formualizer_eval::traits::FunctionProvider for WBResolver {
         ns: &str,
         name: &str,
     ) -> Option<std::sync::Arc<dyn formualizer_eval::function::Function>> {
+        if ns.is_empty() {
+            let key = name.to_ascii_uppercase();
+            if let Some(local) = self.custom_functions.read().get(&key) {
+                return Some(local.function.clone());
+            }
+        }
         formualizer_eval::function_registry::get(ns, name)
     }
 }
@@ -75,9 +845,123 @@ impl formualizer_eval::traits::EvaluationContext for WBResolver {}
 /// Engine-backed workbook facade.
 pub struct Workbook {
     engine: formualizer_eval::engine::Engine<WBResolver>,
+    custom_functions: Arc<RwLock<CustomFnRegistry>>,
+    wasm_plugins: WasmPluginManager,
     enable_changelog: bool,
     log: formualizer_eval::engine::ChangeLog,
     undo: formualizer_eval::engine::graph::editor::undo_engine::UndoEngine,
+}
+
+trait WorkbookActionOps {
+    fn set_value(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) -> Result<(), IoError>;
+
+    fn set_formula(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        formula: &str,
+    ) -> Result<(), IoError>;
+
+    fn set_values(
+        &mut self,
+        sheet: &str,
+        start_row: u32,
+        start_col: u32,
+        rows: &[Vec<LiteralValue>],
+    ) -> Result<(), IoError>;
+
+    fn write_range(
+        &mut self,
+        sheet: &str,
+        start: (u32, u32),
+        cells: BTreeMap<(u32, u32), crate::traits::CellData>,
+    ) -> Result<(), IoError>;
+
+    fn set_row_hidden(&mut self, sheet: &str, row: u32, hidden: bool) -> Result<(), IoError>;
+
+    fn set_rows_hidden(
+        &mut self,
+        sheet: &str,
+        start_row: u32,
+        end_row: u32,
+        hidden: bool,
+    ) -> Result<(), IoError>;
+}
+
+/// Transactional edit surface for `Workbook::action`.
+///
+/// This wrapper exists to avoid aliasing `&mut Workbook` while an Engine transaction is active.
+/// It intentionally exposes only valueful edit operations that can participate in rollback.
+pub struct WorkbookAction<'a> {
+    ops: &'a mut dyn WorkbookActionOps,
+}
+
+impl WorkbookAction<'_> {
+    #[inline]
+    pub fn set_value(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) -> Result<(), IoError> {
+        self.ops.set_value(sheet, row, col, value)
+    }
+
+    #[inline]
+    pub fn set_formula(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        formula: &str,
+    ) -> Result<(), IoError> {
+        self.ops.set_formula(sheet, row, col, formula)
+    }
+
+    #[inline]
+    pub fn set_values(
+        &mut self,
+        sheet: &str,
+        start_row: u32,
+        start_col: u32,
+        rows: &[Vec<LiteralValue>],
+    ) -> Result<(), IoError> {
+        self.ops.set_values(sheet, start_row, start_col, rows)
+    }
+
+    #[inline]
+    pub fn write_range(
+        &mut self,
+        sheet: &str,
+        start: (u32, u32),
+        cells: BTreeMap<(u32, u32), crate::traits::CellData>,
+    ) -> Result<(), IoError> {
+        self.ops.write_range(sheet, start, cells)
+    }
+
+    #[inline]
+    pub fn set_row_hidden(&mut self, sheet: &str, row: u32, hidden: bool) -> Result<(), IoError> {
+        self.ops.set_row_hidden(sheet, row, hidden)
+    }
+
+    #[inline]
+    pub fn set_rows_hidden(
+        &mut self,
+        sheet: &str,
+        start_row: u32,
+        end_row: u32,
+        hidden: bool,
+    ) -> Result<(), IoError> {
+        self.ops.set_rows_hidden(sheet, start_row, end_row, hidden)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,8 +987,11 @@ impl WorkbookConfig {
     }
 
     pub fn interactive() -> Self {
-        let mut eval = formualizer_eval::engine::EvalConfig::default();
-        eval.defer_graph_building = true;
+        let eval = formualizer_eval::engine::EvalConfig {
+            defer_graph_building: true,
+            formula_parse_policy: formualizer_eval::engine::FormulaParsePolicy::CoerceToError,
+            ..Default::default()
+        };
         Self {
             eval,
             enable_changelog: true,
@@ -123,11 +1010,17 @@ impl Workbook {
         config.eval.arrow_storage_enabled = true;
         config.eval.delta_overlay_enabled = true;
         config.eval.write_formula_overlay_enabled = true;
-        let engine = formualizer_eval::engine::Engine::new(WBResolver, config.eval);
+
+        let custom_functions = Arc::new(RwLock::new(BTreeMap::new()));
+        let resolver = WBResolver::new(custom_functions.clone());
+        let engine = formualizer_eval::engine::Engine::new(resolver, config.eval);
+
         let mut log = formualizer_eval::engine::ChangeLog::new();
         log.set_enabled(config.enable_changelog);
         Self {
             engine,
+            custom_functions,
+            wasm_plugins: WasmPluginManager::default(),
             enable_changelog: config.enable_changelog,
             log,
             undo: formualizer_eval::engine::graph::editor::undo_engine::UndoEngine::new(),
@@ -144,6 +1037,339 @@ impl Workbook {
         Self::new_with_mode(WorkbookMode::Interactive)
     }
 
+    pub fn register_custom_function(
+        &mut self,
+        name: &str,
+        options: CustomFnOptions,
+        handler: Arc<dyn CustomFnHandler>,
+    ) -> Result<(), ExcelError> {
+        let canonical_name = normalize_custom_fn_name(name)?;
+
+        validate_custom_arity(&canonical_name, &options)?;
+
+        if self.custom_functions.read().contains_key(&canonical_name) {
+            return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                "Custom function {canonical_name} is already registered"
+            )));
+        }
+
+        if !options.allow_override_builtin
+            && formualizer_eval::function_registry::get("", &canonical_name).is_some()
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                "Custom function {canonical_name} conflicts with a global function; set allow_override_builtin=true to override"
+            )));
+        }
+
+        let info = CustomFnInfo {
+            name: canonical_name.clone(),
+            options: options.clone(),
+        };
+        let function = Arc::new(WorkbookCustomFunction::new(
+            canonical_name.clone(),
+            options,
+            handler,
+        ));
+
+        self.custom_functions
+            .write()
+            .insert(canonical_name, RegisteredCustomFn { info, function });
+        Ok(())
+    }
+
+    /// Inspect a WASM module manifest and return module metadata without mutating workbook state.
+    pub fn inspect_wasm_module_bytes(
+        &self,
+        wasm_bytes: &[u8],
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        #[cfg(feature = "wasm_plugins")]
+        {
+            let manifest_json = extract_wasm_manifest_json_from_module(wasm_bytes)?;
+            let manifest = parse_wasm_manifest_json(&manifest_json)?;
+            let canonical_module_id = normalize_wasm_module_id(&manifest.module.id)?;
+            Ok(wasm_module_info_from_manifest(
+                canonical_module_id,
+                wasm_bytes.len(),
+                &manifest,
+            ))
+        }
+
+        #[cfg(not(feature = "wasm_plugins"))]
+        {
+            let _ = wasm_bytes;
+            Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("WASM module inspection requires the `wasm_plugins` feature"))
+        }
+    }
+
+    pub fn register_wasm_module_bytes(
+        &mut self,
+        module_id: &str,
+        wasm_bytes: &[u8],
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        let canonical_module_id = normalize_wasm_module_id(module_id)?;
+
+        #[cfg(feature = "wasm_plugins")]
+        {
+            self.wasm_plugins
+                .register_module_bytes(&canonical_module_id, wasm_bytes)
+        }
+
+        #[cfg(not(feature = "wasm_plugins"))]
+        {
+            let _ = wasm_bytes;
+            Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                "WASM module registration for {canonical_module_id} requires the `wasm_plugins` feature"
+            )))
+        }
+    }
+
+    /// Inspect a WASM module file without mutating workbook state.
+    pub fn inspect_wasm_module_file(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bytes = read_wasm_file_bytes(path.as_ref())?;
+            self.inspect_wasm_module_bytes(&bytes)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("WASM module file inspection is not available on wasm32 hosts"))
+        }
+    }
+
+    /// Inspect all `*.wasm` files in a directory without mutating workbook state.
+    pub fn inspect_wasm_modules_dir(
+        &self,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<WasmModuleInfo>, ExcelError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut infos = Vec::new();
+            for path in collect_wasm_files_in_dir(dir.as_ref())? {
+                let bytes = read_wasm_file_bytes(&path)?;
+                infos.push(self.inspect_wasm_module_bytes(&bytes)?);
+            }
+            Ok(infos)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = dir;
+            Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("WASM module directory inspection is not available on wasm32 hosts"))
+        }
+    }
+
+    /// Alias for clearer workbook-local terminology.
+    pub fn attach_wasm_module_bytes(
+        &mut self,
+        module_id: &str,
+        wasm_bytes: &[u8],
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        self.register_wasm_module_bytes(module_id, wasm_bytes)
+    }
+
+    /// Attach a WASM module from a file path using the module id from its manifest.
+    pub fn attach_wasm_module_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<WasmModuleInfo, ExcelError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bytes = read_wasm_file_bytes(path.as_ref())?;
+            let info = self.inspect_wasm_module_bytes(&bytes)?;
+            self.attach_wasm_module_bytes(&info.module_id, &bytes)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("WASM module file attachment is not available on wasm32 hosts"))
+        }
+    }
+
+    /// Attach all `*.wasm` modules found in a directory.
+    pub fn attach_wasm_modules_dir(
+        &mut self,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<WasmModuleInfo>, ExcelError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut attached = Vec::new();
+            for path in collect_wasm_files_in_dir(dir.as_ref())? {
+                attached.push(self.attach_wasm_module_file(path)?);
+            }
+            Ok(attached)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = dir;
+            Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("WASM module directory attachment is not available on wasm32 hosts"))
+        }
+    }
+
+    pub fn list_wasm_modules(&self) -> Vec<WasmModuleInfo> {
+        self.wasm_plugins.list_module_infos()
+    }
+
+    pub fn unregister_wasm_module(&mut self, module_id: &str) -> Result<(), ExcelError> {
+        let canonical_module_id = normalize_wasm_module_id(module_id)?;
+
+        #[cfg(feature = "wasm_plugins")]
+        {
+            self.wasm_plugins.unregister_module(&canonical_module_id)
+        }
+
+        #[cfg(not(feature = "wasm_plugins"))]
+        {
+            Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                "WASM module unregistration for {canonical_module_id} requires the `wasm_plugins` feature"
+            )))
+        }
+    }
+
+    #[cfg(feature = "wasm_plugins")]
+    #[doc(hidden)]
+    pub fn set_wasm_runtime(&mut self, runtime: Arc<dyn WasmUdfRuntime>) {
+        self.wasm_plugins.set_runtime(runtime);
+    }
+
+    #[cfg(all(feature = "wasm_runtime_wasmtime", not(target_arch = "wasm32")))]
+    pub fn use_wasmtime_runtime(&mut self) {
+        self.wasm_plugins
+            .set_runtime(Arc::new(new_wasmtime_runtime()));
+    }
+
+    pub fn register_wasm_function(
+        &mut self,
+        name: &str,
+        options: CustomFnOptions,
+        spec: WasmFunctionSpec,
+    ) -> Result<(), ExcelError> {
+        let canonical_name = normalize_custom_fn_name(name)?;
+        validate_custom_arity(&canonical_name, &options)?;
+        validate_wasm_spec(&spec)?;
+
+        #[cfg(feature = "wasm_plugins")]
+        {
+            let module_id = normalize_wasm_module_id(&spec.module_id)?;
+            let module = self.wasm_plugins.get(&module_id).ok_or_else(|| {
+                ExcelError::new(ExcelErrorKind::Name)
+                    .with_message(format!("WASM module {module_id} is not registered"))
+            })?;
+
+            if module.manifest.module.codec != spec.codec_version {
+                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                    "WASM codec mismatch for {canonical_name}: spec codec {} != module codec {}",
+                    spec.codec_version, module.manifest.module.codec
+                )));
+            }
+
+            if !module
+                .manifest
+                .functions
+                .iter()
+                .any(|function| function.export_name == spec.export_name)
+            {
+                return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                    "WASM export {} is not declared in module {}",
+                    spec.export_name, module_id
+                )));
+            }
+
+            if self.custom_functions.read().contains_key(&canonical_name) {
+                return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                    "Custom function {canonical_name} is already registered"
+                )));
+            }
+
+            if !options.allow_override_builtin
+                && formualizer_eval::function_registry::get("", &canonical_name).is_some()
+            {
+                return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                    "Custom function {canonical_name} conflicts with a global function; set allow_override_builtin=true to override"
+                )));
+            }
+
+            let runtime = self.wasm_plugins.runtime();
+            if !runtime.can_bind_functions() {
+                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                    "WASM plugin runtime integration is pending for {canonical_name} (module_id={}, export_name={}, codec_version={})",
+                    module_id, spec.export_name, spec.codec_version
+                )));
+            }
+
+            let info = CustomFnInfo {
+                name: canonical_name.clone(),
+                options: options.clone(),
+            };
+            let function = Arc::new(WorkbookWasmFunction {
+                canonical_name: canonical_name.clone(),
+                options,
+                module_id,
+                export_name: spec.export_name,
+                codec_version: spec.codec_version,
+                runtime_hint: spec.runtime_hint,
+                runtime,
+            });
+
+            self.custom_functions
+                .write()
+                .insert(canonical_name, RegisteredCustomFn { info, function });
+            Ok(())
+        }
+
+        #[cfg(not(feature = "wasm_plugins"))]
+        {
+            Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                "WASM plugin registration for {canonical_name} requires the `wasm_plugins` feature (module_id={}, export_name={}, codec_version={})",
+                spec.module_id, spec.export_name, spec.codec_version
+            )))
+        }
+    }
+
+    /// Alias for clearer workbook-local terminology.
+    pub fn bind_wasm_function(
+        &mut self,
+        name: &str,
+        options: CustomFnOptions,
+        spec: WasmFunctionSpec,
+    ) -> Result<(), ExcelError> {
+        self.register_wasm_function(name, options, spec)
+    }
+
+    pub fn unregister_custom_function(&mut self, name: &str) -> Result<(), ExcelError> {
+        let canonical_name = normalize_custom_fn_name(name)?;
+        if self
+            .custom_functions
+            .write()
+            .remove(&canonical_name)
+            .is_none()
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
+                "Custom function {canonical_name} is not registered"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn list_custom_functions(&self) -> Vec<CustomFnInfo> {
+        self.custom_functions
+            .read()
+            .values()
+            .map(|registered| registered.info.clone())
+            .collect()
+    }
+
     pub fn engine(&self) -> &formualizer_eval::engine::Engine<WBResolver> {
         &self.engine
     }
@@ -154,10 +1380,36 @@ impl Workbook {
         &self.engine.config
     }
 
+    pub fn deterministic_mode(&self) -> &formualizer_eval::engine::DeterministicMode {
+        &self.engine.config.deterministic_mode
+    }
+
+    pub fn set_deterministic_mode(
+        &mut self,
+        mode: formualizer_eval::engine::DeterministicMode,
+    ) -> Result<(), IoError> {
+        self.engine
+            .set_deterministic_mode(mode)
+            .map_err(IoError::Engine)
+    }
+
     // Changelog controls
     pub fn set_changelog_enabled(&mut self, enabled: bool) {
         self.enable_changelog = enabled;
         self.log.set_enabled(enabled);
+    }
+
+    // Changelog metadata
+    pub fn set_actor_id(&mut self, actor_id: Option<String>) {
+        self.log.set_actor_id(actor_id);
+    }
+
+    pub fn set_correlation_id(&mut self, correlation_id: Option<String>) {
+        self.log.set_correlation_id(correlation_id);
+    }
+
+    pub fn set_reason(&mut self, reason: Option<String>) {
+        self.log.set_reason(reason);
     }
     pub fn begin_action(&mut self, description: impl Into<String>) {
         if self.enable_changelog {
@@ -169,12 +1421,318 @@ impl Workbook {
             self.log.end_compound();
         }
     }
+
+    /// Execute an atomic workbook action.
+    ///
+    /// When changelog is enabled, this delegates to `Engine::action_with_logger` and therefore:
+    /// - logs changes into the changelog as a compound
+    /// - rolls back graph + Arrow-truth value changes on error
+    /// - truncates the changelog on rollback
+    ///
+    /// The closure receives a `WorkbookAction` rather than `&mut Workbook` to avoid aliasing
+    /// `&mut Workbook` while the Engine transaction is active.
+    pub fn action<T>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut WorkbookAction<'_>) -> Result<T, IoError>,
+    ) -> Result<T, IoError> {
+        let mut user_err: Option<IoError> = None;
+
+        if self.enable_changelog {
+            let res = self.engine.action_with_logger(&mut self.log, name, |tx| {
+                struct TxOps<'a, 'e> {
+                    tx: &'a mut formualizer_eval::engine::EngineAction<'e, WBResolver>,
+                }
+                impl WorkbookActionOps for TxOps<'_, '_> {
+                    fn set_value(
+                        &mut self,
+                        sheet: &str,
+                        row: u32,
+                        col: u32,
+                        value: LiteralValue,
+                    ) -> Result<(), IoError> {
+                        self.tx
+                            .set_cell_value(sheet, row, col, value)
+                            .map_err(|e| match e {
+                                formualizer_eval::engine::EditorError::Excel(excel) => {
+                                    IoError::Engine(excel)
+                                }
+                                other => IoError::from_backend("editor", other),
+                            })
+                    }
+
+                    fn set_formula(
+                        &mut self,
+                        sheet: &str,
+                        row: u32,
+                        col: u32,
+                        formula: &str,
+                    ) -> Result<(), IoError> {
+                        let with_eq = if formula.starts_with('=') {
+                            formula.to_string()
+                        } else {
+                            format!("={formula}")
+                        };
+                        let ast = formualizer_parse::parser::parse(&with_eq)
+                            .map_err(|e| IoError::from_backend("parser", e))?;
+                        self.tx
+                            .set_cell_formula(sheet, row, col, ast)
+                            .map_err(|e| match e {
+                                formualizer_eval::engine::EditorError::Excel(excel) => {
+                                    IoError::Engine(excel)
+                                }
+                                other => IoError::from_backend("editor", other),
+                            })
+                    }
+
+                    fn set_values(
+                        &mut self,
+                        sheet: &str,
+                        start_row: u32,
+                        start_col: u32,
+                        rows: &[Vec<LiteralValue>],
+                    ) -> Result<(), IoError> {
+                        for (ri, rvals) in rows.iter().enumerate() {
+                            let r = start_row + ri as u32;
+                            for (ci, v) in rvals.iter().enumerate() {
+                                let c = start_col + ci as u32;
+                                self.set_value(sheet, r, c, v.clone())?;
+                            }
+                        }
+                        Ok(())
+                    }
+
+                    fn write_range(
+                        &mut self,
+                        sheet: &str,
+                        _start: (u32, u32),
+                        cells: BTreeMap<(u32, u32), crate::traits::CellData>,
+                    ) -> Result<(), IoError> {
+                        for ((r, c), d) in cells.into_iter() {
+                            if let Some(v) = d.value {
+                                self.set_value(sheet, r, c, v)?;
+                            }
+                            if let Some(f) = d.formula.as_ref() {
+                                self.set_formula(sheet, r, c, f)?;
+                            }
+                        }
+                        Ok(())
+                    }
+
+                    fn set_row_hidden(
+                        &mut self,
+                        sheet: &str,
+                        row: u32,
+                        hidden: bool,
+                    ) -> Result<(), IoError> {
+                        self.tx
+                            .set_row_hidden(sheet, row, hidden, RowVisibilitySource::Manual)
+                            .map_err(|e| match e {
+                                formualizer_eval::engine::EditorError::Excel(excel) => {
+                                    IoError::Engine(excel)
+                                }
+                                other => IoError::from_backend("editor", other),
+                            })
+                    }
+
+                    fn set_rows_hidden(
+                        &mut self,
+                        sheet: &str,
+                        start_row: u32,
+                        end_row: u32,
+                        hidden: bool,
+                    ) -> Result<(), IoError> {
+                        self.tx
+                            .set_rows_hidden(
+                                sheet,
+                                start_row,
+                                end_row,
+                                hidden,
+                                RowVisibilitySource::Manual,
+                            )
+                            .map_err(|e| match e {
+                                formualizer_eval::engine::EditorError::Excel(excel) => {
+                                    IoError::Engine(excel)
+                                }
+                                other => IoError::from_backend("editor", other),
+                            })
+                    }
+                }
+
+                let mut ops = TxOps { tx };
+                let mut wtx = WorkbookAction { ops: &mut ops };
+                match f(&mut wtx) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        user_err = Some(e);
+                        Err(formualizer_eval::engine::EditorError::TransactionFailed {
+                            reason: "Workbook::action aborted".to_string(),
+                        })
+                    }
+                }
+            });
+
+            if let Some(e) = user_err {
+                return Err(e);
+            }
+            return res.map_err(|e| match e {
+                formualizer_eval::engine::EditorError::Excel(excel) => IoError::Engine(excel),
+                other => IoError::from_backend("editor", other),
+            });
+        }
+
+        let res = self.engine.action_atomic_journal(name.to_string(), |tx| {
+            struct TxOps<'a, 'e> {
+                tx: &'a mut formualizer_eval::engine::EngineAction<'e, WBResolver>,
+            }
+            impl WorkbookActionOps for TxOps<'_, '_> {
+                fn set_value(
+                    &mut self,
+                    sheet: &str,
+                    row: u32,
+                    col: u32,
+                    value: LiteralValue,
+                ) -> Result<(), IoError> {
+                    self.tx
+                        .set_cell_value(sheet, row, col, value)
+                        .map_err(|e| match e {
+                            formualizer_eval::engine::EditorError::Excel(excel) => {
+                                IoError::Engine(excel)
+                            }
+                            other => IoError::from_backend("editor", other),
+                        })
+                }
+
+                fn set_formula(
+                    &mut self,
+                    sheet: &str,
+                    row: u32,
+                    col: u32,
+                    formula: &str,
+                ) -> Result<(), IoError> {
+                    let with_eq = if formula.starts_with('=') {
+                        formula.to_string()
+                    } else {
+                        format!("={formula}")
+                    };
+                    let ast = formualizer_parse::parser::parse(&with_eq)
+                        .map_err(|e| IoError::from_backend("parser", e))?;
+                    self.tx
+                        .set_cell_formula(sheet, row, col, ast)
+                        .map_err(|e| match e {
+                            formualizer_eval::engine::EditorError::Excel(excel) => {
+                                IoError::Engine(excel)
+                            }
+                            other => IoError::from_backend("editor", other),
+                        })
+                }
+
+                fn set_values(
+                    &mut self,
+                    sheet: &str,
+                    start_row: u32,
+                    start_col: u32,
+                    rows: &[Vec<LiteralValue>],
+                ) -> Result<(), IoError> {
+                    for (ri, rvals) in rows.iter().enumerate() {
+                        let r = start_row + ri as u32;
+                        for (ci, v) in rvals.iter().enumerate() {
+                            let c = start_col + ci as u32;
+                            self.set_value(sheet, r, c, v.clone())?;
+                        }
+                    }
+                    Ok(())
+                }
+
+                fn write_range(
+                    &mut self,
+                    sheet: &str,
+                    _start: (u32, u32),
+                    cells: BTreeMap<(u32, u32), crate::traits::CellData>,
+                ) -> Result<(), IoError> {
+                    for ((r, c), d) in cells.into_iter() {
+                        if let Some(v) = d.value {
+                            self.set_value(sheet, r, c, v)?;
+                        }
+                        if let Some(f) = d.formula.as_ref() {
+                            self.set_formula(sheet, r, c, f)?;
+                        }
+                    }
+                    Ok(())
+                }
+
+                fn set_row_hidden(
+                    &mut self,
+                    sheet: &str,
+                    row: u32,
+                    hidden: bool,
+                ) -> Result<(), IoError> {
+                    self.tx
+                        .set_row_hidden(sheet, row, hidden, RowVisibilitySource::Manual)
+                        .map_err(|e| match e {
+                            formualizer_eval::engine::EditorError::Excel(excel) => {
+                                IoError::Engine(excel)
+                            }
+                            other => IoError::from_backend("editor", other),
+                        })
+                }
+
+                fn set_rows_hidden(
+                    &mut self,
+                    sheet: &str,
+                    start_row: u32,
+                    end_row: u32,
+                    hidden: bool,
+                ) -> Result<(), IoError> {
+                    self.tx
+                        .set_rows_hidden(
+                            sheet,
+                            start_row,
+                            end_row,
+                            hidden,
+                            RowVisibilitySource::Manual,
+                        )
+                        .map_err(|e| match e {
+                            formualizer_eval::engine::EditorError::Excel(excel) => {
+                                IoError::Engine(excel)
+                            }
+                            other => IoError::from_backend("editor", other),
+                        })
+                }
+            }
+
+            let mut ops = TxOps { tx };
+            let mut wtx = WorkbookAction { ops: &mut ops };
+            match f(&mut wtx) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(formualizer_eval::engine::EditorError::TransactionFailed {
+                        reason: "Workbook::action aborted".to_string(),
+                    })
+                }
+            }
+        });
+
+        if let Some(e) = user_err {
+            return Err(e);
+        }
+        let (v, journal) = res.map_err(|e| match e {
+            formualizer_eval::engine::EditorError::Excel(excel) => IoError::Engine(excel),
+            other => IoError::from_backend("editor", other),
+        })?;
+        self.undo.push_action(journal);
+        Ok(v)
+    }
     pub fn undo(&mut self) -> Result<(), IoError> {
         if self.enable_changelog {
             self.engine
                 .undo_logged(&mut self.undo, &mut self.log)
                 .map_err(|e| IoError::from_backend("editor", e))?;
-            self.resync_all_overlays();
+        } else {
+            self.engine
+                .undo_action(&mut self.undo)
+                .map_err(|e| IoError::from_backend("editor", e))?;
         }
         Ok(())
     }
@@ -183,41 +1741,12 @@ impl Workbook {
             self.engine
                 .redo_logged(&mut self.undo, &mut self.log)
                 .map_err(|e| IoError::from_backend("editor", e))?;
-            self.resync_all_overlays();
+        } else {
+            self.engine
+                .redo_action(&mut self.undo)
+                .map_err(|e| IoError::from_backend("editor", e))?;
         }
         Ok(())
-    }
-
-    fn resync_all_overlays(&mut self) {
-        // Heavy but simple: walk all sheets and rebuild overlay values from graph
-        let sheet_names: Vec<String> = self
-            .engine
-            .sheet_store()
-            .sheets
-            .iter()
-            .map(|s| s.name.as_ref().to_string())
-            .collect();
-        for s in sheet_names {
-            self.resync_overlay_for_sheet(&s);
-        }
-    }
-    fn resync_overlay_for_sheet(&mut self, sheet: &str) {
-        if let Some(asheet) = self.engine.sheet_store().sheet(sheet) {
-            let rows = asheet.nrows as usize;
-            let cols = asheet.columns.len();
-            for r0 in 0..rows {
-                let r = (r0 as u32) + 1;
-                for c0 in 0..cols {
-                    let c = (c0 as u32) + 1;
-                    let v = self
-                        .engine
-                        .graph_cell_value(sheet, r, c)
-                        .unwrap_or(LiteralValue::Empty);
-                    self.mirror_value_to_overlay(sheet, r, c, &v);
-                }
-            }
-        }
-        // No Arrow sheet: nothing to sync
     }
 
     fn ensure_arrow_sheet_capacity(&mut self, sheet: &str, min_rows: usize, min_cols: usize) {
@@ -281,22 +1810,22 @@ impl Workbook {
                         date_system,
                         &dt,
                     );
-                    OverlayValue::Number(serial)
+                    OverlayValue::DateTime(serial)
                 }
                 LiteralValue::DateTime(dt) => {
                     let serial = formualizer_eval::builtins::datetime::datetime_to_serial_for(
                         date_system,
                         dt,
                     );
-                    OverlayValue::Number(serial)
+                    OverlayValue::DateTime(serial)
                 }
                 LiteralValue::Time(t) => {
                     let serial = t.num_seconds_from_midnight() as f64 / 86_400.0;
-                    OverlayValue::Number(serial)
+                    OverlayValue::DateTime(serial)
                 }
                 LiteralValue::Duration(d) => {
                     let serial = d.num_seconds() as f64 / 86_400.0;
-                    OverlayValue::Number(serial)
+                    OverlayValue::Duration(serial)
                 }
                 LiteralValue::Pending => OverlayValue::Pending,
                 LiteralValue::Array(_) => {
@@ -376,9 +1905,21 @@ impl Workbook {
                 sheet_id,
                 formualizer_eval::reference::Coord::from_excel(row, col, true, true),
             );
+
+            // In Arrow-canonical mode, the graph value cache is disabled, so we must capture
+            // the old state from Arrow truth for undo/redo.
+            let old_value = self.engine.get_cell_value(sheet, row, col);
+            let old_formula = self
+                .engine
+                .get_cell(sheet, row, col)
+                .and_then(|(ast, _)| ast);
+
             self.engine.edit_with_logger(&mut self.log, |editor| {
                 editor.set_cell_value(cell, value.clone());
             });
+
+            self.log
+                .patch_last_cell_event_old_state(cell, old_value, old_formula);
             self.mirror_value_to_overlay(sheet, row, col, &value);
             self.engine.mark_data_edited();
             Ok(())
@@ -415,9 +1956,16 @@ impl Workbook {
                         sheet_id,
                         formualizer_eval::reference::Coord::from_excel(row, col, true, true),
                     );
+
+                    let old_value = self.engine.get_cell_value(sheet, row, col);
+                    let old_formula = self.engine.get_cell(sheet, row, col).and_then(|(a, _)| a);
+
                     self.engine.edit_with_logger(&mut self.log, |editor| {
                         editor.set_cell_formula(cell, ast);
                     });
+
+                    self.log
+                        .patch_last_cell_event_old_state(cell, old_value, old_formula);
                     self.engine.mark_data_edited();
                     Ok(())
                 } else {
@@ -458,6 +2006,39 @@ impl Workbook {
                     .map_err(IoError::Engine)
             }
         }
+    }
+
+    pub fn set_row_hidden(&mut self, sheet: &str, row: u32, hidden: bool) -> Result<(), IoError> {
+        self.engine
+            .set_row_hidden(sheet, row, hidden, RowVisibilitySource::Manual)
+            .map_err(|e| IoError::from_backend("editor", e))
+    }
+
+    pub fn set_rows_hidden(
+        &mut self,
+        sheet: &str,
+        start_row: u32,
+        end_row: u32,
+        hidden: bool,
+    ) -> Result<(), IoError> {
+        self.engine
+            .set_rows_hidden(
+                sheet,
+                start_row,
+                end_row,
+                hidden,
+                RowVisibilitySource::Manual,
+            )
+            .map_err(|e| IoError::from_backend("editor", e))
+    }
+
+    pub fn is_row_hidden(&self, sheet: &str, row: u32) -> Result<bool, IoError> {
+        self.engine
+            .is_row_hidden(sheet, row, Some(RowVisibilitySource::Manual))
+            .ok_or_else(|| IoError::Backend {
+                backend: "workbook".to_string(),
+                message: format!("Unknown sheet: {sheet}"),
+            })
     }
 
     pub fn get_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
@@ -518,23 +2099,45 @@ impl Workbook {
                 .unwrap_or_else(|| self.engine.add_sheet(sheet).expect("add sheet"));
             let defer_graph_building = self.engine.config.defer_graph_building;
 
+            // Capture per-cell old state from Arrow truth BEFORE applying the bulk edit.
+            // In canonical mode the graph value cache is empty, so ChangeLog old_value must be patched.
+            #[allow(clippy::type_complexity)]
+            let mut items: Vec<(
+                u32,
+                u32,
+                crate::traits::CellData,
+                formualizer_eval::reference::CellRef,
+                Option<LiteralValue>,
+                Option<formualizer_parse::ASTNode>,
+            )> = Vec::with_capacity(cells.len());
+            for ((r, c), d) in cells.into_iter() {
+                let cell = formualizer_eval::reference::CellRef::new(
+                    sheet_id,
+                    formualizer_eval::reference::Coord::from_excel(r, c, true, true),
+                );
+                let old_value = self.engine.get_cell_value(sheet, r, c);
+                let old_formula = self.engine.get_cell(sheet, r, c).and_then(|(ast, _)| ast);
+                items.push((r, c, d, cell, old_value, old_formula));
+            }
+
             let mut overlay_ops: Vec<(u32, u32, LiteralValue)> = Vec::new();
             let mut staged_forms: Vec<(u32, u32, String)> = Vec::new();
 
             self.engine
                 .edit_with_logger(&mut self.log, |editor| -> Result<(), IoError> {
-                    for ((r, c), d) in cells.into_iter() {
-                        let cell = formualizer_eval::reference::CellRef::new(
-                            sheet_id,
-                            formualizer_eval::reference::Coord::from_excel(r, c, true, true),
-                        );
+                    for (r, c, d, cell, _old_value, _old_formula) in items.iter() {
                         if let Some(v) = d.value.clone() {
-                            editor.set_cell_value(cell, v.clone());
-                            overlay_ops.push((r, c, v));
+                            editor.set_cell_value(*cell, v.clone());
+                            // If a formula is also being set for this cell, do not mirror the
+                            // provided value into the delta overlay. In Arrow-truth mode that
+                            // would mask the computed formula result.
+                            if d.formula.is_none() {
+                                overlay_ops.push((*r, *c, v));
+                            }
                         }
                         if let Some(f) = d.formula.as_ref() {
                             if defer_graph_building {
-                                staged_forms.push((r, c, f.clone()));
+                                staged_forms.push((*r, *c, f.clone()));
                             } else {
                                 let with_eq = if f.starts_with('=') {
                                     f.clone()
@@ -543,12 +2146,21 @@ impl Workbook {
                                 };
                                 let ast = formualizer_parse::parser::parse(&with_eq)
                                     .map_err(|e| IoError::from_backend("parser", e))?;
-                                editor.set_cell_formula(cell, ast);
+                                editor.set_cell_formula(*cell, ast);
                             }
                         }
                     }
                     Ok(())
                 })?;
+
+            // Patch old_value/old_formula for each cell's last SetValue/SetFormula event.
+            for (_r, _c, _d, cell, old_value, old_formula) in items.iter().rev() {
+                self.log.patch_last_cell_event_old_state(
+                    *cell,
+                    old_value.clone(),
+                    old_formula.clone(),
+                );
+            }
 
             for (r, c, v) in overlay_ops {
                 self.mirror_value_to_overlay(sheet, r, c, &v);
@@ -599,24 +2211,46 @@ impl Workbook {
                 .engine
                 .sheet_id(sheet)
                 .unwrap_or_else(|| self.engine.add_sheet(sheet).expect("add sheet"));
-            let mut overlay_ops: Vec<(u32, u32, LiteralValue)> = Vec::new();
+
+            // Capture old state from Arrow truth BEFORE applying the batch.
+            #[allow(clippy::type_complexity)]
+            let mut items: Vec<(
+                u32,
+                u32,
+                LiteralValue,
+                formualizer_eval::reference::CellRef,
+                Option<LiteralValue>,
+                Option<formualizer_parse::ASTNode>,
+            )> = Vec::new();
+            for (ri, rvals) in rows.iter().enumerate() {
+                let r = start_row + ri as u32;
+                for (ci, v) in rvals.iter().enumerate() {
+                    let c = start_col + ci as u32;
+                    let cell = formualizer_eval::reference::CellRef::new(
+                        sheet_id,
+                        formualizer_eval::reference::Coord::from_excel(r, c, true, true),
+                    );
+                    let old_value = self.engine.get_cell_value(sheet, r, c);
+                    let old_formula = self.engine.get_cell(sheet, r, c).and_then(|(ast, _)| ast);
+                    items.push((r, c, v.clone(), cell, old_value, old_formula));
+                }
+            }
 
             self.engine.edit_with_logger(&mut self.log, |editor| {
-                for (ri, rvals) in rows.iter().enumerate() {
-                    let r = start_row + ri as u32;
-                    for (ci, v) in rvals.iter().enumerate() {
-                        let c = start_col + ci as u32;
-                        let cell = formualizer_eval::reference::CellRef::new(
-                            sheet_id,
-                            formualizer_eval::reference::Coord::from_excel(r, c, true, true),
-                        );
-                        editor.set_cell_value(cell, v.clone());
-                        overlay_ops.push((r, c, v.clone()));
-                    }
+                for (_r, _c, v, cell, _old_value, _old_formula) in items.iter() {
+                    editor.set_cell_value(*cell, v.clone());
                 }
             });
 
-            for (r, c, v) in overlay_ops {
+            for (_r, _c, _v, cell, old_value, old_formula) in items.iter().rev() {
+                self.log.patch_last_cell_event_old_state(
+                    *cell,
+                    old_value.clone(),
+                    old_formula.clone(),
+                );
+            }
+
+            for (r, c, v, _cell, _old_value, _old_formula) in items {
                 self.mirror_value_to_overlay(sheet, r, c, &v);
             }
             self.engine.mark_data_edited();
@@ -969,6 +2603,7 @@ impl Workbook {
                 let end_col = range.end.coord.col() + 1;
                 RangeAddress::new(sheet, start_row, start_col, end_row, end_col).ok()
             }
+            NamedDefinition::Literal(_) => None,
             NamedDefinition::Formula { .. } => {
                 #[cfg(feature = "tracing")]
                 tracing::debug!("formula-backed named ranges are not yet supported");

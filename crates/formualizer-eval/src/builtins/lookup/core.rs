@@ -16,7 +16,6 @@ use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::ArgKind;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
-use formualizer_parse::parser::ReferenceType;
 
 fn binary_search_match(slice: &[LiteralValue], needle: &LiteralValue, mode: i32) -> Option<usize> {
     if mode == 0 || slice.is_empty() {
@@ -62,6 +61,61 @@ fn binary_search_match(slice: &[LiteralValue], needle: &LiteralValue, mode: i32)
 
 #[derive(Debug)]
 pub struct MatchFn;
+/// Returns the relative position of a lookup value in a one-dimensional array.
+///
+/// `MATCH` supports exact and approximate modes and returns a 1-based position.
+///
+/// # Remarks
+/// - `match_type` defaults to `1` (approximate, ascending).
+/// - `match_type=0` performs exact matching and supports `*`, `?`, and `~` wildcards for text.
+/// - `match_type=1` looks for the largest value less than or equal to the lookup value.
+/// - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
+/// - Approximate modes require sorted data; unsorted data returns `#N/A`.
+/// - If no match is found, returns `#N/A`.
+///
+/// # Examples
+/// ```yaml,sandbox
+/// title: "Exact text match"
+/// grid:
+///   A1: "A"
+///   A2: "B"
+///   A3: "C"
+/// formula: '=MATCH("B",A1:A3,0)'
+/// expected: 2
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Approximate numeric match"
+/// grid:
+///   A1: 10
+///   A2: 20
+///   A3: 30
+///   A4: 40
+/// formula: '=MATCH(27,A1:A4,1)'
+/// expected: 2
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - XMATCH
+///   - XLOOKUP
+///   - VLOOKUP
+/// faq:
+///   - q: "Why does MATCH with match_type 1 or -1 return #N/A on unsorted data?"
+///     a: "Approximate modes assume ordered lookup data; this implementation treats detected unsorted inputs as no valid match and returns #N/A."
+///   - q: "When are wildcards interpreted in MATCH?"
+///     a: "Wildcard patterns (*, ?, ~ escapes) are only applied in exact mode (match_type=0) for text lookup values."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: MATCH
+/// Type: MatchFn
+/// Min args: 2
+/// Max args: 3
+/// Variadic: false
+/// Signature: MATCH(arg1: any@scalar, arg2: any@range, arg3?: number@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Caps: PURE, LOOKUP
+/// [formualizer-docgen:schema:end]
 impl Function for MatchFn {
     fn name(&self) -> &'static str {
         "MATCH"
@@ -277,6 +331,64 @@ impl Function for MatchFn {
 
 #[derive(Debug)]
 pub struct VLookupFn;
+/// Looks up a value in the first column of a table and returns a value from another column.
+///
+/// `VLOOKUP` searches vertically and returns the matching row's value from `col_index_num`.
+///
+/// # Remarks
+/// - `col_index_num` is 1-based and must be within the table width.
+/// - `range_lookup` defaults to `FALSE` in this engine (exact match by default).
+/// - When `range_lookup=TRUE`, approximate match logic is used against the first column.
+/// - If the lookup value is not found, returns `#N/A`.
+/// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
+/// - A matched empty target cell is materialized as numeric `0`.
+///
+/// # Examples
+/// ```yaml,sandbox
+/// title: "Exact match in a key/value table"
+/// grid:
+///   A1: "SKU-1"
+///   B1: 12.5
+///   A2: "SKU-2"
+///   B2: 18
+/// formula: '=VLOOKUP("SKU-2",A1:B2,2,FALSE)'
+/// expected: 18
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Approximate tier lookup"
+/// grid:
+///   A1: 0
+///   B1: "Bronze"
+///   A2: 1000
+///   B2: "Silver"
+///   A3: 5000
+///   B3: "Gold"
+/// formula: '=VLOOKUP(3200,A1:B3,2,TRUE)'
+/// expected: "Silver"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - HLOOKUP
+///   - XLOOKUP
+///   - MATCH
+/// faq:
+///   - q: "What is the default behavior when range_lookup is omitted?"
+///     a: "This engine defaults range_lookup to FALSE, so VLOOKUP performs exact matching unless TRUE is explicitly provided."
+///   - q: "What happens if col_index_num points outside the table?"
+///     a: "A numeric out-of-range column index returns #REF!, while a non-numeric col_index_num returns #VALUE!."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: VLOOKUP
+/// Type: VLookupFn
+/// Min args: 3
+/// Max args: 4
+/// Variadic: false
+/// Signature: VLOOKUP(arg1: any@scalar, arg2: any@range, arg3: number@scalar, arg4?: logical@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Caps: PURE, LOOKUP
+/// [formualizer-docgen:schema:end]
 impl Function for VLookupFn {
     fn name(&self) -> &'static str {
         "VLOOKUP"
@@ -375,32 +487,15 @@ impl Function for VLookupFn {
         };
         // Handle both cell references and array literals
         if let Some(table_ref) = table_ref_opt {
-            let (sheet, sr, sc, er, ec) = match &table_ref {
-                ReferenceType::Range {
-                    sheet,
-                    start_row: Some(sr),
-                    start_col: Some(sc),
-                    end_row: Some(er),
-                    end_col: Some(ec),
-                    ..
-                } => (sheet.clone(), *sr, *sc, *er, *ec),
-                _ => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
-            };
             let current_sheet = ctx.current_sheet();
-            let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
-            let width = ec - sc + 1;
-            if col_index as u32 > width {
+            let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
+            let (rows, cols) = rv.dims();
+            if col_index as usize > cols {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Ref),
                 )));
             }
 
-            let rv = ctx.resolve_range_view(&table_ref, sheet_name)?;
-            let rows = rv.dims().0;
             let first_col_view = rv.sub_view(0, 0, rows, 1);
             let row_idx_opt = if !approximate {
                 let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
@@ -426,9 +521,15 @@ impl Function for VLookupFn {
             match row_idx_opt {
                 Some(i) => {
                     let target_col_idx = (col_index - 1) as usize;
-                    Ok(crate::traits::CalcValue::Scalar(
-                        rv.get_cell(i, target_col_idx),
-                    ))
+                    let v = rv.get_cell(i, target_col_idx);
+                    // Excel treats a direct reference to an empty cell as 0.
+                    // VLOOKUP/HLOOKUP return the referenced cell value, so match Excel by
+                    // materializing Empty as numeric 0. (Empty text "" remains Text(""))
+                    let v = match v {
+                        LiteralValue::Empty => LiteralValue::Number(0.0),
+                        other => other,
+                    };
+                    Ok(crate::traits::CalcValue::Scalar(v))
                 }
                 None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Na),
@@ -471,6 +572,10 @@ impl Function for VLookupFn {
                         .and_then(|r| r.get(target_col_idx))
                         .cloned()
                         .unwrap_or(LiteralValue::Empty);
+                    let val = match val {
+                        LiteralValue::Empty => LiteralValue::Number(0.0),
+                        other => other,
+                    };
                     Ok(crate::traits::CalcValue::Scalar(val))
                 }
                 None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -483,6 +588,64 @@ impl Function for VLookupFn {
 
 #[derive(Debug)]
 pub struct HLookupFn;
+/// Looks up a value in the first row of a table and returns a value from another row.
+///
+/// `HLOOKUP` searches horizontally and returns the matching column's value from `row_index_num`.
+///
+/// # Remarks
+/// - `row_index_num` is 1-based and must be within the table height.
+/// - `range_lookup` defaults to `FALSE` in this engine (exact match by default).
+/// - When `range_lookup=TRUE`, approximate match logic is used against the first row.
+/// - If the lookup value is not found, returns `#N/A`.
+/// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
+/// - A matched empty target cell is materialized as numeric `0`.
+///
+/// # Examples
+/// ```yaml,sandbox
+/// title: "Exact match across header row"
+/// grid:
+///   A1: "Jan"
+///   B1: "Feb"
+///   A2: 120
+///   B2: 150
+/// formula: '=HLOOKUP("Feb",A1:B2,2,FALSE)'
+/// expected: 150
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Approximate threshold lookup"
+/// grid:
+///   A1: 0
+///   B1: 50
+///   C1: 80
+///   A2: "F"
+///   B2: "C"
+///   C2: "A"
+/// formula: '=HLOOKUP(72,A1:C2,2,TRUE)'
+/// expected: "C"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - VLOOKUP
+///   - XLOOKUP
+///   - MATCH
+/// faq:
+///   - q: "Does HLOOKUP default to exact or approximate matching?"
+///     a: "It defaults to exact matching in this engine because range_lookup defaults to FALSE."
+///   - q: "How are invalid row_index_num values reported?"
+///     a: "If row_index_num is outside table height HLOOKUP returns #REF!; if it is non-numeric it returns #VALUE!."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: HLOOKUP
+/// Type: HLookupFn
+/// Min args: 3
+/// Max args: 4
+/// Variadic: false
+/// Signature: HLOOKUP(arg1: any@scalar, arg2: any@range, arg3: number@scalar, arg4?: logical@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Caps: PURE, LOOKUP
+/// [formualizer-docgen:schema:end]
 impl Function for HLookupFn {
     fn name(&self) -> &'static str {
         "HLOOKUP"
@@ -581,35 +744,17 @@ impl Function for HLookupFn {
         };
         // Handle both cell references and array literals
         if let Some(table_ref) = table_ref_opt {
-            let (sheet, sr, sc, er, ec) = match &table_ref {
-                ReferenceType::Range {
-                    sheet,
-                    start_row: Some(sr),
-                    start_col: Some(sc),
-                    end_row: Some(er),
-                    end_col: Some(ec),
-                    ..
-                } => (sheet.clone(), *sr, *sc, *er, *ec),
-                _ => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
-            };
             let current_sheet = ctx.current_sheet();
-            let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
-            let height = er - sr + 1;
-            let width = ec - sc + 1;
-            if row_index as u32 > height {
+            let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
+            let (rows, cols) = rv.dims();
+            if row_index as usize > rows {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Ref),
                 )));
             }
-            let rv = ctx.resolve_range_view(&table_ref, sheet_name)?;
-            let cols = rv.dims().1;
             let first_row_view = rv.sub_view(0, 0, 1, cols);
             let col_idx_opt = if approximate {
-                let mut first_row: Vec<LiteralValue> = Vec::with_capacity(width as usize);
+                let mut first_row: Vec<LiteralValue> = Vec::with_capacity(cols);
                 first_row_view.for_each_row(&mut |row| {
                     if first_row.is_empty() {
                         first_row.extend_from_slice(row);
@@ -629,9 +774,12 @@ impl Function for HLookupFn {
             match col_idx_opt {
                 Some(i) => {
                     let target_row_idx = (row_index - 1) as usize;
-                    Ok(crate::traits::CalcValue::Scalar(
-                        rv.get_cell(target_row_idx, i),
-                    ))
+                    let v = rv.get_cell(target_row_idx, i);
+                    let v = match v {
+                        LiteralValue::Empty => LiteralValue::Number(0.0),
+                        other => other,
+                    };
+                    Ok(crate::traits::CalcValue::Scalar(v))
                 }
                 None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Na),
@@ -673,6 +821,10 @@ impl Function for HLookupFn {
                         .and_then(|r| r.get(i))
                         .cloned()
                         .unwrap_or(LiteralValue::Empty);
+                    let val = match val {
+                        LiteralValue::Empty => LiteralValue::Number(0.0),
+                        other => other,
+                    };
                     Ok(crate::traits::CalcValue::Scalar(val))
                 }
                 None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1046,6 +1198,78 @@ mod tests {
     }
 
     #[test]
+    fn vlookup_named_range_reference() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(VLookupFn))
+            .with_named_range(
+                "Split",
+                vec![
+                    vec![
+                        LiteralValue::Text("Professional".into()),
+                        LiteralValue::Int(123),
+                    ],
+                    vec![LiteralValue::Text("Support".into()), LiteralValue::Int(77)],
+                ],
+            );
+        let ctx = wb.interpreter();
+        let table = ASTNode::new(
+            ASTNodeType::Reference {
+                original: "Split".into(),
+                reference: ReferenceType::NamedRange("Split".into()),
+            },
+            None,
+        );
+        let f = ctx.context.get_function("", "VLOOKUP").unwrap();
+        let key = lit(LiteralValue::Text("Professional".into()));
+        let two = lit(LiteralValue::Int(2));
+        let false_lit = lit(LiteralValue::Boolean(false));
+        let args = vec![
+            ArgumentHandle::new(&key, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&false_lit, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Number(123.0));
+    }
+
+    #[test]
+    fn vlookup_blank_target_cell_returns_zero() {
+        // Excel treats a direct reference to an empty cell as 0.
+        // VLOOKUP should therefore return 0 (not Empty) when the found cell is empty.
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(VLookupFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1));
+
+        let ctx = wb.interpreter();
+        let table = ASTNode::new(
+            ASTNodeType::Reference {
+                original: "A1:B1".into(),
+                reference: ReferenceType::range(None, Some(1), Some(1), Some(1), Some(2)),
+            },
+            None,
+        );
+        let f = ctx.context.get_function("", "VLOOKUP").unwrap();
+        let key1 = lit(LiteralValue::Int(1));
+        let two = lit(LiteralValue::Int(2));
+        let false_lit = lit(LiteralValue::Boolean(false));
+        let args = vec![
+            ArgumentHandle::new(&key1, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&false_lit, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Number(0.0));
+    }
+
+    #[test]
     fn hlookup_basic() {
         let wb = TestWorkbook::new()
             .with_function(Arc::new(HLookupFn))
@@ -1076,5 +1300,36 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v, LiteralValue::Number(100.0));
+    }
+
+    #[test]
+    fn hlookup_blank_target_cell_returns_zero() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(HLookupFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1));
+
+        let ctx = wb.interpreter();
+        let table = ASTNode::new(
+            ASTNodeType::Reference {
+                original: "A1:B2".into(),
+                reference: ReferenceType::range(None, Some(1), Some(1), Some(2), Some(2)),
+            },
+            None,
+        );
+        let f = ctx.context.get_function("", "HLOOKUP").unwrap();
+        let key1 = lit(LiteralValue::Int(1));
+        let two = lit(LiteralValue::Int(2));
+        let false_lit = lit(LiteralValue::Boolean(false));
+        let args = vec![
+            ArgumentHandle::new(&key1, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&false_lit, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Number(0.0));
     }
 }

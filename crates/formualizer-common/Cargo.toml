@@ -1,13 +1,14 @@
 [package]
 name = "formualizer-common"
-version = "1.0.0"
+version = "1.1.1"
 edition = "2024"
 description = "Core value, reference, and error types shared across the Formualizer parser and engine"
 homepage.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
 readme = "README.md"
-keywords = ["excel", "formula", "spreadsheet", "engine", "arrow"]
+keywords = ["spreadsheet", "excel", "types", "cell", "reference"]
 categories = ["data-structures"]
 
 [features]

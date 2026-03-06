@@ -13,21 +13,23 @@ members = [
   "crates/sheetport-spec",
   "crates/formualizer-sheetport",
   "crates/formualizer",
+  "crates/xtask",
 ]
 
 [workspace.package]
 homepage = "https://github.com/psu3d0/formualizer"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/psu3d0/formualizer"
+documentation = "https://docs.rs/formualizer"
 
 
 [workspace.dependencies]
 
-formualizer-common = { version = "1.0.0", path = "crates/formualizer-common" }
-formualizer-macros = { version = "0.3.0", path = "crates/formualizer-macros" }
-formualizer-parse = { version = "1.0.0", path = "crates/formualizer-parse" }
-formualizer-eval = { version = "0.3.0", path = "crates/formualizer-eval" }
-formualizer-workbook = { version = "0.3.0", path = "crates/formualizer-workbook" }
+formualizer-common = { version = "1.1.1", path = "crates/formualizer-common" }
+formualizer-macros = { version = "0.4.3", path = "crates/formualizer-macros" }
+formualizer-parse = { version = "1.1.1", path = "crates/formualizer-parse" }
+formualizer-eval = { version = "0.4.3", path = "crates/formualizer-eval" }
+formualizer-workbook = { version = "0.4.3", path = "crates/formualizer-workbook" }
 
 chrono = "0.4.41"
 serde = "1.0.228"
@@ -50,3 +52,6 @@ wasm-bindgen-futures = "0.4.45"
 js-sys = "0.3.72"
 web-sys = "0.3.72"
 syn = "2.0"
+
+[patch.crates-io]
+umya-spreadsheet = { git = "https://github.com/PSU3D0/umya-spreadsheet.git", rev = "4b64d65daf19bba79800951cd38920d7eb95320c" }

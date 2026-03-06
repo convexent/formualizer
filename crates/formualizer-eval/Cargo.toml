@@ -1,13 +1,14 @@
 [package]
 name = "formualizer-eval"
-version = "0.3.0"
+version = "0.4.3"
 edition = "2024"
 description = "High-performance Arrow-backed Excel formula engine with dependency graph and incremental recalculation"
 homepage.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
 readme = "README.md"
-keywords = ["excel", "formula", "engine", "arrow", "spreadsheet"]
+keywords = ["spreadsheet", "excel", "evaluation", "arrow", "dependency-graph"]
 categories = ["data-structures", "mathematics"]
 
 [lints.rust]
@@ -65,6 +66,15 @@ optional = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
 glob = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "interval_tree_bench"
+harness = false
+
+[[bench]]
+name = "sheet_ops"
+harness = false
 
 [features]
 default = []

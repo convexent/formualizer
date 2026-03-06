@@ -1,13 +1,4 @@
-import init, {
-  Tokenizer as WasmTokenizer,
-  Parser as WasmParser,
-  ASTNode as WasmASTNode,
-  Reference as WasmReference,
-  parse as wasmParse,
-  FormulaDialect as WasmFormulaDialect,
-  Workbook as WasmWorkbook,
-  SheetPortSession as WasmSheetPortSession,
-} from '../pkg/formualizer_wasm.js';
+import * as wasm from '../pkg/formualizer_wasm.js';
 
 let wasmInitialized = false;
 let wasmInitPromise: Promise<void> | null = null;
@@ -18,7 +9,8 @@ let wasmInitPromise: Promise<void> | null = null;
  */
 export async function initializeWasm(): Promise<void> {
   if (!wasmInitPromise) {
-    wasmInitPromise = init().then(() => {
+    // wasm-pack `--target bundler` initializes at module import time.
+    wasmInitPromise = Promise.resolve().then(() => {
       wasmInitialized = true;
     });
   }
@@ -37,8 +29,10 @@ async function ensureInitialized<T>(fn: () => T): Promise<T> {
 
 export interface Token {
   tokenType: string;
+  subtype: string;
   value: string;
   pos: number;
+  end: number;
 }
 
 export interface ReferenceData {
@@ -65,6 +59,10 @@ export interface ASTNodeData {
   operand?: ASTNodeData;
   elements?: ASTNodeData[][];
   message?: string;
+  sourceStart?: number;
+  sourceEnd?: number;
+  sourceTokenType?: string;
+  sourceTokenSubtype?: string;
 }
 
 export enum FormulaDialect {
@@ -72,26 +70,49 @@ export enum FormulaDialect {
   OpenFormula = 'openFormula',
 }
 
-function resolveDialect(dialect?: FormulaDialect): WasmFormulaDialect | undefined {
+function resolveDialect(dialect?: FormulaDialect): wasm.FormulaDialect | undefined {
   if (dialect === undefined) {
     return undefined;
   }
 
   return dialect === FormulaDialect.OpenFormula
-    ? WasmFormulaDialect.OpenFormula
-    : WasmFormulaDialect.Excel;
+    ? wasm.FormulaDialect.OpenFormula
+    : wasm.FormulaDialect.Excel;
+}
+
+function normalizeWasmValue<T>(value: unknown): T {
+  if (value instanceof Map) {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of value.entries()) {
+      obj[String(k)] = normalizeWasmValue(v);
+    }
+    return obj as T;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeWasmValue(item)) as T;
+  }
+
+  if (value && typeof value === 'object') {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      obj[k] = normalizeWasmValue(v);
+    }
+    return obj as T;
+  }
+
+  return value as T;
 }
 
 export class Tokenizer {
-  private inner: WasmTokenizer;
+  private inner: wasm.Tokenizer;
 
   constructor(formula: string, dialect?: FormulaDialect) {
-    this.inner = new WasmTokenizer(formula, resolveDialect(dialect));
+    this.inner = new wasm.Tokenizer(formula, resolveDialect(dialect));
   }
 
   get tokens(): Token[] {
-    const tokensJson = this.inner.tokens();
-    return JSON.parse(tokensJson);
+    return normalizeWasmValue<Token[]>(this.inner.tokens() as unknown);
   }
 
   render(): string {
@@ -103,8 +124,7 @@ export class Tokenizer {
   }
 
   getToken(index: number): Token {
-    const tokenJson = this.inner.getToken(index);
-    return JSON.parse(tokenJson);
+    return normalizeWasmValue<Token>(this.inner.getToken(index) as unknown);
   }
 
   toString(): string {
@@ -113,29 +133,27 @@ export class Tokenizer {
 }
 
 export class Parser {
-  private inner: WasmParser;
+  private inner: wasm.Parser;
 
   constructor(formula: string, dialect?: FormulaDialect) {
-    this.inner = new WasmParser(formula, resolveDialect(dialect));
+    this.inner = new wasm.Parser(formula, resolveDialect(dialect));
   }
 
   parse(): ASTNodeData {
     const ast = this.inner.parse();
-    const json = ast.toJSON();
-    return JSON.parse(json);
+    return normalizeWasmValue<ASTNodeData>(ast.toJSON() as unknown);
   }
 }
 
 export class ASTNode {
-  private inner: WasmASTNode;
+  private inner: wasm.ASTNode;
 
-  constructor(inner: WasmASTNode) {
+  constructor(inner: wasm.ASTNode) {
     this.inner = inner;
   }
 
   toJSON(): ASTNodeData {
-    const json = this.inner.toJSON();
-    return JSON.parse(json);
+    return normalizeWasmValue<ASTNodeData>(this.inner.toJSON() as unknown);
   }
 
   toString(): string {
@@ -148,7 +166,7 @@ export class ASTNode {
 }
 
 export class Reference {
-  private inner: WasmReference;
+  private inner: wasm.Reference;
 
   constructor(
     sheet: string | undefined,
@@ -161,7 +179,7 @@ export class Reference {
     rowAbsEnd: boolean,
     colAbsEnd: boolean,
   ) {
-    this.inner = new WasmReference(
+    this.inner = new wasm.Reference(
       sheet,
       rowStart,
       colStart,
@@ -223,8 +241,7 @@ export class Reference {
   }
 
   toJSON(): ReferenceData {
-    const json = this.inner.toJSON();
-    return JSON.parse(json);
+    return normalizeWasmValue<ReferenceData>(this.inner.toJSON() as unknown);
   }
 }
 
@@ -246,13 +263,52 @@ export async function parse(
   dialect?: FormulaDialect,
 ): Promise<ASTNodeData> {
   return ensureInitialized(() => {
-    const ast = wasmParse(formula, resolveDialect(dialect));
-    const json = ast.toJSON();
-    return JSON.parse(json);
+    const ast = wasm.parse(formula, resolveDialect(dialect));
+    return normalizeWasmValue<ASTNodeData>(ast.toJSON() as unknown);
   });
 }
 
-export { WasmWorkbook as Workbook, WasmSheetPortSession as SheetPortSession };
+export type CellScalar = null | undefined | boolean | number | string;
+export type CellArray = CellScalar[] | CellScalar[][];
+export type CellValue = CellScalar | CellArray;
+
+export interface CustomFunctionOptions {
+  minArgs?: number;
+  maxArgs?: number | null;
+  volatile?: boolean;
+  threadSafe?: boolean;
+  deterministic?: boolean;
+  allowOverrideBuiltin?: boolean;
+}
+
+export interface RegisteredFunctionInfo {
+  name: string;
+  minArgs: number;
+  maxArgs: number | null;
+  volatile: boolean;
+  threadSafe: boolean;
+  deterministic: boolean;
+  allowOverrideBuiltin: boolean;
+}
+
+export interface WorkbookApi extends wasm.Workbook {
+  registerFunction(
+    name: string,
+    callback: (...args: CellValue[]) => CellValue,
+    options?: CustomFunctionOptions,
+  ): void;
+  unregisterFunction(name: string): void;
+  listFunctions(): RegisteredFunctionInfo[];
+}
+
+export type WorkbookConstructor = {
+  new (): WorkbookApi;
+  fromJson(json: string): WorkbookApi;
+  prototype: WorkbookApi;
+};
+
+export const Workbook = wasm.Workbook as unknown as WorkbookConstructor;
+export const SheetPortSession = wasm.SheetPortSession;
 
 // Re-export the initialization function as default
 export default initializeWasm;

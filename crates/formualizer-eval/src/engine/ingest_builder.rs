@@ -164,6 +164,14 @@ impl<'g> BulkIngestBuilder<'g> {
             }
             // 1) Build plan for formulas on this sheet
             if !stage.formulas.is_empty() {
+                // Rewrite context-dependent structured references (e.g., this-row selectors)
+                // into concrete references using the current graph's table metadata.
+                for (r, c, ast, _vol) in stage.formulas.iter_mut() {
+                    let coord = crate::reference::Coord::from_excel(*r, *c, true, true);
+                    let cell = crate::reference::CellRef::new(stage.id, coord);
+                    self.g.rewrite_structured_references_for_cell(ast, cell)?;
+                }
+
                 let tp0 = Instant::now();
                 let refs = stage
                     .formulas
@@ -221,10 +229,11 @@ impl<'g> BulkIngestBuilder<'g> {
                 let mut target_vids: Vec<VertexId> = Vec::with_capacity(plan.formula_targets.len());
                 for (i, (sid, pc)) in plan.formula_targets.iter().enumerate() {
                     let vid = self.g.vid_for_sid_pc(*sid, *pc).expect("VID must exist");
-                    target_vids.push(vid);
-                    // Remove old edges if replacing a formula
+                    target_vids.push(vid); // Remove old edges if replacing a formula
+                    let ast_ref = &stage.formulas[i].2;
+                    let dynamic = self.g.is_ast_dynamic(ast_ref);
                     self.g
-                        .assign_formula_vertex(vid, ast_ids[i], stage.formulas[i].3);
+                        .assign_formula_vertex(vid, ast_ids[i], stage.formulas[i].3, dynamic);
                 }
                 total_formulas += target_vids.len();
                 t_assign_ms = ta0.elapsed().as_millis();

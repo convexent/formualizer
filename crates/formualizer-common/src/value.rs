@@ -10,50 +10,58 @@ use crate::ExcelError;
 use serde::{Deserialize, Serialize};
 
 /* ───────────────────── Excel date-serial utilities ───────────────────
-Excel's serial date system:
-  Serial 1  = 1900-01-01
-  Serial 59 = 1900-02-28
-  Serial 60 = 1900-02-29  (phantom – doesn't exist, but Excel thinks it does)
-  Serial 61 = 1900-03-01
-Base date = 1899-12-31 so that serial 1 = base + 1 day = 1900-01-01.
-Time is stored as fractional days (no timezone).
-------------------------------------------------------------------- */
+Excel 1900 system with the leap-year bug.
 
-/// Base date for the 1900 date system. Serial 1 = base + 1 day = 1900-01-01.
-const EXCEL_EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
+Serial 1  = 1900-01-01
+Serial 59 = 1900-02-28
+Serial 60 = 1900-02-29 (phantom day; does not exist)
+Serial 61 = 1900-03-01
+
+Time is stored as fractional days (no timezone).
+
+Implementation notes:
+- For date -> serial: compute days since base 1899-12-31. If date >= 1900-03-01, add 1.
+- For serial -> date: if serial == 60, map to 1900-02-28. If serial > 60, subtract 1 day.
+-------------------------------------------------------------------- */
 
 pub fn datetime_to_serial(dt: &NaiveDateTime) -> f64 {
-    let days = (dt.date() - EXCEL_EPOCH).num_days();
-    // Dates on or after 1900-03-01 get +1 to account for phantom Feb 29
-    let serial_days = if dt.date() >= NaiveDate::from_ymd_opt(1900, 3, 1).unwrap() {
-        days + 1
-    } else {
-        days
-    };
+    let base = NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
+    let mut days = (dt.date() - base).num_days();
+
+    // Account for Excel's phantom 1900-02-29.
+    if dt.date() >= NaiveDate::from_ymd_opt(1900, 3, 1).unwrap() {
+        days += 1;
+    }
 
     let secs_in_day = dt.time().num_seconds_from_midnight() as f64;
-    serial_days as f64 + secs_in_day / 86_400.0
+    days as f64 + secs_in_day / 86_400.0
 }
 
 pub fn serial_to_datetime(serial: f64) -> NaiveDateTime {
     let days = serial.trunc() as i64;
     let frac_secs = (serial.fract() * 86_400.0).round() as i64;
 
-    // Serial 60 is phantom 1900-02-29; map to 1900-02-28
-    let date = if days == 60 {
-        NaiveDate::from_ymd_opt(1900, 2, 28).unwrap()
+    // Excel base: serial 1 = 1900-01-01
+    let base = NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
+
+    // Handle phantom day explicitly.
+    let offset_days = if days == 60 {
+        59
+    } else if days < 60 {
+        days
     } else {
-        // serial < 60: offset = serial (no phantom day yet)
-        // serial > 60: offset = serial - 1 (skip phantom day)
-        let offset = if days < 60 { days } else { days - 1 };
-        EXCEL_EPOCH + ChronoDur::days(offset)
+        days - 1
     };
 
+    let date = base + ChronoDur::days(offset_days);
     let time =
         NaiveTime::from_num_seconds_from_midnight_opt((frac_secs.rem_euclid(86_400)) as u32, 0)
             .unwrap();
     date.and_time(time)
 }
+
+// Historical: EXCEL_EPOCH previously used 1899-12-30 in this crate. Keep all conversions going
+// through the functions above, which are aligned with `formualizer-eval`'s Excel1900 mapping.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DateSystem {
@@ -198,5 +206,36 @@ impl LiteralValue {
             LiteralValue::Empty => false,
             LiteralValue::Pending => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excel_1900_serial_roundtrip_basic() {
+        let base = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+        let dt = base.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        assert!((datetime_to_serial(&dt) - 1.0).abs() < 1e-12);
+        assert_eq!(serial_to_datetime(1.0).date(), base);
+    }
+
+    #[test]
+    fn excel_1900_phantom_day_behavior() {
+        // Excel treats serial 60 as 1900-02-29. We map it to 1900-02-28.
+        let d59 = serial_to_datetime(59.0).date();
+        let d60 = serial_to_datetime(60.0).date();
+        let d61 = serial_to_datetime(61.0).date();
+        assert_eq!(d59, NaiveDate::from_ymd_opt(1900, 2, 28).unwrap());
+        assert_eq!(d60, NaiveDate::from_ymd_opt(1900, 2, 28).unwrap());
+        assert_eq!(d61, NaiveDate::from_ymd_opt(1900, 3, 1).unwrap());
+    }
+
+    #[test]
+    fn excel_1900_modern_date_regression() {
+        // Regression: Excel serial for 2023-03-01 should decode to 2023-03-01.
+        let d = serial_to_datetime(44986.0).date();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2023, 3, 1).unwrap());
     }
 }

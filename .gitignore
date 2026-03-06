@@ -12,3 +12,8 @@ opencode.json
 !tests/formula_tests/extended_coverage.json
 *.xlsx
 test-wb/
+tickets/
+
+# Local git worktrees (repo-local)
+.worktrees/
+.forkops/

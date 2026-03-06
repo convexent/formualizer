@@ -13,6 +13,409 @@ fn lit_num(value: f64) -> LiteralValue {
     LiteralValue::Number(value)
 }
 
+fn canonical_cfg() -> EvalConfig {
+    EvalConfig::default()
+}
+
+#[test]
+fn workbook_named_literal_invalidation_updates_dependents() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .define_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=X+1").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(2.0))
+    );
+
+    engine
+        .update_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(2.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(3.0))
+    );
+
+    // Arrow overlay should reflect the updated result (sheet-grid truth).
+    let asheet = engine.sheet_store().sheet("Sheet1").expect("arrow sheet");
+    let av = asheet.range_view(0, 0, 0, 0);
+    match av.get_cell(0, 0) {
+        LiteralValue::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+        other => panic!("expected Number(3.0) from Arrow overlay, got {other:?}"),
+    }
+}
+
+#[test]
+fn sheet_scoped_name_shadows_workbook_name_and_invalidates_locally() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+    let sheet1 = engine.sheet_id_mut("Sheet1");
+    engine.add_sheet("Sheet2").unwrap();
+
+    engine
+        .define_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .define_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(10.0)),
+            NameScope::Sheet(sheet1),
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=X").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet2", 1, 1, parse("=X").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(10.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet2", 1, 1),
+        Some(LiteralValue::Number(1.0))
+    );
+
+    engine
+        .update_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(20.0)),
+            NameScope::Sheet(sheet1),
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(20.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet2", 1, 1),
+        Some(LiteralValue::Number(1.0))
+    );
+}
+
+#[test]
+fn named_formula_reacts_to_cell_precedent_edits() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    engine
+        .define_name(
+            "N",
+            NamedDefinition::Formula {
+                ast: parse("=A1*2").unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=N+1").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(11.0))
+    );
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(7.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(15.0))
+    );
+}
+
+#[test]
+fn named_formula_definition_change_invalidates_dependents() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    engine
+        .define_name(
+            "N",
+            NamedDefinition::Formula {
+                ast: parse("=A1*2").unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=N").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(10.0))
+    );
+
+    engine
+        .update_name(
+            "N",
+            NamedDefinition::Formula {
+                ast: parse("=A1*3").unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(15.0))
+    );
+}
+
+#[test]
+fn named_range_descriptor_uses_arrow_cells_and_updates_on_cell_edits() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(2.0))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 3, 1, LiteralValue::Number(3.0))
+        .unwrap();
+
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    let start = CellRef::new(sid, Coord::from_excel(1, 1, true, true));
+    let end = CellRef::new(sid, Coord::from_excel(3, 1, true, true));
+    engine
+        .define_name(
+            "R",
+            NamedDefinition::Range(RangeRef::new(start, end)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUM(R)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(6.0))
+    );
+
+    // In canonical mode, graph is not the value source.
+    assert!(engine.graph.get_cell_value("Sheet1", 1, 2).is_none());
+
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(20.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(24.0))
+    );
+}
+
+#[test]
+fn column_named_range_uses_range_anchor_column_and_tracks_updates() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    let start = CellRef::new(sid, Coord::from_excel(2, 4, true, true)); // D2
+    let end = CellRef::new(sid, Coord::from_excel(5, 6, true, true)); // F5
+    engine
+        .define_name(
+            "MyRange",
+            NamedDefinition::Range(RangeRef::new(start, end)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=COLUMN(MyRange)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 4),
+        Some(LiteralValue::Number(v)) => assert!((v - 4.0).abs() < 1e-9),
+        other => panic!("expected column index 4 from named range anchor, got {other:?}"),
+    }
+
+    // Move the named range anchor to column F and ensure dependent formulas update.
+    let start2 = CellRef::new(sid, Coord::from_excel(10, 6, true, true)); // F10
+    let end2 = CellRef::new(sid, Coord::from_excel(12, 8, true, true)); // H12
+    engine
+        .update_name(
+            "MyRange",
+            NamedDefinition::Range(RangeRef::new(start2, end2)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 6),
+        Some(LiteralValue::Number(v)) => assert!((v - 6.0).abs() < 1e-9),
+        other => panic!("expected column index 6 after name update, got {other:?}"),
+    }
+}
+
+#[test]
+fn row_and_columns_named_range_track_anchor_and_width_updates() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    let start = CellRef::new(sid, Coord::from_excel(2, 4, true, true)); // D2
+    let end = CellRef::new(sid, Coord::from_excel(5, 6, true, true)); // F5 (3 columns)
+    engine
+        .define_name(
+            "RangeRC",
+            NamedDefinition::Range(RangeRef::new(start, end)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=ROW(RangeRC)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=COLUMNS(RangeRC)").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 2),
+        Some(LiteralValue::Number(v)) => assert!((v - 2.0).abs() < 1e-9),
+        other => panic!("expected row index 2 from named range anchor, got {other:?}"),
+    }
+    match engine.get_cell_value("Sheet1", 1, 2) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 3),
+        Some(LiteralValue::Number(v)) => assert!((v - 3.0).abs() < 1e-9),
+        other => panic!("expected width 3 from named range, got {other:?}"),
+    }
+
+    // Move anchor row and change width to verify both values update.
+    let start2 = CellRef::new(sid, Coord::from_excel(10, 6, true, true)); // F10
+    let end2 = CellRef::new(sid, Coord::from_excel(12, 10, true, true)); // J12 (5 columns)
+    engine
+        .update_name(
+            "RangeRC",
+            NamedDefinition::Range(RangeRef::new(start2, end2)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 10),
+        Some(LiteralValue::Number(v)) => assert!((v - 10.0).abs() < 1e-9),
+        other => panic!("expected row index 10 after name update, got {other:?}"),
+    }
+    match engine.get_cell_value("Sheet1", 1, 2) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 5),
+        Some(LiteralValue::Number(v)) => assert!((v - 5.0).abs() < 1e-9),
+        other => panic!("expected width 5 after name update, got {other:?}"),
+    }
+}
+
+#[test]
+fn rows_full_column_reference_returns_excel_sheet_height() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=ROWS(A:A)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 1_048_576),
+        Some(LiteralValue::Number(v)) => assert!((v - 1_048_576.0).abs() < 1e-9),
+        other => panic!("expected 1048576 rows for full-column reference, got {other:?}"),
+    }
+}
+
+#[test]
+fn columns_full_row_reference_returns_excel_sheet_width() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=COLUMNS(1:1)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Int(v)) => assert_eq!(v, 16_384),
+        Some(LiteralValue::Number(v)) => assert!((v - 16_384.0).abs() < 1e-9),
+        other => panic!("expected 16384 columns for full-row reference, got {other:?}"),
+    }
+}
+
+#[test]
+fn removing_referenced_sheet_yields_ref_for_name_and_dependents() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+
+    let data_id = engine.add_sheet("Data").unwrap();
+    engine
+        .set_cell_value("Data", 1, 1, LiteralValue::Number(42.0))
+        .unwrap();
+
+    let target = CellRef::new(data_id, Coord::from_excel(1, 1, true, true));
+    engine
+        .define_name("X", NamedDefinition::Cell(target), NameScope::Workbook)
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=X").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(42.0))
+    );
+
+    engine.remove_sheet(data_id).unwrap();
+    engine.evaluate_all().unwrap();
+
+    match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Ref),
+        other => panic!("expected #REF! after removing referenced sheet, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_named_range_basic() {
     let mut graph = DependencyGraph::new();
@@ -199,11 +602,9 @@ fn engine_get_cell_value_handles_named_range_formula() {
         .expect("engine should surface formula result");
     assert!(matches!(via_engine, LiteralValue::Number(n) if (n - 20.0).abs() < 1e-9));
 
-    let via_graph = engine
-        .graph
-        .get_cell_value("Sheet1", 1, 2)
-        .expect("graph should have formula value");
-    assert!(matches!(via_graph, LiteralValue::Number(n) if (n - 20.0).abs() < 1e-9));
+    // In Arrow-canonical mode, the dependency graph is not allowed to cache cell/formula values.
+    // The engine must surface the value via Arrow storage instead.
+    assert!(engine.graph.get_cell_value("Sheet1", 1, 2).is_none());
 
     engine
         .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(25.0))
@@ -215,11 +616,219 @@ fn engine_get_cell_value_handles_named_range_formula() {
         .expect("engine should reflect updated named range");
     assert!(matches!(updated_engine, LiteralValue::Number(n) if (n - 50.0).abs() < 1e-9));
 
-    let updated_graph = engine
+    assert!(engine.graph.get_cell_value("Sheet1", 1, 2).is_none());
+}
+
+#[test]
+fn engine_sheet_scope_precedence_prefers_sheet_over_workbook() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    let sheet1 = engine.sheet_id_mut("Sheet1");
+    engine.add_sheet("Sheet2").unwrap();
+    let sheet2 = engine.sheet_id_mut("Sheet2");
+
+    engine
+        .define_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .define_name(
+            "X",
+            NamedDefinition::Literal(LiteralValue::Number(2.0)),
+            NameScope::Sheet(sheet1),
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=X").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet2", 1, 1, parse("=X").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+
+    let v1 = engine.get_cell_value("Sheet1", 1, 1).unwrap();
+    assert!(matches!(v1, LiteralValue::Number(n) if (n - 2.0).abs() < 1e-9));
+
+    let v2 = engine.get_cell_value("Sheet2", 1, 1).unwrap();
+    assert!(matches!(v2, LiteralValue::Number(n) if (n - 1.0).abs() < 1e-9));
+
+    // Ensure lookups are per-sheet.
+    assert!(engine.graph.resolve_name_entry("X", sheet1).is_some());
+    assert!(engine.graph.resolve_name_entry("X", sheet2).is_some());
+}
+
+#[test]
+fn engine_named_ranges_snapshot_includes_workbook_and_sheet_scopes() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let sheet1 = engine.sheet_id_mut("Sheet1");
+    engine.add_sheet("Sheet2").unwrap();
+
+    engine
+        .define_name(
+            "GlobalX",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .define_name(
+            "LocalX",
+            NamedDefinition::Literal(LiteralValue::Number(2.0)),
+            NameScope::Sheet(sheet1),
+        )
+        .unwrap();
+
+    let all = engine.named_ranges_snapshot();
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter()
+            .any(|n| n.name == "GlobalX" && n.scope == NameScope::Workbook)
+    );
+    assert!(
+        all.iter()
+            .any(|n| n.name == "LocalX" && n.scope == NameScope::Sheet(sheet1))
+    );
+
+    let visible_on_sheet1 = engine.named_ranges_snapshot_for_sheet(sheet1);
+    assert_eq!(visible_on_sheet1.len(), 2);
+
+    let sheet2 = engine.sheet_id("Sheet2").unwrap();
+    let visible_on_sheet2 = engine.named_ranges_snapshot_for_sheet(sheet2);
+    assert_eq!(visible_on_sheet2.len(), 1);
+    assert_eq!(visible_on_sheet2[0].name, "GlobalX");
+}
+
+#[test]
+fn named_range_resolution_is_case_insensitive_by_default() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+
+    let sheet_id = engine.sheet_id_mut("Sheet1");
+    let input_ref = CellRef::new(sheet_id, Coord::new(0, 0, true, true));
+    engine
+        .define_name(
+            "InputValue",
+            NamedDefinition::Cell(input_ref),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    // Reference the name using different casing.
+    let ast = parse("=inputvalue*2").unwrap();
+    engine.set_cell_formula("Sheet1", 2, 1, ast).unwrap();
+    let v = engine
+        .evaluate_cell("Sheet1", 2, 1)
+        .unwrap()
+        .expect("computed value");
+    assert_eq!(v, LiteralValue::Number(20.0));
+}
+
+#[test]
+fn named_range_definition_rejects_case_insensitive_collisions() {
+    let mut graph = DependencyGraph::new();
+    graph
+        .define_name(
+            "Sales",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    let err = graph
+        .define_name(
+            "sales",
+            NamedDefinition::Literal(LiteralValue::Number(2.0)),
+            NameScope::Workbook,
+        )
+        .expect_err("expected collision error");
+
+    assert_eq!(err.kind, ExcelErrorKind::Name);
+}
+
+#[test]
+fn named_range_definition_allows_distinct_cases_when_case_sensitive_enabled() {
+    let cfg = EvalConfig {
+        case_sensitive_names: true,
+        ..EvalConfig::default()
+    };
+    let mut graph = DependencyGraph::new_with_config(cfg);
+
+    graph
+        .define_name(
+            "Sales",
+            NamedDefinition::Literal(LiteralValue::Number(1.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    graph
+        .define_name(
+            "sales",
+            NamedDefinition::Literal(LiteralValue::Number(2.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+}
+
+#[test]
+fn engine_range_named_array_dependency_propagates() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(20.0))
+        .unwrap();
+
+    let sheet_id = engine.sheet_id_mut("Sheet1");
+    let start = CellRef::new(sheet_id, Coord::new(0, 0, true, true));
+    let end = CellRef::new(sheet_id, Coord::new(1, 0, true, true));
+    engine
+        .define_name(
+            "InputRange",
+            NamedDefinition::Range(RangeRef::new(start, end)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUM(InputRange)").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    let initial = engine.get_cell_value("Sheet1", 1, 2).unwrap();
+    assert!(matches!(initial, LiteralValue::Number(n) if (n - 30.0).abs() < 1e-9));
+
+    let name_vertex = engine
         .graph
-        .get_cell_value("Sheet1", 1, 2)
-        .expect("graph should reflect updated named range");
-    assert!(matches!(updated_graph, LiteralValue::Number(n) if (n - 50.0).abs() < 1e-9));
+        .resolve_name_entry("InputRange", sheet_id)
+        .unwrap()
+        .vertex;
+    assert_eq!(
+        engine.graph.get_vertex_kind(name_vertex),
+        VertexKind::NamedArray
+    );
+
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(50.0))
+        .unwrap();
+
+    let pending = engine.evaluation_vertices();
+    assert!(
+        pending.contains(&name_vertex),
+        "named range vertex should be dirtied after dependency edit"
+    );
+
+    engine.evaluate_all().unwrap();
+    let updated = engine.get_cell_value("Sheet1", 1, 2).unwrap();
+    assert!(matches!(updated, LiteralValue::Number(n) if (n - 60.0).abs() < 1e-9));
 }
 
 #[test]
@@ -1279,6 +1888,9 @@ fn test_vertex_editor_change_log() {
     let mut graph = DependencyGraph::new();
     let mut log = crate::engine::graph::editor::change_log::ChangeLog::new();
 
+    let expected_deleted_def =
+        NamedDefinition::Cell(CellRef::new(0, Coord::from_excel(2, 2, true, true)));
+
     {
         let mut editor =
             crate::engine::graph::editor::VertexEditor::with_logger(&mut graph, &mut log);
@@ -1288,9 +1900,8 @@ fn test_vertex_editor_change_log() {
             .define_name_for_cell("Name1", "Sheet1", 1, 1, NameScope::Workbook)
             .expect("Should define name");
 
-        let new_def = NamedDefinition::Cell(CellRef::new(0, Coord::from_excel(2, 2, true, true)));
         editor
-            .update_name("Name1", new_def, NameScope::Workbook)
+            .update_name("Name1", expected_deleted_def.clone(), NameScope::Workbook)
             .expect("Should update name");
 
         editor
@@ -1306,5 +1917,18 @@ fn test_vertex_editor_change_log() {
     use crate::engine::graph::editor::change_log::ChangeEvent;
     assert!(matches!(&changes[0], ChangeEvent::DefineName { .. }));
     assert!(matches!(&changes[1], ChangeEvent::UpdateName { .. }));
-    assert!(matches!(&changes[2], ChangeEvent::DeleteName { .. }));
+
+    match &changes[2] {
+        ChangeEvent::DeleteName {
+            name,
+            scope,
+            old_definition,
+        } => {
+            assert_eq!(name, "Name1");
+            assert_eq!(*scope, NameScope::Workbook);
+            // Regression: old_definition must be captured *before* deletion.
+            assert_eq!(old_definition.as_ref(), Some(&expected_deleted_def));
+        }
+        _ => panic!("Expected DeleteName event"),
+    }
 }

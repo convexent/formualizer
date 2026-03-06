@@ -161,7 +161,9 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
         }
         LiteralValue::Empty => Ok(CriteriaPredicate::IsBlank),
         LiteralValue::Number(n) => Ok(CriteriaPredicate::Eq(LiteralValue::Number(*n))),
-        LiteralValue::Int(i) => Ok(CriteriaPredicate::Eq(LiteralValue::Int(*i))),
+        // Normalize integer criteria to Number for Excel-style numeric coercions
+        // (e.g. blank == 0, numeric text == number, etc.)
+        LiteralValue::Int(i) => Ok(CriteriaPredicate::Eq(LiteralValue::Number(*i as f64))),
         LiteralValue::Boolean(b) => Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(*b))),
         LiteralValue::Error(e) => Err(e.clone()),
         LiteralValue::Array(arr) => {
@@ -270,6 +272,12 @@ pub fn validate_and_prepare<'a, 'b>(
                             }
                             crate::traits::CalcValue::Range(rv) => Cow::Owned(rv.get_cell(0, 0)),
                             crate::traits::CalcValue::Scalar(s) => Cow::Owned(s),
+                            crate::traits::CalcValue::Callable(_) => {
+                                Cow::Owned(LiteralValue::Error(
+                                    ExcelError::new(ExcelErrorKind::Calc)
+                                        .with_message("LAMBDA value must be invoked"),
+                                ))
+                            }
                         };
                         // Apply coercion policy to Value shapes when applicable
                         let coerced = match spec.coercion {

@@ -1,6 +1,9 @@
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 use formualizer::common::LiteralValue;
+use formualizer::common::error::{ExcelError, ExcelErrorKind};
 
 use crate::engine::{PyEvaluationConfig, eval_plan_to_py};
 use crate::enums::PyWorkbookMode;
@@ -12,6 +15,80 @@ type SheetCache = HashMap<String, SheetCellMap>;
 
 type PyObject = pyo3::Py<pyo3::PyAny>;
 
+struct PyCustomFnHandler {
+    callback: PyObject,
+}
+
+impl PyCustomFnHandler {
+    fn new(callback: PyObject) -> Self {
+        Self { callback }
+    }
+
+    fn pyerr_to_excel_value(err: pyo3::PyErr, py: Python<'_>) -> ExcelError {
+        let exc_name = err
+            .get_type(py)
+            .name()
+            .ok()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "Exception".to_string());
+
+        let mut detail = err.to_string().replace(['\r', '\n'], " ");
+        if let Some(stripped) = detail.strip_prefix(&format!("{exc_name}:")) {
+            detail = stripped.trim().to_string();
+        } else {
+            detail = detail.trim().to_string();
+        }
+
+        if detail.len() > 240 {
+            detail.truncate(240);
+            detail.push_str("...");
+        }
+
+        let message = if detail.is_empty() {
+            format!("Python callback raised {exc_name}")
+        } else {
+            format!("Python callback raised {exc_name}: {detail}")
+        };
+
+        ExcelError::new(ExcelErrorKind::Value).with_message(message)
+    }
+}
+
+impl formualizer::workbook::CustomFnHandler for PyCustomFnHandler {
+    fn call(&self, args: &[LiteralValue]) -> Result<LiteralValue, ExcelError> {
+        Python::attach(|py| {
+            let callback = self.callback.bind(py);
+            let py_args = args
+                .iter()
+                .map(|arg| literal_to_py(py, arg))
+                .collect::<PyResult<Vec<_>>>()
+                .map_err(|err| Self::pyerr_to_excel_value(err, py))?;
+            let tuple =
+                PyTuple::new(py, py_args).map_err(|err| Self::pyerr_to_excel_value(err, py))?;
+            let result = callback
+                .call1(tuple)
+                .map_err(|err| Self::pyerr_to_excel_value(err, py))?;
+            py_to_literal(&result).map_err(|err| Self::pyerr_to_excel_value(err, py))
+        })
+    }
+}
+
+/// Configuration for creating a [`Workbook`].
+///
+/// You typically pass this into `Workbook(config=...)`.
+///
+/// Example:
+/// ```python
+///     import formualizer as fz
+///
+///     cfg = fz.WorkbookConfig(
+///         mode=fz.WorkbookMode.Interactive,
+///         enable_changelog=True,
+///         eval_config=fz.EvaluationConfig(),
+///     )
+///     wb = fz.Workbook(config=cfg)
+/// ```
+#[gen_stub_pyclass]
 #[pyclass(name = "WorkbookConfig", module = "formualizer")]
 #[derive(Clone)]
 pub struct PyWorkbookConfig {
@@ -20,6 +97,7 @@ pub struct PyWorkbookConfig {
     enable_changelog: Option<bool>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyWorkbookConfig {
     #[new]
@@ -48,6 +126,28 @@ impl PyWorkbookConfig {
     }
 }
 
+/// An in-memory Excel-like workbook which can store values and formulas and evaluate them.
+///
+/// Rows and columns are **1-based** (as in Excel).
+///
+/// The workbook supports setting values and formulas, evaluating individual cells,
+/// and (optionally) tracking a changelog for undo/redo.
+///
+/// Quick start:
+/// ```python
+///     import formualizer as fz
+///
+///     wb = fz.Workbook()
+///     s = wb.sheet("Sheet1")
+///
+///     s.set_value(1, 1, fz.LiteralValue.number(1000.0))  # A1
+///     s.set_value(2, 1, fz.LiteralValue.number(0.05))    # A2
+///     s.set_value(3, 1, fz.LiteralValue.number(12.0))    # A3
+///
+///     s.set_formula(1, 2, "=PMT(A2/12, A3, -A1)")
+///     print(wb.evaluate_cell("Sheet1", 1, 2))
+/// ```
+#[gen_stub_pyclass]
 #[pyclass(name = "Workbook", module = "formualizer")]
 #[derive(Clone)]
 pub struct PyWorkbook {
@@ -57,6 +157,7 @@ pub struct PyWorkbook {
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyWorkbook {
     #[new]
@@ -72,7 +173,22 @@ impl PyWorkbook {
         })
     }
 
-    /// Class method: load a workbook from a file path
+    /// Class method: load an XLSX workbook from a file path.
+    ///
+    /// This is equivalent to the top-level `formualizer.load_workbook(...)`.
+    ///
+    /// Args:
+    ///     path: Path to the `.xlsx` file.
+    ///     backend: Backend name (currently defaults to `calamine`).
+    ///     mode/config: Optional workbook configuration.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook.load_path("model.xlsx")
+    ///     print(wb.sheet_names)
+    /// ```
     #[classmethod]
     #[pyo3(signature = (path, strategy=None, backend=None, *, mode=None, config=None))]
     pub fn load_path(
@@ -87,7 +203,22 @@ impl PyWorkbook {
         Self::from_path(_cls, path, backend, mode, config)
     }
 
-    /// Get or create a sheet by name
+    /// Get or create a sheet by name.
+    ///
+    /// This returns a lightweight handle which forwards operations to the parent workbook.
+    ///
+    /// Notes:
+    /// - Sheet names are case-sensitive.
+    /// - The sheet is created if it doesn't exist.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     s = wb.sheet("Data")
+    ///     s.set_value(1, 1, 123)
+    /// ```
     pub fn sheet(&self, name: &str) -> PyResult<crate::sheet::PySheet> {
         // Ensure sheet exists
         {
@@ -141,12 +272,48 @@ impl PyWorkbook {
                     cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 })
             }
+            "umya" => {
+                use formualizer::workbook::backends::UmyaAdapter;
+                use formualizer::workbook::traits::SpreadsheetReader;
+                let adapter =
+                    <UmyaAdapter as SpreadsheetReader>::open_path(std::path::Path::new(path))
+                        .map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                                "open failed: {e}"
+                            ))
+                        })?;
+                let wb = formualizer::workbook::Workbook::from_reader(
+                    adapter,
+                    formualizer::workbook::LoadStrategy::EagerAll,
+                    cfg,
+                )
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("load failed: {e}"))
+                })?;
+                Ok(Self {
+                    inner: std::sync::Arc::new(std::sync::RwLock::new(wb)),
+                    sheets: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                })
+            }
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Unsupported backend: {backend}"
             ))),
         }
     }
 
+    /// Add a sheet to the workbook.
+    ///
+    /// This is idempotent: adding an existing sheet name is a no-op.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     wb.add_sheet("Inputs")
+    ///     wb.add_sheet("Outputs")
+    /// ```
     pub fn add_sheet(&self, name: &str) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -168,6 +335,186 @@ impl PyWorkbook {
         Ok(wb.sheet_names())
     }
 
+    /// Register a workbook-local custom function backed by a Python callable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, callback, *, min_args = 0, max_args = None, volatile = false, thread_safe = false, deterministic = true, allow_override_builtin = false))]
+    pub fn register_function(
+        &self,
+        name: &str,
+        callback: &Bound<'_, PyAny>,
+        min_args: usize,
+        max_args: Option<usize>,
+        volatile: bool,
+        thread_safe: bool,
+        deterministic: bool,
+        allow_override_builtin: bool,
+    ) -> PyResult<()> {
+        if !callback.is_callable() {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "callback must be callable",
+            ));
+        }
+
+        let handler = std::sync::Arc::new(PyCustomFnHandler::new(callback.clone().unbind()));
+        let options = formualizer::workbook::CustomFnOptions {
+            min_args,
+            max_args,
+            volatile,
+            thread_safe,
+            deterministic,
+            allow_override_builtin,
+        };
+
+        let mut wb = self
+            .inner
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        wb.register_custom_function(name, options, handler)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Unregister a previously registered workbook-local custom function.
+    pub fn unregister_function(&self, name: &str) -> PyResult<()> {
+        let mut wb = self
+            .inner
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        wb.unregister_custom_function(name)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// List registered workbook-local custom functions and their options.
+    pub fn list_functions(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let wb = self
+            .inner
+            .read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        let out = PyList::empty(py);
+
+        for info in wb.list_custom_functions() {
+            let row = PyDict::new(py);
+            row.set_item("name", info.name)?;
+            row.set_item("min_args", info.options.min_args)?;
+            row.set_item("max_args", info.options.max_args)?;
+            row.set_item("volatile", info.options.volatile)?;
+            row.set_item("thread_safe", info.options.thread_safe)?;
+            row.set_item("deterministic", info.options.deterministic)?;
+            row.set_item(
+                "allow_override_builtin",
+                info.options.allow_override_builtin,
+            )?;
+            out.append(row)?;
+        }
+
+        Ok(out.into())
+    }
+
+    /// Return named ranges visible to the workbook or a specific sheet.
+    ///
+    /// Args:
+    ///     sheet: Optional sheet name. When provided, returns workbook-scoped names plus
+    ///         sheet-scoped names visible on that sheet.
+    ///
+    /// Returns:
+    ///     A list of dictionaries with keys:
+    ///     - `name`
+    ///     - `scope` (`"workbook" | "sheet"`)
+    ///     - `scope_sheet` (optional)
+    ///     - `kind` (`"cell" | "range" | "literal" | "formula"`)
+    ///     - address fields for `cell`/`range` kinds
+    #[pyo3(signature = (sheet=None))]
+    pub fn get_named_ranges(&self, py: Python<'_>, sheet: Option<&str>) -> PyResult<PyObject> {
+        let wb = self
+            .inner
+            .read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+
+        let engine = wb.engine();
+        let entries = if let Some(sheet_name) = sheet {
+            let sheet_id = engine.sheet_id(sheet_name).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Sheet not found: {sheet_name}"
+                ))
+            })?;
+            engine.named_ranges_snapshot_for_sheet(sheet_id)
+        } else {
+            engine.named_ranges_snapshot()
+        };
+
+        let out = PyList::empty(py);
+        for entry in entries {
+            let row = PyDict::new(py);
+            row.set_item("name", entry.name)?;
+
+            match entry.scope {
+                formualizer::eval::engine::named_range::NameScope::Workbook => {
+                    row.set_item("scope", "workbook")?;
+                    row.set_item("scope_sheet", py.None())?;
+                }
+                formualizer::eval::engine::named_range::NameScope::Sheet(sheet_id) => {
+                    row.set_item("scope", "sheet")?;
+                    row.set_item("scope_sheet", engine.sheet_name(sheet_id))?;
+                }
+            }
+
+            match entry.definition {
+                formualizer::eval::engine::named_range::NamedDefinition::Cell(cell) => {
+                    row.set_item("kind", "cell")?;
+                    row.set_item("sheet", engine.sheet_name(cell.sheet_id))?;
+                    let r = cell.coord.row() + 1;
+                    let c = cell.coord.col() + 1;
+                    row.set_item("start_row", r)?;
+                    row.set_item("start_col", c)?;
+                    row.set_item("end_row", r)?;
+                    row.set_item("end_col", c)?;
+                }
+                formualizer::eval::engine::named_range::NamedDefinition::Range(range) => {
+                    row.set_item("kind", "range")?;
+                    row.set_item("start_sheet", engine.sheet_name(range.start.sheet_id))?;
+                    row.set_item("end_sheet", engine.sheet_name(range.end.sheet_id))?;
+                    row.set_item("start_row", range.start.coord.row() + 1)?;
+                    row.set_item("start_col", range.start.coord.col() + 1)?;
+                    row.set_item("end_row", range.end.coord.row() + 1)?;
+                    row.set_item("end_col", range.end.coord.col() + 1)?;
+                    if range.start.sheet_id == range.end.sheet_id {
+                        row.set_item("sheet", engine.sheet_name(range.start.sheet_id))?;
+                    }
+                }
+                formualizer::eval::engine::named_range::NamedDefinition::Literal(value) => {
+                    row.set_item("kind", "literal")?;
+                    row.set_item("value", literal_to_py(py, &value)?)?;
+                }
+                formualizer::eval::engine::named_range::NamedDefinition::Formula { .. } => {
+                    row.set_item("kind", "formula")?;
+                }
+            }
+
+            out.append(row)?;
+        }
+
+        Ok(out.into())
+    }
+
+    /// Set a single cell value.
+    ///
+    /// Rows and columns are **1-based**.
+    ///
+    /// The `value` may be a Python primitive (int/float/bool/str/None), a
+    /// `datetime/date/time/timedelta`, or a [`LiteralValue`].
+    ///
+    /// Example:
+    /// ```python
+    ///     import datetime
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     wb.add_sheet("Sheet1")
+    ///
+    ///     wb.set_value("Sheet1", 1, 1, 123)
+    ///     wb.set_value("Sheet1", 2, 1, 3.14)
+    ///     wb.set_value("Sheet1", 3, 1, datetime.date(2024, 1, 1))
+    ///     wb.set_value("Sheet1", 4, 1, fz.LiteralValue.text("hello"))
+    /// ```
     pub fn set_value(
         &self,
         _py: Python<'_>,
@@ -196,6 +543,22 @@ impl PyWorkbook {
         Ok(())
     }
 
+    /// Set a single cell formula.
+    ///
+    /// Rows and columns are **1-based**. Formulas should be Excel-style and typically
+    /// begin with `=`.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     s = wb.sheet("Sheet1")
+    ///     s.set_value(1, 1, 10)
+    ///     s.set_value(2, 1, 20)
+    ///     s.set_formula(3, 1, "=SUM(A1:A2)")
+    ///     print(wb.evaluate_cell("Sheet1", 3, 1))
+    /// ```
     pub fn set_formula(&self, sheet: &str, row: u32, col: u32, formula: &str) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -216,6 +579,26 @@ impl PyWorkbook {
         Ok(())
     }
 
+    /// Evaluate a single cell and return the computed value.
+    ///
+    /// Rows and columns are **1-based**.
+    ///
+    /// Returns:
+    ///     A Python value converted from the engine's internal [`LiteralValue`].
+    ///     For example: `float`, `int`, `str`, `bool`, `datetime.*`, `None`, or
+    ///     nested lists for arrays.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     s = wb.sheet("Data")
+    ///     s.set_value(1, 1, 100)
+    ///     s.set_value(2, 1, 200)
+    ///     s.set_formula(3, 1, "=SUM(A1:A2)")
+    ///     print(wb.evaluate_cell("Data", 3, 1))
+    /// ```
     pub fn evaluate_cell(
         &self,
         py: Python<'_>,
@@ -372,6 +755,57 @@ impl PyWorkbook {
         wb.set_changelog_enabled(enabled);
         Ok(())
     }
+
+    // Changelog metadata
+    #[pyo3(signature = (actor_id=None))]
+    pub fn set_actor_id(&self, actor_id: Option<String>) -> PyResult<()> {
+        let mut wb = self
+            .inner
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        wb.set_actor_id(actor_id);
+        Ok(())
+    }
+
+    #[pyo3(signature = (correlation_id=None))]
+    pub fn set_correlation_id(&self, correlation_id: Option<String>) -> PyResult<()> {
+        let mut wb = self
+            .inner
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        wb.set_correlation_id(correlation_id);
+        Ok(())
+    }
+
+    #[pyo3(signature = (reason=None))]
+    pub fn set_reason(&self, reason: Option<String>) -> PyResult<()> {
+        let mut wb = self
+            .inner
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))?;
+        wb.set_reason(reason);
+        Ok(())
+    }
+
+    /// Begin grouping multiple edits into a single undo/redo action.
+    ///
+    /// This is only relevant when the changelog is enabled.
+    ///
+    /// Example:
+    /// ```python
+    ///     import formualizer as fz
+    ///
+    ///     wb = fz.Workbook()
+    ///     wb.set_changelog_enabled(True)
+    ///     s = wb.sheet("Data")
+    ///
+    ///     wb.begin_action("update prices")
+    ///     s.set_value(1, 1, 100)
+    ///     s.set_value(2, 1, 200)
+    ///     wb.end_action()
+    ///
+    ///     wb.undo()  # reverts both values at once
+    /// ```
     pub fn begin_action(&self, description: &str) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -380,6 +814,8 @@ impl PyWorkbook {
         wb.begin_action(description.to_string());
         Ok(())
     }
+
+    /// End the current grouped undo/redo action.
     pub fn end_action(&self) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -388,6 +824,8 @@ impl PyWorkbook {
         wb.end_action();
         Ok(())
     }
+
+    /// Undo the most recent workbook edit.
     pub fn undo(&self) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -396,6 +834,8 @@ impl PyWorkbook {
         wb.undo()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
+
+    /// Redo the most recently undone edit.
     pub fn redo(&self) -> PyResult<()> {
         let mut wb = self
             .inner
@@ -514,6 +954,7 @@ impl PyWorkbook {
     ///     end_col: End column (1-based). Defaults to start_col for a single cell.
     ///     scope: "workbook" (default) or "sheet".
     #[pyo3(signature = (name, sheet, start_row, start_col, end_row=None, end_col=None, scope="workbook"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn define_named_range(
         &self,
         name: &str,
@@ -650,6 +1091,7 @@ pub struct CellData {
     pub formula: Option<String>,
 }
 
+#[gen_stub_pyclass]
 #[pyclass(name = "Cell", module = "formualizer")]
 pub struct PyCell {
     value: LiteralValue,
@@ -662,6 +1104,7 @@ impl PyCell {
     }
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyCell {
     #[getter]
@@ -675,6 +1118,7 @@ impl PyCell {
     }
 }
 
+#[gen_stub_pyclass]
 #[pyclass(name = "RangeAddress", module = "formualizer")]
 #[derive(Clone, Debug)]
 pub struct PyRangeAddress {
@@ -690,6 +1134,7 @@ pub struct PyRangeAddress {
     pub end_col: u32,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyRangeAddress {
     #[new]

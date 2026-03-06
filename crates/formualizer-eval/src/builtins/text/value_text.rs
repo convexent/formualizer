@@ -2,13 +2,16 @@ use super::super::utils::ARG_ANY_ONE;
 use crate::args::ArgSchema;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
         crate::traits::CalcValue::Scalar(v) => v,
         crate::traits::CalcValue::Range(rv) => rv.get_cell(0, 0),
+        crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+        ),
     })
 }
 
@@ -34,6 +37,47 @@ fn to_text<'a, 'b>(a: &ArgumentHandle<'a, 'b>) -> Result<String, ExcelError> {
 // VALUE(text) - parse number
 #[derive(Debug)]
 pub struct ValueFn;
+/// Converts text that represents a number into a numeric value.
+///
+/// # Remarks
+/// - Parsing uses locale-aware invariant number parsing from the function context.
+/// - Non-numeric text returns `#VALUE!`.
+/// - Booleans and numbers are first coerced to text, then parsed.
+/// - Errors are propagated unchanged.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Parse decimal text"
+/// formula: '=VALUE("12.5")'
+/// expected: 12.5
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Invalid numeric text"
+/// formula: '=VALUE("abc")'
+/// expected: "#VALUE!"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - TEXT
+///   - N
+///   - ISNUMBER
+/// faq:
+///   - q: "Does VALUE coerce arbitrary text like TRUE/FALSE?"
+///     a: "VALUE parses numeric text only; non-numeric strings return #VALUE!."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: VALUE
+/// Type: ValueFn
+/// Min args: 1
+/// Max args: 1
+/// Variadic: false
+/// Signature: VALUE(arg1: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
 impl Function for ValueFn {
     func_caps!(PURE);
     fn name(&self) -> &'static str {
@@ -48,21 +92,64 @@ impl Function for ValueFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let s = to_text(&args[0])?;
-        match s.trim().parse::<f64>() {
-            Ok(n) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(n))),
-            Err(_) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+        let Some(n) = ctx.locale().parse_number_invariant(&s) else {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
-            ))),
-        }
+            )));
+        };
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(n)))
     }
 }
 
 // TEXT(value, format_text) - limited formatting (#,0,0.00, percent, yyyy, mm, dd, hh:mm) naive
 #[derive(Debug)]
 pub struct TextFn;
+/// Formats a value as text using a format pattern.
+///
+/// This implementation supports common numeric, percent, grouping, and basic date tokens.
+///
+/// # Remarks
+/// - Requires exactly two arguments: value and format text.
+/// - Numeric text is parsed before formatting; invalid numeric text returns `#VALUE!`.
+/// - Error inputs are propagated unchanged.
+/// - Supported patterns are intentionally limited compared with full Excel formatting.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Fixed decimal formatting"
+/// formula: '=TEXT(12.3, "0.00")'
+/// expected: "12.30"
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Percent formatting"
+/// formula: '=TEXT(0.256, "0%")'
+/// expected: "26%"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - VALUE
+///   - FIXED
+///   - DOLLAR
+/// faq:
+///   - q: "How complete is format_text support?"
+///     a: "Only a limited subset of Excel-style numeric/date tokens is supported in this implementation."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: TEXT
+/// Type: TextFn
+/// Min args: 2
+/// Max args: 1
+/// Variadic: false
+/// Signature: TEXT(arg1: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
 impl Function for TextFn {
     func_caps!(PURE);
     fn name(&self) -> &'static str {
@@ -77,7 +164,7 @@ impl Function for TextFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -92,7 +179,14 @@ impl Function for TextFn {
         let num = match val {
             LiteralValue::Number(f) => f,
             LiteralValue::Int(i) => i as f64,
-            LiteralValue::Text(t) => t.parse::<f64>().unwrap_or(0.0),
+            LiteralValue::Text(t) => {
+                let Some(n) = ctx.locale().parse_number_invariant(&t) else {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new_value(),
+                    )));
+                };
+                n
+            }
             LiteralValue::Boolean(b) => {
                 if b {
                     1.0
@@ -107,8 +201,8 @@ impl Function for TextFn {
             _ => 0.0,
         };
         // Strip currency prefix if present
-        let (currency_prefix, fmt_inner) = if fmt.starts_with('$') {
-            ("$", &fmt[1..])
+        let (currency_prefix, fmt_inner) = if let Some(stripped) = fmt.strip_prefix('$') {
+            ("$", stripped)
         } else {
             ("", fmt.as_str())
         };
@@ -263,6 +357,23 @@ mod tests {
             .into_literal();
         assert_eq!(out, LiteralValue::Number(12.5));
     }
+
+    #[test]
+    fn value_percent_text() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(ValueFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "VALUE").unwrap();
+        let s = lit(LiteralValue::Text("90%".into()));
+        let out = f
+            .dispatch(
+                &[ArgumentHandle::new(&s, &ctx)],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+        assert_eq!(out, LiteralValue::Number(0.9));
+    }
+
     #[test]
     fn text_basic_number() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(TextFn));

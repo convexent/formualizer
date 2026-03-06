@@ -1,0 +1,114 @@
+---
+title: 'JS/WASM API Reference'
+description: Comprehensive documentation for the Formualizer JavaScript and WebAssembly bindings.
+---
+
+The `formualizer` npm package provides high-performance formula parsing and evaluation by leveraging a WebAssembly core compiled from Rust.
+
+## Initialization
+
+Before using the library, you must initialize the WebAssembly module.
+
+```javascript
+import init, { initializeWasm } from 'formualizer';
+
+// Initialize the module
+await init();
+// or
+await initializeWasm();
+```
+
+## Tokenizer
+
+The `Tokenizer` class allows you to break a formula into its constituent parts without parsing the full structure.
+
+- `constructor(formula: string, dialect?: FormulaDialect)`
+- `tokens`: Read-only array of `Token` objects.
+- `render()`: Returns the formula string reconstructed from tokens.
+- `length`: Returns the number of tokens.
+- `getToken(index: number)`: Returns the `Token` at the specified index.
+
+## Parser
+
+The `Parser` class handles the conversion of a formula string into an Abstract Syntax Tree (AST).
+
+- `constructor(formula: string, dialect?: FormulaDialect)`
+- `parse()`: Returns `ASTNodeData` representing the root of the AST.
+
+## Convenience Functions
+
+For quick operations, use these standalone functions:
+
+- `tokenize(formula: string, dialect?: FormulaDialect)`: Returns an array of tokens.
+- `parse(formula: string, dialect?: FormulaDialect)`: Returns the root `ASTNodeData`.
+
+## Workbook API
+
+The `Workbook` class manages stateful evaluation across multiple sheets and cells.
+
+- `constructor()`: Create a new empty workbook.
+- `fromJson(json: string)`: Load workbook state from a JSON string.
+- `addSheet(name: string)`: Add a new sheet to the workbook.
+- `setValue(sheet: string, row: number, col: number, value: any)`: Set a literal value.
+- `setFormula(sheet: string, row: number, col: number, formula: string)`: Set a formula.
+- `evaluateCell(sheet: string, row: number, col: number)`: Evaluate a specific cell.
+- `evaluateAll()`: Re-evaluate all dirty cells in the workbook.
+- `sheet(name: string)`: Returns a sheet facade with helper methods like `setValues` and `setFormulas`.
+
+## Custom Functions
+
+Extend the engine with your own logic:
+
+- `registerFunction(name: string, callback: Function, options?)`: Add a custom function.
+- `unregisterFunction(name: string)`: Remove a custom function.
+- `listFunctions()`: Get a list of all registered functions.
+
+## SheetPort
+
+`SheetPortSession` provides a high-level API for interacting with workbooks via defined inputs and outputs (ports).
+
+- `fromManifestYaml(yaml: string, workbook: Workbook)`: Create a session from a YAML manifest.
+- `readInputs()`: Get current values for all input ports.
+- `readOutputs()`: Get current values for all output ports.
+- `writeInputs(update: object)`: Update input port values.
+- `evaluateOnce(options?)`: Run a single evaluation cycle.
+
+## Interfaces and Types
+
+### Token
+```typescript
+interface Token {
+  tokenType: string;
+  subtype: string;
+  value: string;
+  pos: number;
+  end: number;
+}
+```
+
+### ASTNodeData
+```typescript
+interface ASTNodeData {
+  type: string;
+  value?: any;
+  reference?: ReferenceData;
+  name?: string;
+  args?: ASTNodeData[];
+  op?: string;
+  left?: ASTNodeData;
+  right?: ASTNodeData;
+  operand?: ASTNodeData;
+  elements?: ASTNodeData[];
+  message?: string;
+}
+```
+
+### FormulaDialect
+- `Excel`: Standard Excel formula syntax.
+- `OpenFormula`: OpenDocument formula syntax.
+
+## See Also
+
+- [Python API Map](/docs/reference/python-api-map)
+- [Rust API Map](/docs/reference/rust-api-map)
+- [Playground](/docs/playground)

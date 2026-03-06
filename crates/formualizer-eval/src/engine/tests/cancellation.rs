@@ -72,7 +72,7 @@ fn test_cancellation_between_layers() {
             // In that case, verify all values were computed correctly
             assert_eq!(
                 engine.get_cell_value("Sheet1", 1, 1),
-                Some(LiteralValue::Int(1))
+                Some(LiteralValue::Number(1.0))
             );
             assert_eq!(
                 engine.get_cell_value("Sheet1", 1, 2),
@@ -344,11 +344,15 @@ fn test_cancellation_message_differentiation() {
             message: Some(msg),
             ..
         }) => {
-            // Should contain context about where cancellation occurred
+            // Should contain context about where cancellation occurred.
+            // Immediate cancellation can now happen before scheduling.
             assert!(
-                msg.contains("between layers")
+                msg.contains("before scheduling")
+                    || msg.contains("between layers")
                     || msg.contains("cycle handling")
                     || msg.contains("within layer")
+                    || msg.contains("before starting")
+                    || msg.contains("during execution")
             );
         }
         _ => panic!("Expected cancellation error with message"),

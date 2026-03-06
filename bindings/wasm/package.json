@@ -1,18 +1,31 @@
 {
   "name": "formualizer",
-  "version": "0.3.7",
-  "description": "WebAssembly bindings for the Formualizer workbook + formula engine",
-  "main": "pkg/formualizer_wasm.js",
-  "module": "pkg/formualizer_wasm.js",
+  "version": "0.4.3",
+  "description": "Embeddable spreadsheet engine — parse, evaluate & mutate Excel workbooks in the browser. 320+ functions, Arrow-powered.",
+  "homepage": "https://github.com/psu3d0/formualizer",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./pkg/*": "./pkg/*"
+  },
   "files": [
+    "dist",
     "pkg",
     "README.md"
   ],
   "scripts": {
-    "build": "npm run build:wasm",
-    "build:wasm": "wasm-pack build --target bundler --out-dir pkg --release",
+    "build": "npm run build:wasm && npm run build:ts",
+    "build:wasm": "wasm-pack build --target bundler --out-dir pkg --release && rm -f pkg/.gitignore",
+    "build:ts": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "test": "wasm-pack test --node",
-    "clean": "rimraf dist pkg"
+    "clean": "rm -rf dist pkg"
   },
   "keywords": [
     "excel",
@@ -20,13 +33,17 @@
     "parser",
     "wasm",
     "webassembly",
-    "spreadsheet"
+    "spreadsheet",
+    "spreadsheet-engine",
+    "formula-evaluation",
+    "evaluation",
+    "arrow",
+    "workbook"
   ],
   "license": "MIT OR Apache-2.0",
   "devDependencies": {
     "@rollup/plugin-typescript": "^11.1.5",
     "@types/node": "^20.10.0",
-    "rimraf": "^5.0.5",
     "rollup": "^4.9.0",
     "typescript": "^5.3.0"
   },
