@@ -24,9 +24,6 @@ Implementation notes:
 - For serial -> date: if serial == 60, map to 1900-02-28. If serial > 60, subtract 1 day.
 -------------------------------------------------------------------- */
 
-/// Base date for the 1900 date system. Serial 1 = base + 1 day = 1900-01-01.
-const EXCEL_EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
-
 pub fn datetime_to_serial(dt: &NaiveDateTime) -> f64 {
     let base = NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
     let mut days = (dt.date() - base).num_days();
@@ -37,7 +34,7 @@ pub fn datetime_to_serial(dt: &NaiveDateTime) -> f64 {
     }
 
     let secs_in_day = dt.time().num_seconds_from_midnight() as f64;
-    serial_days as f64 + secs_in_day / 86_400.0
+    days as f64 + secs_in_day / 86_400.0
 }
 
 pub fn serial_to_datetime(serial: f64) -> NaiveDateTime {

@@ -19,8 +19,6 @@ fn coerce_to_serial(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
             ExcelError::new_value().with_message("Date/time serial is not a valid number")
         }),
         LiteralValue::Boolean(b) => Ok(if b { 1.0 } else { 0.0 }),
-        LiteralValue::Date(d) => Ok(date_to_serial(&d)),
-        LiteralValue::DateTime(dt) => Ok(datetime_to_serial(&dt)),
         LiteralValue::Empty => Ok(0.0),
         LiteralValue::Error(e) => Err(e),
         _ => Err(ExcelError::new_value()
