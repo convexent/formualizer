@@ -87,7 +87,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --manifest-path bindings/python/Cargo.toml
+          args: --release --out dist --manifest-path bindings/python/Cargo.toml --interpreter python3.12
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
       - name: Upload wheels
