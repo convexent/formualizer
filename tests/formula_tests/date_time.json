@@ -389,6 +389,42 @@
       "description": "EOMONTH 3 months backward from serial 444"
     },
     {
+      "formula": "=EDATE(A1, 15)",
+      "result": 46146,
+      "result_type": "int",
+      "description": "EDATE adds months to a native Date cell, preserving day",
+      "context": {
+        "A1": {"type": "date", "value": "2025-02-04"}
+      }
+    },
+    {
+      "formula": "=EDATE(A1, 1)",
+      "result": 45716,
+      "result_type": "int",
+      "description": "EDATE clamps day-of-month overflow when target month is shorter",
+      "context": {
+        "A1": {"type": "date", "value": "2025-01-31"}
+      }
+    },
+    {
+      "formula": "=EDATE(A1, -3)",
+      "result": 45641,
+      "result_type": "int",
+      "description": "EDATE accepts negative months from a native Date cell",
+      "context": {
+        "A1": {"type": "date", "value": "2025-03-15"}
+      }
+    },
+    {
+      "formula": "=EOMONTH(A1, 0)",
+      "result": 45716,
+      "result_type": "int",
+      "description": "EOMONTH on a native Date cell returns the month-end serial",
+      "context": {
+        "A1": {"type": "date", "value": "2025-02-04"}
+      }
+    },
+    {
       "formula": "=WEEKNUM(0, 1)",
       "result": 0,
       "result_type": "int",
