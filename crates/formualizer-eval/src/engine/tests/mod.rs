@@ -1,5 +1,6 @@
 mod arena_debug;
 mod cancellation;
+mod cross_sheet_named_range_first_cell;
 mod change_log;
 mod changelog_replay;
 mod common;
