@@ -17,3 +17,10 @@ tickets/
 # Local git worktrees (repo-local)
 .worktrees/
 .forkops/
+# Local build artifacts (Python wheels from maturin develop / build-wheels)
+dist/
+dist-local/
+dist-local-arm64/
+dist-local-darwin-arm64/
+# Ad-hoc repro scripts (root-level Python files for local debugging)
+/repro-*.py
