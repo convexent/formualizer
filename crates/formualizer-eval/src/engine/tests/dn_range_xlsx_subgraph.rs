@@ -65,12 +65,7 @@ fn supermod_repro_evaluate_cell_with_dn_range_ref_after_set_value() {
 
     // Target = SUM(direct base range, UP_PROFIT)
     engine
-        .set_cell_formula(
-            "Model",
-            10,
-            1,
-            parse("=SUM(E1:G1,UP_PROFIT)").unwrap(),
-        )
+        .set_cell_formula("Model", 10, 1, parse("=SUM(E1:G1,UP_PROFIT)").unwrap())
         .unwrap();
 
     engine.evaluate_all().unwrap();

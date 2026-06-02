@@ -377,9 +377,7 @@ impl DeltaEdgeSlab {
     /// Iterate over all (from, &additions) pairs in the delta. Used by
     /// build_from_adjacency to carry forward delta-only edges that the
     /// adjacency input does not cover.
-    pub fn additions_iter(
-        &self,
-    ) -> impl Iterator<Item = (&VertexId, &FxHashSet<VertexId>)> {
+    pub fn additions_iter(&self) -> impl Iterator<Item = (&VertexId, &FxHashSet<VertexId>)> {
         self.additions.iter()
     }
 
@@ -614,8 +612,7 @@ impl CsrMutableEdges {
         // in the adjacency input, so without this carry-forward the
         // named-range vertex's out-edges would be silently dropped and
         // build_demand_subgraph would never reach the underlying cells.
-        let covered: rustc_hash::FxHashSet<u32> =
-            adjacency.iter().map(|(vid, _)| *vid).collect();
+        let covered: rustc_hash::FxHashSet<u32> = adjacency.iter().map(|(vid, _)| *vid).collect();
         // Carry forward base-only out-edges for ANY existing vertex not in
         // the new adjacency input. Iterate over the current vertex_ids
         // (which already track every vertex allocated so far, including

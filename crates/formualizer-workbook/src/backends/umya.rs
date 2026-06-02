@@ -14,7 +14,7 @@ use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::time::Instant;
 use umya_spreadsheet::{
-    CellRawValue, CellValue, Spreadsheet,
+    CellErrorType, CellRawValue, CellValue, Spreadsheet,
     reader::xlsx,
     structs::{DefinedName as UmyaDefinedName, Worksheet},
 };
@@ -324,57 +324,72 @@ impl UmyaAdapter {
             return;
         }
 
-        let formula_obj = cell.get_formula_obj().cloned();
-        let mut cv = cell.get_cell_value().clone();
-
+        // Use `set_formula_result_*` (not `set_value_*`) for formula
+        // cells. The `set_value_*` family eagerly clears the formula
+        // (via `remove_formula()`) and we'd have to re-attach it after
+        // — which worked for some consumers but caused openpyxl
+        // `data_only=True` reads to surface the cached value as a
+        // *string* instead of the typed number/bool we wrote. The
+        // `set_formula_result_*` family is the API umya exposes
+        // explicitly for this use case ("only updates the cached
+        // value (`<v>`) and does not remove the formula object
+        // (`<f>`)" — see umya_spreadsheet::CellValue at
+        // crates/structs/cell_value.rs:194). The end result is a
+        // properly typed cached value that round-trips through any
+        // standard xlsx reader.
+        let cv = cell.get_cell_value_mut();
         match value {
             LiteralValue::Empty => {
-                cv.set_blank();
+                cv.set_formula_result_blank();
             }
             LiteralValue::Int(i) => {
-                cv.set_value_number(*i as f64);
+                cv.set_formula_result_number(*i as f64);
             }
             LiteralValue::Number(n) => {
-                cv.set_value_number(*n);
+                cv.set_formula_result_number(*n);
             }
             LiteralValue::Boolean(b) => {
-                cv.set_value_bool(*b);
+                cv.set_formula_result_bool(*b);
             }
             LiteralValue::Text(s) => {
-                cv.set_value_string(s.clone());
+                cv.set_formula_result_string(s.clone());
             }
             LiteralValue::Error(e) => {
-                cv.set_error(e.kind.to_string());
+                let kind = match e.kind {
+                    ExcelErrorKind::Null => CellErrorType::Null,
+                    ExcelErrorKind::Div => CellErrorType::Div0,
+                    ExcelErrorKind::Value => CellErrorType::Value,
+                    ExcelErrorKind::Ref => CellErrorType::Ref,
+                    ExcelErrorKind::Name => CellErrorType::Name,
+                    ExcelErrorKind::Num => CellErrorType::Num,
+                    ExcelErrorKind::Na => CellErrorType::NA,
+                    _ => CellErrorType::Value,
+                };
+                cv.set_formula_result_error(kind);
             }
             LiteralValue::Date(d) => {
                 let dt = d.and_hms_opt(0, 0, 0).unwrap();
                 let serial =
                     formualizer_eval::builtins::datetime::datetime_to_serial_for(date_system, &dt);
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::DateTime(dt) => {
                 let serial =
                     formualizer_eval::builtins::datetime::datetime_to_serial_for(date_system, dt);
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Time(t) => {
                 let serial = t.num_seconds_from_midnight() as f64 / 86_400.0;
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Duration(d) => {
                 let serial = d.num_seconds() as f64 / 86_400.0;
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Pending | LiteralValue::Array(_) => {
-                cv.set_error(ExcelErrorKind::Value.to_string());
+                cv.set_formula_result_error(CellErrorType::Value);
             }
         }
-
-        if let Some(formula) = formula_obj {
-            cv.set_formula_obj(formula);
-        }
-
-        cell.set_cell_value(cv);
     }
 
     /// Write cached values for formula cells in a single workbook lock, amortizing

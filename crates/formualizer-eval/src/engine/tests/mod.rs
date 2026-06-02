@@ -1,9 +1,9 @@
 mod arena_debug;
 mod cancellation;
-mod cross_sheet_named_range_first_cell;
 mod change_log;
 mod changelog_replay;
 mod common;
+mod cross_sheet_named_range_first_cell;
 mod cycle_detection;
 mod demand_driven;
 mod dependency;
@@ -59,9 +59,9 @@ mod spill_parallel_501;
 mod spill_semantics_101;
 
 mod date_arithmetic_ops;
+mod date_function_duration_cells;
 mod date_math_parity;
 mod edate_eomonth_engine;
-mod date_function_duration_cells;
 
 mod hardening_503;
 
