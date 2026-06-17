@@ -20,6 +20,7 @@ mod parallel;
 mod range_dependencies;
 mod range_property_tests;
 mod recalc_plan;
+mod redirty_volatiles_perf;
 mod schedule_cache;
 mod schedule_integration;
 mod sheet_index_integration;
