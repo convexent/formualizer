@@ -1889,12 +1889,61 @@ impl DependencyGraph {
         self.volatile_vertices.clear();
     }
 
-    /// Re-marks all volatile vertices as dirty for the next evaluation cycle.
+    /// Re-marks all volatile vertices (and their transitive dependents) as dirty
+    /// for the next evaluation cycle.
+    ///
+    /// This is the batched equivalent of calling [`Self::mark_dirty`] once per
+    /// volatile vertex: it produces the identical dirty set, but walks the union
+    /// of the volatiles' transitive dependent cones with a SINGLE shared `visited`
+    /// set instead of re-walking overlapping cones once per volatile. The naive
+    /// per-volatile form is O(V·N) when volatiles sit near the dependency root
+    /// (every volatile's cone covers a large fraction of the graph), which on
+    /// large workbooks dominates evaluation entirely (see convexent/supermod#2130:
+    /// ~219s of a 219.2s `evaluate_cell`). The shared-visited traversal is
+    /// O(N + edges).
     pub(crate) fn redirty_volatiles(&mut self) {
-        let volatile_ids: Vec<VertexId> = self.volatile_vertices.iter().copied().collect();
-        for id in volatile_ids {
-            self.mark_dirty(id);
+        if self.volatile_vertices.is_empty() {
+            return;
         }
+
+        let mut affected: FxHashSet<VertexId> = FxHashSet::default();
+        let mut visited: FxHashSet<VertexId> = FxHashSet::default();
+        let mut to_visit: Vec<VertexId> = Vec::new();
+
+        // Seed-level expansion for every volatile vertex, mirroring the pre-loop
+        // block of `mark_dirty` (which expands name-dependents only at the seed).
+        // Volatile vertices are formula vertices, so each is itself re-dirtied.
+        let volatile_ids: Vec<VertexId> = self.volatile_vertices.iter().copied().collect();
+        for &v in &volatile_ids {
+            to_visit.push(v);
+            if let Some(dependents) = self.dependents_slice(v) {
+                to_visit.extend(dependents.iter().copied());
+            } else {
+                to_visit.extend(self.get_dependents(v));
+            }
+            if let Some(name_set) = self.cell_to_name_dependents.get(&v) {
+                to_visit.extend(name_set.iter().copied());
+            }
+            to_visit.extend(self.collect_range_dependents_for_vertex(v));
+        }
+
+        // Single shared-visited propagation over the union of all volatile cones.
+        while let Some(id) = to_visit.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            affected.insert(id);
+            self.store.set_dirty(id, true);
+
+            if let Some(dependents) = self.dependents_slice(id) {
+                to_visit.extend(dependents.iter().copied());
+            } else {
+                to_visit.extend(self.get_dependents(id));
+            }
+            to_visit.extend(self.collect_range_dependents_for_vertex(id));
+        }
+
+        self.dirty_vertices.extend(&affected);
     }
 
     fn get_or_create_vertex(
