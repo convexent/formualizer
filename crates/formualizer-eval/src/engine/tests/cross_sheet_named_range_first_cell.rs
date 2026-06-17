@@ -29,7 +29,7 @@ fn build_repro_engine() -> Engine<TestWorkbook> {
             .set_cell_value("Schedule", r, 1, LiteralValue::Number(r as f64 * 100.0))
             .unwrap();
         engine
-            .set_cell_formula("Schedule", r, 3, parse(&format!("=$A${r}")).unwrap())
+            .set_cell_formula("Schedule", r, 3, parse(format!("=$A${r}")).unwrap())
             .unwrap();
     }
     engine
@@ -117,8 +117,10 @@ fn cross_sheet_evaluate_cell_drains_all_staged_sheets() {
     // cell. The fix in ``evaluate_cell`` calls ``build_graph_all`` so
     // every staged sheet is materialized before the target's formula
     // tries to read its dependencies.
-    let mut cfg = EvalConfig::default();
-    cfg.defer_graph_building = true;
+    let cfg = EvalConfig {
+        defer_graph_building: true,
+        ..Default::default()
+    };
     let mut engine = Engine::new(TestWorkbook::default(), cfg);
 
     engine.graph.add_sheet("Schedule").unwrap();
