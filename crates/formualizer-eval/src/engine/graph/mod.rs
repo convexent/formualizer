@@ -1901,12 +1901,20 @@ impl DependencyGraph {
     /// large workbooks dominates evaluation entirely (see convexent/supermod#2130:
     /// ~219s of a 219.2s `evaluate_cell`). The shared-visited traversal is
     /// O(N + edges).
+    ///
+    /// Equivalence to the per-volatile form relies on every entry in
+    /// `volatile_vertices` being a formula vertex (`mark_dirty` only pushes its
+    /// seed into the walk when `is_formula`; here we push every seed
+    /// unconditionally). That invariant holds because all `mark_volatile` call
+    /// sites set a `Formula*` kind before registering the vertex as volatile.
     pub(crate) fn redirty_volatiles(&mut self) {
         if self.volatile_vertices.is_empty() {
             return;
         }
 
-        let mut affected: FxHashSet<VertexId> = FxHashSet::default();
+        // `visited` doubles as the affected set: every vertex is added on its
+        // first (and only) visit, so the final `visited` is exactly the dirty
+        // set to record.
         let mut visited: FxHashSet<VertexId> = FxHashSet::default();
         let mut to_visit: Vec<VertexId> = Vec::new();
 
@@ -1932,7 +1940,6 @@ impl DependencyGraph {
             if !visited.insert(id) {
                 continue;
             }
-            affected.insert(id);
             self.store.set_dirty(id, true);
 
             if let Some(dependents) = self.dependents_slice(id) {
@@ -1943,7 +1950,7 @@ impl DependencyGraph {
             to_visit.extend(self.collect_range_dependents_for_vertex(id));
         }
 
-        self.dirty_vertices.extend(&affected);
+        self.dirty_vertices.extend(&visited);
     }
 
     fn get_or_create_vertex(

@@ -11,9 +11,20 @@
 //! intermediate `SUM`, which is the head of a length-N dependency CHAIN
 //! (each cell references the previous). Every volatile's cone is therefore the
 //! same ~N-vertex chain. Pre-fix, re-dirtying re-walks that chain once per
-//! volatile = V·N visits (seconds at this size); the batched-traversal fix walks
-//! it once = O(N). The blowup is carried by V (cheap cells), keeping chain depth
-//! — and thus per-pass evaluation — modest so the test stays fast post-fix.
+//! volatile = V·N visits; the batched-traversal fix walks it once = O(N). The
+//! blowup is carried by V (cheap cells), keeping chain depth — and thus per-pass
+//! evaluation — modest so the test stays fast post-fix.
+//!
+//! Measured (debug, `cargo test -p formualizer-eval`) at V=20000, N=2000, with
+//! the fix reverted vs applied — i.e. the bound was watched go red:
+//!   pre-fix  (per-volatile mark_dirty): second evaluate_all ~= 38.7s  -> FAILS
+//!   post-fix (batched traversal):       second evaluate_all ~=  0.29s -> passes
+//! The 5s bound therefore sits ~7.7x under the pre-fix time and ~17x over the
+//! post-fix time. Each pre-fix cone-visit costs ~1us (a
+//! `collect_range_dependents_for_vertex` allocation plus hash-set work), so
+//! V*N ~= 40M lands at ~39s rather than the low single-digit seconds a cheaper
+//! per-visit cost would imply. V is held at 20000 (not higher) to bound the
+//! one-time ~22k-cell setup; the timed region itself is sub-second.
 
 use super::common::create_cell_ref_ast;
 use crate::builtins::random::register_builtins;
