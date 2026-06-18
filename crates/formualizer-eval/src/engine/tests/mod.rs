@@ -119,3 +119,6 @@ mod visibility_mask_cache;
 
 mod demand_subgraph_named_range;
 mod dn_range_xlsx_subgraph;
+
+mod mark_dirty_multi_source;
+mod redirty_volatiles_perf;
