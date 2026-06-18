@@ -64,10 +64,14 @@ build-artifact cleanup, and the fork's own version-bump release commits.
   `u64`, unrelated to #139).
 - Adopted upstream's clippy-clean form for the two pre-1.93 test files so
   CI (`clippy 1.93.0 -D warnings`) is green on `main`.
-- Salvaged the fork-new #2130 wall-clock regression guard
-  (`redirty_volatiles_perf.rs`) and adopted upstream's deterministic
-  visit-count tests (`mark_dirty_multi_source.rs`, minus its iterative-calc
-  test which the fork can't compile yet).
+- Adopted upstream's deterministic visit-count tests
+  (`mark_dirty_multi_source.rs`, minus its iterative-calc test which the fork
+  can't compile yet) as the #2130 regression guard — the volatile redirty
+  asserts ~one component walk (251 visits) vs the ≥10 000 quadratic, and the
+  union-equivalence test pins `mark_dirty_many` == sequential single-source.
+  PR #20's interim wall-clock guard was evaluated and dropped as strictly
+  dominated (timing-sensitive 5s bound, ~44s setup per run, weaker signal), so
+  nothing from PR #20 is carried — the fix and its tests all come from upstream.
 
 ## Sync policy
 
