@@ -15,7 +15,7 @@ use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 use umya_spreadsheet::{
-    CellRawValue, CellValue,
+    CellErrorType, CellRawValue, CellValue,
     structs::{DefinedName as UmyaDefinedName, Worksheet},
 };
 
@@ -342,55 +342,67 @@ impl UmyaAdapter {
             return;
         }
 
-        let formula_obj = cell.get_formula_obj().cloned();
-        let mut cv = cell.get_cell_value().clone();
-
+        // Use `set_formula_result_*` (not `set_value_*`) for formula
+        // cells. The `set_value_*` family eagerly clears the formula
+        // (via `remove_formula()`) and we'd have to re-attach it after
+        // — which worked for some consumers but caused openpyxl
+        // `data_only=True` reads to surface the cached value as a
+        // *string* instead of the typed number/bool we wrote. The
+        // `set_formula_result_*` family is the API umya exposes
+        // explicitly for this use case: it "only updates the cached
+        // value (`<v>`) and does not remove the formula object (`<f>`)".
+        // Available with the same signatures in umya 2.3 and 3.1.
+        let cv = cell.get_cell_value_mut();
         match value {
             LiteralValue::Empty => {
-                cv.set_blank();
+                cv.set_formula_result_blank();
             }
             LiteralValue::Int(i) => {
-                cv.set_value_number(*i as f64);
+                cv.set_formula_result_number(*i as f64);
             }
             LiteralValue::Number(n) => {
-                cv.set_value_number(*n);
+                cv.set_formula_result_number(*n);
             }
             LiteralValue::Boolean(b) => {
-                cv.set_value_bool(*b);
+                cv.set_formula_result_bool(*b);
             }
             LiteralValue::Text(s) => {
-                cv.set_value_string(s.clone());
+                cv.set_formula_result_string(s.clone());
             }
             LiteralValue::Error(e) => {
-                cv.set_error(e.kind.to_string());
+                let kind = match e.kind {
+                    ExcelErrorKind::Null => CellErrorType::Null,
+                    ExcelErrorKind::Div => CellErrorType::Div0,
+                    ExcelErrorKind::Value => CellErrorType::Value,
+                    ExcelErrorKind::Ref => CellErrorType::Ref,
+                    ExcelErrorKind::Name => CellErrorType::Name,
+                    ExcelErrorKind::Num => CellErrorType::Num,
+                    ExcelErrorKind::Na => CellErrorType::NA,
+                    _ => CellErrorType::Value,
+                };
+                cv.set_formula_result_error(kind);
             }
             LiteralValue::Date(d) => {
                 let dt = d.and_hms_opt(0, 0, 0).unwrap();
                 let serial = formualizer_common::datetime_to_serial_for(date_system, &dt);
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::DateTime(dt) => {
                 let serial = formualizer_common::datetime_to_serial_for(date_system, dt);
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Time(t) => {
                 let serial = formualizer_common::time_to_fraction(t);
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Duration(d) => {
                 let serial = d.num_seconds() as f64 / 86_400.0;
-                cv.set_value_number(serial);
+                cv.set_formula_result_number(serial);
             }
             LiteralValue::Pending | LiteralValue::Array(_) => {
-                cv.set_error(ExcelErrorKind::Value.to_string());
+                cv.set_formula_result_error(CellErrorType::Value);
             }
         }
-
-        if let Some(formula) = formula_obj {
-            cv.set_formula_obj(formula);
-        }
-
-        cell.set_cell_value(cv);
     }
 
     /// Write cached values for formula cells in a single workbook lock, amortizing
@@ -1634,4 +1646,67 @@ fn consuming_adapter_moves_the_existing_cell_graph() {
             .len(),
         1
     );
+}
+
+/// Fork-local guard (convexent 3392ea8): formula cached values must save with
+/// their `<f>` intact and a *typed* `<v>` (numeric/bool/error), never a
+/// `t="str"` string cache, which openpyxl `data_only=True` surfaces as `str`.
+/// Upstream's `formula_cache_batch` tests accept string caches, so they would
+/// not catch that regression. This pins the observable XML across umya 2 and 3.
+#[cfg(test)]
+#[test]
+fn formula_cached_values_are_saved_as_typed_values() {
+    let mut adapter = UmyaAdapter::new_empty();
+    {
+        let sheet = adapter
+            .workbook
+            .get_mut()
+            .lookup_sheet_mut("Sheet1")
+            .unwrap();
+        sheet.get_cell_mut("A1").set_formula("1+1.5");
+        sheet.get_cell_mut("B1").set_formula("1=1");
+        sheet.get_cell_mut("C1").set_formula("1/0");
+    }
+    let ds = formualizer_eval::engine::DateSystem::Excel1900;
+    for (col, value) in [
+        (1, LiteralValue::Number(2.5)),
+        (2, LiteralValue::Boolean(true)),
+        (3, LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div))),
+    ] {
+        adapter
+            .set_formula_cached_value("Sheet1", 1, col, &value, ds)
+            .unwrap();
+    }
+
+    let bytes = adapter.save_to_bytes().unwrap();
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut xml = String::new();
+    archive
+        .by_name("xl/worksheets/sheet1.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
+
+    let cell_xml = |r: &str| -> String {
+        let start = xml
+            .find(&format!("<c r=\"{r}\""))
+            .unwrap_or_else(|| panic!("{r} missing from sheet xml: {xml}"));
+        let end = start + xml[start..].find("</c>").expect("closing </c>") + 4;
+        xml[start..end].to_string()
+    };
+
+    let a1 = cell_xml("A1");
+    assert!(a1.contains("<f>1+1.5</f>"), "A1 lost its formula: {a1}");
+    assert!(a1.contains("<v>2.5</v>"), "A1 cached value: {a1}");
+    assert!(!a1.contains("t=\""), "A1 numeric cache must be untyped (n): {a1}");
+
+    let b1 = cell_xml("B1");
+    assert!(b1.contains("<f>1=1</f>"), "B1 lost its formula: {b1}");
+    assert!(b1.contains("t=\"b\""), "B1 cache must be boolean-typed: {b1}");
+    assert!(b1.contains("<v>1</v>") || b1.contains("<v>TRUE</v>"), "B1: {b1}");
+
+    let c1 = cell_xml("C1");
+    assert!(c1.contains("<f>1/0</f>"), "C1 lost its formula: {c1}");
+    assert!(c1.contains("t=\"e\""), "C1 cache must be error-typed: {c1}");
+    assert!(c1.contains("<v>#DIV/0!</v>"), "C1: {c1}");
 }
