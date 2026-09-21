@@ -581,7 +581,7 @@ jobs:
 
   publish-pypi:
     if: startsWith(github.ref_name, 'v')
-    needs: [publish-product-crates, build-wheels-linux, build-wheels-musllinux, build-wheels-windows, build-wheels-macos, build-sdist, build-wheels-pyodide]
+    needs: [build-wheels-linux, build-wheels-musllinux, build-wheels-windows, build-wheels-macos, build-sdist, build-wheels-pyodide]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -624,7 +624,6 @@ jobs:
 
   publish-npm:
     if: startsWith(github.ref_name, 'v')
-    needs: publish-product-crates
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -670,7 +669,6 @@ jobs:
   github-release:
     if: startsWith(github.ref_name, 'v')
     needs:
-      - publish-product-crates
       - publish-pypi
       - publish-npm
     runs-on: ubuntu-latest
