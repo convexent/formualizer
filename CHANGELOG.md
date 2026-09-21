@@ -4,6 +4,14 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+## [0.9.4] - 2026-09-21
+
+- Aligned Rust product crates and Python/npm bindings at 0.9.4 (bumped from 0.9.3, which was already published on crates.io with different source, to publish this fork's changes). Parser/common remain at 3.1.2, SheetPort spec remains 0.3.1.
+
+### Fixed
+
+- Write formula cached values in the umya backend via `set_formula_result_*` instead of `set_value_*`. `set_value_*` eagerly cleared the formula (`remove_formula()`), which caused openpyxl `data_only=True` reads to surface the cached value as a string instead of the typed number/bool that was written. `set_formula_result_*` only updates the cached value (`<v>`) without removing the formula object (`<f>`).
+
 ## [0.9.3] - 2026-09-11
 
 - Aligned Rust product crates and Python/npm bindings at 0.9.3. Parser/common move together to **3.1.2** because the date/time text parsing change below lives in `formualizer-common`; `formualizer-parse` moves in lockstep with no source change and product crates now pin `formualizer-parse = "3.1.2"`. SheetPort spec remains 0.3.1.
