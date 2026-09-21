@@ -1,6 +1,10 @@
 use crate::engine::VertexId;
 use crate::engine::VertexKind;
 use crate::engine::eval::Engine;
+use crate::engine::used_extent::{
+    ExtentPolicy, OpenRangeBounds, ResolvedExtent, resolve_used_extent_with_fallback,
+};
+use crate::formula_plane::region_index::Region;
 use crate::traits::{
     EvaluationContext, FunctionProvider, NamedRangeResolver, Range, RangeResolver,
     ReferenceResolver, Resolver, SourceResolver, Table, TableResolver,
@@ -15,7 +19,8 @@ use crate::interpreter::Interpreter;
 pub struct DynamicRefCollector<'a, R: EvaluationContext> {
     pub engine: &'a Engine<R>,
     pub current_sheet: &'a str,
-    pub collected: Mutex<FxHashSet<VertexId>>,
+    pub(crate) collected: Mutex<FxHashSet<VertexId>>,
+    pub(crate) collected_regions: Mutex<FxHashSet<Region>>,
 }
 
 impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
@@ -24,6 +29,7 @@ impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
             engine,
             current_sheet,
             collected: Mutex::new(FxHashSet::default()),
+            collected_regions: Mutex::new(FxHashSet::default()),
         }
     }
 
@@ -38,18 +44,23 @@ impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
         let Some(sheet_id) = self.engine.graph.sheet_id(sheet_name) else {
             return;
         };
-        let Some(index) = self.engine.graph.sheet_index(sheet_id) else {
-            return;
-        };
-
         let sr0 = sr.saturating_sub(1);
         let er0 = er.saturating_sub(1);
         let sc0 = sc.saturating_sub(1);
         let ec0 = ec.saturating_sub(1);
+        self.collected_regions
+            .lock()
+            .unwrap()
+            .insert(Region::rect(sheet_id, sr0, er0, sc0, ec0).normalized());
+        let Some(index) = self.engine.graph.sheet_index(sheet_id) else {
+            return;
+        };
 
         let mut out = self.collected.lock().unwrap();
         for u in index.vertices_in_col_range(sc0, ec0) {
-            let row0 = self.engine.graph.vertex_coord(u).row();
+            let Some(row0) = self.engine.graph.vertex_grid_addr(u).map(|addr| addr.row()) else {
+                continue;
+            };
             if row0 < sr0 || row0 > er0 {
                 continue;
             }
@@ -72,65 +83,40 @@ impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
         end_row: Option<u32>,
         end_col: Option<u32>,
     ) {
-        let mut sr = start_row;
-        let mut sc = start_col;
-        let mut er = end_row;
-        let mut ec = end_col;
-
-        if sr.is_none() && er.is_none() {
-            let scv = sc.unwrap_or(1u32);
-            let ecv = ec.unwrap_or(scv);
-            sr = Some(1);
-            if let Some((_, max_r)) = self.engine.used_rows_for_columns(sheet_name, scv, ecv) {
-                er = Some(max_r);
-            } else if self.engine.sheet_bounds(sheet_name).is_some() {
-                er = Some(self.engine.config.max_open_ended_rows);
-            }
-        }
-        if sc.is_none() && ec.is_none() {
-            let srv = sr.unwrap_or(1u32);
-            let erv = er.unwrap_or(srv);
-            sc = Some(1);
-            if let Some((_, max_c)) = self.engine.used_cols_for_rows(sheet_name, srv, erv) {
-                ec = Some(max_c);
-            } else if self.engine.sheet_bounds(sheet_name).is_some() {
-                ec = Some(self.engine.config.max_open_ended_cols);
-            }
-        }
-        if sr.is_some() && er.is_none() {
-            let scv = sc.unwrap_or(1u32);
-            let ecv = ec.unwrap_or(scv);
-            if let Some((_, max_r)) = self.engine.used_rows_for_columns(sheet_name, scv, ecv) {
-                er = Some(max_r);
-            } else if self.engine.sheet_bounds(sheet_name).is_some() {
-                er = Some(self.engine.config.max_open_ended_rows);
-            }
-        }
-        if er.is_some() && sr.is_none() {
-            sr = Some(1);
-        }
-        if sc.is_some() && ec.is_none() {
-            let srv = sr.unwrap_or(1u32);
-            let erv = er.unwrap_or(srv);
-            if let Some((_, max_c)) = self.engine.used_cols_for_rows(sheet_name, srv, erv) {
-                ec = Some(max_c);
-            } else if self.engine.sheet_bounds(sheet_name).is_some() {
-                ec = Some(self.engine.config.max_open_ended_cols);
-            }
-        }
-        if ec.is_some() && sc.is_none() {
-            sc = Some(1);
-        }
-
-        let sr = sr.unwrap_or(1);
-        let sc = sc.unwrap_or(1);
-        let er = er.unwrap_or(sr.saturating_sub(1));
-        let ec = ec.unwrap_or(sc.saturating_sub(1));
-        if er < sr || ec < sc {
+        let Some(extent) = resolve_used_extent_with_fallback(
+            OpenRangeBounds {
+                start_row,
+                start_column: start_col,
+                end_row,
+                end_column: end_col,
+            },
+            ExtentPolicy::EvaluationCompat {
+                fallback_row: None,
+                fallback_column: None,
+            },
+            || {
+                self.engine
+                    .sheet_bounds(sheet_name)
+                    .map(|_| self.engine.config.max_open_ended_rows)
+            },
+            || {
+                self.engine
+                    .sheet_bounds(sheet_name)
+                    .map(|_| self.engine.config.max_open_ended_cols)
+            },
+            |first, last| self.engine.used_rows_for_columns(sheet_name, first, last),
+            |first, last| self.engine.used_cols_for_rows(sheet_name, first, last),
+        ) else {
             return;
-        }
+        };
 
-        self.collect_formula_vertices_in_rect(sheet_name, sr, sc, er, ec);
+        self.collect_formula_vertices_in_rect(
+            sheet_name,
+            extent.start_row,
+            extent.start_column,
+            extent.end_row,
+            extent.end_column,
+        );
     }
 }
 
@@ -142,6 +128,13 @@ impl<'a, R: EvaluationContext> ReferenceResolver for DynamicRefCollector<'a, R> 
         col: u32,
     ) -> Result<LiteralValue, ExcelError> {
         let sheet_name = sheet.unwrap_or(self.current_sheet);
+        if let Some(sheet_id) = self.engine.graph.sheet_id(sheet_name) {
+            self.collected_regions.lock().unwrap().insert(Region::point(
+                sheet_id,
+                row.saturating_sub(1),
+                col.saturating_sub(1),
+            ));
+        }
         if let Some(&vid) = self
             .engine
             .graph
@@ -201,6 +194,10 @@ impl<'a, R: EvaluationContext> SourceResolver for DynamicRefCollector<'a, R> {
 impl<'a, R: EvaluationContext> Resolver for DynamicRefCollector<'a, R> {}
 
 impl<'a, R: EvaluationContext> FunctionProvider for DynamicRefCollector<'a, R> {
+    fn planning_semantic_revision(&self) -> Option<u64> {
+        self.engine.planning_semantic_revision()
+    }
+
     fn get_function(
         &self,
         ns: &str,
@@ -208,9 +205,50 @@ impl<'a, R: EvaluationContext> FunctionProvider for DynamicRefCollector<'a, R> {
     ) -> Option<std::sync::Arc<dyn crate::traits::Function>> {
         self.engine.get_function(ns, name)
     }
+
+    fn get_function_for_planning(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn crate::traits::Function>> {
+        self.engine.get_function_for_planning(ns, name)
+    }
 }
 
 impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> {
+    fn cancellation_token(&self) -> Option<crate::engine::CancelToken> {
+        self.engine.cancellation_token()
+    }
+
+    fn resolve_cell_format(
+        &self,
+        sheet: Option<&str>,
+        row: u32,
+        col: u32,
+        current_sheet: &str,
+    ) -> Option<crate::format::FormatId> {
+        self.engine
+            .resolve_cell_format(sheet, row, col, current_sheet)
+    }
+
+    fn format_class(
+        &self,
+        format: crate::format::FormatId,
+    ) -> Option<formualizer_common::numfmt::FormatClass> {
+        self.engine.format_class(format)
+    }
+
+    fn record_cell_derived_format(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        format: Option<crate::format::FormatId>,
+    ) {
+        self.engine
+            .record_cell_derived_format(sheet, row, col, format)
+    }
+
     fn resolve_range_view<'c>(
         &'c self,
         reference: &ReferenceType,
@@ -259,6 +297,37 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
 pub struct RangeVirtualDepProvider;
 
 impl RangeVirtualDepProvider {
+    pub(crate) fn resolve_range<R: EvaluationContext>(
+        engine: &Engine<R>,
+        sheet_name: &str,
+        range: &formualizer_common::SheetRangeRef<'_>,
+    ) -> Option<ResolvedExtent> {
+        resolve_used_extent_with_fallback(
+            OpenRangeBounds {
+                start_row: range.start_row.map(|bound| bound.index + 1),
+                start_column: range.start_col.map(|bound| bound.index + 1),
+                end_row: range.end_row.map(|bound| bound.index + 1),
+                end_column: range.end_col.map(|bound| bound.index + 1),
+            },
+            ExtentPolicy::VirtualDependencyCompat {
+                fallback_row: None,
+                fallback_column: None,
+            },
+            || {
+                engine
+                    .sheet_bounds(sheet_name)
+                    .map(|_| engine.config.max_open_ended_rows)
+            },
+            || {
+                engine
+                    .sheet_bounds(sheet_name)
+                    .map(|_| engine.config.max_open_ended_cols)
+            },
+            |first, last| engine.used_rows_for_columns(sheet_name, first, last),
+            |first, last| engine.used_cols_for_rows(sheet_name, first, last),
+        )
+    }
+
     pub fn get_virtual_deps<R: EvaluationContext>(
         engine: &Engine<R>,
         v: VertexId,
@@ -273,78 +342,13 @@ impl RangeVirtualDepProvider {
                 };
                 let sheet_name = engine.graph.sheet_name(sheet_id);
 
-                let mut sr = r.start_row.map(|b| b.index + 1);
-                let mut sc = r.start_col.map(|b| b.index + 1);
-                let mut er = r.end_row.map(|b| b.index + 1);
-                let mut ec = r.end_col.map(|b| b.index + 1);
-
-                if sr.is_none() && er.is_none() {
-                    let scv = sc.unwrap_or(1u32);
-                    let ecv = ec.unwrap_or(scv);
-                    if let Some((min_r, max_r)) = engine.used_rows_for_columns(sheet_name, scv, ecv)
-                    {
-                        sr = Some(min_r);
-                        er = Some(max_r);
-                    } else if let Some((_max_rows, _)) = engine.sheet_bounds(sheet_name) {
-                        sr = Some(1);
-                        er = Some(engine.config.max_open_ended_rows);
-                    }
-                }
-                if sc.is_none() && ec.is_none() {
-                    let srv = sr.unwrap_or(1u32);
-                    let erv = er.unwrap_or(srv);
-                    if let Some((min_c, max_c)) = engine.used_cols_for_rows(sheet_name, srv, erv) {
-                        sc = Some(min_c);
-                        ec = Some(max_c);
-                    } else if let Some((_, _max_cols)) = engine.sheet_bounds(sheet_name) {
-                        sc = Some(1);
-                        ec = Some(engine.config.max_open_ended_cols);
-                    }
-                }
-                if sr.is_some() && er.is_none() {
-                    let scv = sc.unwrap_or(1u32);
-                    let ecv = ec.unwrap_or(scv);
-                    if let Some((_, max_r)) = engine.used_rows_for_columns(sheet_name, scv, ecv) {
-                        er = Some(max_r);
-                    } else if let Some((_max_rows, _)) = engine.sheet_bounds(sheet_name) {
-                        er = Some(engine.config.max_open_ended_rows);
-                    }
-                }
-                if er.is_some() && sr.is_none() {
-                    let scv = sc.unwrap_or(1u32);
-                    let ecv = ec.unwrap_or(scv);
-                    if let Some((min_r, _)) = engine.used_rows_for_columns(sheet_name, scv, ecv) {
-                        sr = Some(min_r);
-                    } else {
-                        sr = Some(1);
-                    }
-                }
-                if sc.is_some() && ec.is_none() {
-                    let srv = sr.unwrap_or(1u32);
-                    let erv = er.unwrap_or(srv);
-                    if let Some((_, max_c)) = engine.used_cols_for_rows(sheet_name, srv, erv) {
-                        ec = Some(max_c);
-                    } else if let Some((_, _max_cols)) = engine.sheet_bounds(sheet_name) {
-                        ec = Some(engine.config.max_open_ended_cols);
-                    }
-                }
-                if ec.is_some() && sc.is_none() {
-                    let srv = sr.unwrap_or(1u32);
-                    let erv = er.unwrap_or(srv);
-                    if let Some((min_c, _)) = engine.used_cols_for_rows(sheet_name, srv, erv) {
-                        sc = Some(min_c);
-                    } else {
-                        sc = Some(1);
-                    }
-                }
-
-                let sr = sr.unwrap_or(1);
-                let sc = sc.unwrap_or(1);
-                let er = er.unwrap_or(sr.saturating_sub(1));
-                let ec = ec.unwrap_or(sc.saturating_sub(1));
-                if er < sr || ec < sc {
+                let Some(extent) = Self::resolve_range(engine, sheet_name, r) else {
                     continue;
-                }
+                };
+                let sr = extent.start_row;
+                let sc = extent.start_column;
+                let er = extent.end_row;
+                let ec = extent.end_column;
 
                 if let Some(index) = engine.graph.sheet_index(sheet_id) {
                     let sr0 = sr.saturating_sub(1);
@@ -352,7 +356,9 @@ impl RangeVirtualDepProvider {
                     let sc0 = sc.saturating_sub(1);
                     let ec0 = ec.saturating_sub(1);
                     for u in index.vertices_in_col_range(sc0, ec0) {
-                        let pc = engine.graph.vertex_coord(u);
+                        let Some(pc) = engine.graph.vertex_grid_addr(u) else {
+                            continue;
+                        };
                         let row0 = pc.row();
                         if row0 < sr0 || row0 > er0 {
                             continue;
@@ -414,46 +420,65 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
 pub struct DynamicRefVirtualDepProvider;
 
 impl DynamicRefVirtualDepProvider {
+    fn collect<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+    ) -> (Vec<VertexId>, Vec<Region>) {
+        if !engine.graph.is_dynamic(v) {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(ast_id) = engine.graph.get_formula_id(v) else {
+            return (Vec::new(), Vec::new());
+        };
+        let sheet_id = engine.graph.get_vertex_sheet_id(v);
+        let sheet_name = engine.graph.sheet_name(sheet_id);
+        let collector = DynamicRefCollector::new(engine, sheet_name);
+        let cell_ref = engine
+            .graph
+            .get_cell_ref(v)
+            .unwrap_or_else(|| engine.graph.make_cell_ref(sheet_name, 0, 0));
+        let interpreter = Interpreter::new_with_cell(&collector, sheet_name, cell_ref);
+        let _ = interpreter.evaluate_arena_ast(
+            ast_id,
+            engine.graph.data_store(),
+            engine.graph.sheet_reg(),
+        );
+        let mut deps = collector
+            .collected
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&dependency| dependency != v)
+            .collect::<Vec<_>>();
+        deps.sort_unstable();
+        deps.dedup();
+        let mut regions = collector
+            .collected_regions
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        regions.sort_by_key(|region| {
+            let (rows, cols) = region.axis_ranges();
+            (region.sheet_id(), rows.query_bounds(), cols.query_bounds())
+        });
+        regions.dedup();
+        (deps, regions)
+    }
+
     pub fn get_virtual_deps<R: EvaluationContext>(
         engine: &Engine<R>,
         v: VertexId,
     ) -> Vec<VertexId> {
-        let mut deps = Vec::new();
+        Self::collect(engine, v).0
+    }
 
-        if engine.graph.is_dynamic(v) {
-            // Re-evaluating the dynamic formula reference side to find what it references.
-            if let Some(ast_id) = engine.graph.get_formula_id(v) {
-                let sheet_id = engine.graph.get_vertex_sheet_id(v);
-                let sheet_name = engine.graph.sheet_name(sheet_id);
-
-                let collector = DynamicRefCollector::new(engine, sheet_name);
-
-                let cell_ref = engine
-                    .graph
-                    .get_cell_ref(v)
-                    .unwrap_or_else(|| engine.graph.make_cell_ref(sheet_name, 0, 0));
-
-                let interpreter = Interpreter::new_with_cell(&collector, sheet_name, cell_ref);
-
-                // Evaluate the formula. We ignore the result, we only care about the collected vertices!
-                let _ = interpreter.evaluate_arena_ast(
-                    ast_id,
-                    engine.graph.data_store(),
-                    engine.graph.sheet_reg(),
-                );
-
-                deps.extend(
-                    collector
-                        .collected
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .copied()
-                        .filter(|&u| u != v),
-                );
-            }
-        }
-
-        deps
+    pub(crate) fn get_virtual_regions<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+    ) -> Vec<Region> {
+        Self::collect(engine, v).1
     }
 }

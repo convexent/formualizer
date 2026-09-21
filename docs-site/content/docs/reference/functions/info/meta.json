@@ -3,7 +3,9 @@
   "defaultOpen": false,
   "pages": [
     "index",
+    "cell",
     "error-type",
+    "formulatext",
     "isblank",
     "iserr",
     "iserror",
@@ -14,9 +16,12 @@
     "isnontext",
     "isnumber",
     "isodd",
+    "isref",
     "istext",
     "n",
     "na",
+    "sheet",
+    "sheets",
     "t",
     "type"
   ],

@@ -1,27 +1,23 @@
 //! Bond pricing functions: ACCRINT, ACCRINTM, PRICE, YIELD
 
 use crate::args::ArgSchema;
-use crate::builtins::datetime::serial_to_date;
+use crate::coercion::to_serial_strict;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use chrono::{Datelike, NaiveDate};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, LiteralValue, try_serial_to_date_for};
 use formualizer_macros::func_caps;
 
+/// Numeric coercion for bond arguments.
+///
+/// `settlement`, `maturity` and `issue` are date arguments, and a workbook
+/// loaded from XLSX holds genuine `Date` cells there. The previous local
+/// copy of the value -> number policy had no date arm, so `PRICE(A1,B1,...)`
+/// over date cells returned `#VALUE!` (see #328). Delegates to the central
+/// [`crate::coercion::to_serial_strict`].
 fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
     let v = arg.value()?.into_literal();
-    coerce_literal_num(&v)
-}
-
-fn coerce_literal_num(v: &LiteralValue) -> Result<f64, ExcelError> {
-    match v {
-        LiteralValue::Number(f) => Ok(*f),
-        LiteralValue::Int(i) => Ok(*i as f64),
-        LiteralValue::Boolean(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        LiteralValue::Empty => Ok(0.0),
-        LiteralValue::Error(e) => Err(e.clone()),
-        _ => Err(ExcelError::new_value()),
-    }
+    to_serial_strict(&v, arg.date_system())
 }
 
 /// Day count basis calculation
@@ -296,7 +292,7 @@ impl Function for AccrintFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Check minimum required arguments
         if args.len() < 6 {
@@ -336,9 +332,10 @@ impl Function for AccrintFn {
 
         let basis = DayCountBasis::from_int(basis_int)?;
 
-        let issue = serial_to_date(issue_serial)?;
-        let first_interest = serial_to_date(first_interest_serial)?;
-        let settlement = serial_to_date(settlement_serial)?;
+        let system = ctx.date_system();
+        let issue = try_serial_to_date_for(system, issue_serial)?;
+        let first_interest = try_serial_to_date_for(system, first_interest_serial)?;
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
 
         // settlement must be after issue
         if settlement <= issue {
@@ -446,7 +443,7 @@ impl Function for AccrintmFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Check minimum required arguments
         if args.len() < 4 {
@@ -474,8 +471,9 @@ impl Function for AccrintmFn {
 
         let basis = DayCountBasis::from_int(basis_int)?;
 
-        let issue = serial_to_date(issue_serial)?;
-        let settlement = serial_to_date(settlement_serial)?;
+        let system = ctx.date_system();
+        let issue = try_serial_to_date_for(system, issue_serial)?;
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
 
         // settlement must be after issue
         if settlement <= issue {
@@ -571,7 +569,7 @@ impl Function for PriceFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Check minimum required arguments
         if args.len() < 6 {
@@ -606,8 +604,9 @@ impl Function for PriceFn {
 
         let basis = DayCountBasis::from_int(basis_int)?;
 
-        let settlement = serial_to_date(settlement_serial)?;
-        let maturity = serial_to_date(maturity_serial)?;
+        let system = ctx.date_system();
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
+        let maturity = try_serial_to_date_for(system, maturity_serial)?;
 
         // maturity must be after settlement
         if maturity <= settlement {
@@ -765,7 +764,7 @@ impl Function for YieldFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Check minimum required arguments
         if args.len() < 6 {
@@ -800,8 +799,9 @@ impl Function for YieldFn {
 
         let basis = DayCountBasis::from_int(basis_int)?;
 
-        let settlement = serial_to_date(settlement_serial)?;
-        let maturity = serial_to_date(maturity_serial)?;
+        let system = ctx.date_system();
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
+        let maturity = try_serial_to_date_for(system, maturity_serial)?;
 
         // maturity must be after settlement
         if maturity <= settlement {
@@ -970,7 +970,7 @@ impl Function for TbilleqFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let settlement_serial = coerce_num(&args[0])?;
         let maturity_serial = coerce_num(&args[1])?;
@@ -982,8 +982,9 @@ impl Function for TbilleqFn {
             ));
         }
 
-        let settlement = serial_to_date(settlement_serial)?;
-        let maturity = serial_to_date(maturity_serial)?;
+        let system = ctx.date_system();
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
+        let maturity = try_serial_to_date_for(system, maturity_serial)?;
 
         if maturity <= settlement {
             return Ok(CalcValue::Scalar(
@@ -1085,7 +1086,7 @@ impl Function for TbillpriceFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let settlement_serial = coerce_num(&args[0])?;
         let maturity_serial = coerce_num(&args[1])?;
@@ -1097,8 +1098,9 @@ impl Function for TbillpriceFn {
             ));
         }
 
-        let settlement = serial_to_date(settlement_serial)?;
-        let maturity = serial_to_date(maturity_serial)?;
+        let system = ctx.date_system();
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
+        let maturity = try_serial_to_date_for(system, maturity_serial)?;
 
         if maturity <= settlement {
             return Ok(CalcValue::Scalar(
@@ -1184,7 +1186,7 @@ impl Function for TbillyieldFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let settlement_serial = coerce_num(&args[0])?;
         let maturity_serial = coerce_num(&args[1])?;
@@ -1196,8 +1198,9 @@ impl Function for TbillyieldFn {
             ));
         }
 
-        let settlement = serial_to_date(settlement_serial)?;
-        let maturity = serial_to_date(maturity_serial)?;
+        let system = ctx.date_system();
+        let settlement = try_serial_to_date_for(system, settlement_serial)?;
+        let maturity = try_serial_to_date_for(system, maturity_serial)?;
 
         if maturity <= settlement {
             return Ok(CalcValue::Scalar(
@@ -1219,13 +1222,13 @@ impl Function for TbillyieldFn {
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(AccrintFn));
-    crate::function_registry::register_function(Arc::new(AccrintmFn));
-    crate::function_registry::register_function(Arc::new(PriceFn));
-    crate::function_registry::register_function(Arc::new(YieldFn));
-    crate::function_registry::register_function(Arc::new(TbilleqFn));
-    crate::function_registry::register_function(Arc::new(TbillpriceFn));
-    crate::function_registry::register_function(Arc::new(TbillyieldFn));
+    crate::function_registry::register_builtin(Arc::new(AccrintFn));
+    crate::function_registry::register_builtin(Arc::new(AccrintmFn));
+    crate::function_registry::register_builtin(Arc::new(PriceFn));
+    crate::function_registry::register_builtin(Arc::new(YieldFn));
+    crate::function_registry::register_builtin(Arc::new(TbilleqFn));
+    crate::function_registry::register_builtin(Arc::new(TbillpriceFn));
+    crate::function_registry::register_builtin(Arc::new(TbillyieldFn));
 }
 
 #[cfg(test)]
@@ -1251,5 +1254,51 @@ mod tests {
         let forward = year_fraction(&start, &end, DayCountBasis::ActualActual);
         let backward = year_fraction(&end, &start, DayCountBasis::ActualActual);
         assert!((forward + backward).abs() < 1e-12);
+    }
+
+    fn eval_bond_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
+        use crate::engine::{Engine, EvalConfig};
+        use crate::interpreter::Interpreter;
+        use crate::test_workbook::TestWorkbook;
+        use formualizer_parse::parser::parse;
+
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AccrintmFn));
+        let engine = Engine::new(wb, EvalConfig::default().with_date_system(system));
+        let interpreter = Interpreter::new(&engine, "Sheet1");
+        interpreter
+            .evaluate_ast(&parse(formula).expect("formula should parse"))
+            .expect("formula should evaluate")
+            .into_literal()
+    }
+
+    /// Bond day counts depend on the calendar dates the serials denote, so the
+    /// same issue/settlement pair must accrue identically in both date systems.
+    #[test]
+    fn accrintm_follows_workbook_date_system_1900_and_1904() {
+        use crate::engine::DateSystem;
+        use formualizer_common::date_to_serial_for;
+
+        // Dates in 1904 are deliberate. Actual/360 accrual depends only on the
+        // *difference* between the two dates, which is epoch-invariant, so a
+        // modern date pair cannot detect a misread date system at all. Anchored
+        // at the 1904 epoch the settlement serials are small, and reading them
+        // as 1900 serials lands on entirely different calendar dates -- which is
+        // exactly the confusion this test exists to catch.
+        let issue = NaiveDate::from_ymd_opt(1904, 1, 1).unwrap();
+        let settlement = NaiveDate::from_ymd_opt(1904, 7, 1).unwrap();
+        // Actual/360 over 182 days: 1000 * 0.1 * 182 / 360.
+        let expected = 1000.0 * 0.1 * 182.0 / 360.0;
+
+        for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+            let i = date_to_serial_for(system, &issue);
+            let s = date_to_serial_for(system, &settlement);
+            match eval_bond_formula(system, &format!("=ACCRINTM({i},{s},0.1,1000,2)")) {
+                LiteralValue::Number(n) => assert!(
+                    (n - expected).abs() < 1e-9,
+                    "ACCRINTM under {system:?}: expected {expected}, got {n}"
+                ),
+                other => panic!("expected numeric ACCRINTM under {system:?}, got {other:?}"),
+            }
+        }
     }
 }

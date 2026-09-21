@@ -1,6 +1,8 @@
 use super::super::utils::{ARG_RANGE_NUM_LENIENT_ONE, coerce_num};
+use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
 use crate::function::Function;
+use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow_array::Array;
 use formualizer_common::{ExcelError, LiteralValue};
@@ -66,6 +68,13 @@ pub struct MinFn; // MIN(...)
 /// Caps: PURE, REDUCTION, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for MinFn {
+    fn propagate_format(
+        &self,
+        result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        result.format_id()
+    }
+
     func_caps!(PURE, REDUCTION, NUMERIC_ONLY);
     fn name(&self) -> &'static str {
         "MIN"
@@ -76,60 +85,78 @@ impl Function for MinFn {
     fn variadic(&self) -> bool {
         true
     }
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract::static_reduction(arity, self.min_args())
+    }
     fn arg_schema(&self) -> &'static [ArgSchema] {
         &ARG_RANGE_NUM_LENIENT_ONE[..]
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut mv: Option<f64> = None;
+        let mut mv_format = None;
         for a in args {
-            if let Ok(view) = a.range_view() {
-                // Propagate errors from range first
-                for res in view.errors_slices() {
-                    let (_, _, err_cols) = res?;
-                    for col in err_cols {
-                        if col.null_count() < col.len() {
-                            for i in 0..col.len() {
-                                if !col.is_null(i) {
-                                    return Ok(crate::traits::CalcValue::Scalar(
-                                        LiteralValue::Error(ExcelError::new(
-                                            crate::arrow_store::unmap_error_code(col.value(i)),
-                                        )),
-                                    ));
+            let argument_format = a.value()?.format_id();
+            match resolve_aggregate_argument(a, ctx)? {
+                AggregateArgument::Range(view) => {
+                    // Propagate errors from range first
+                    for res in view.errors_slices() {
+                        let (_, _, err_cols) = res?;
+                        for col in err_cols {
+                            if col.null_count() < col.len() {
+                                for i in 0..col.len() {
+                                    if !col.is_null(i) {
+                                        return Ok(crate::traits::CalcValue::Scalar(
+                                            LiteralValue::Error(ExcelError::new(
+                                                crate::arrow_store::unmap_error_code(col.value(i)),
+                                            )),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                for res in view.numbers_slices() {
-                    let (_, _, num_cols) = res?;
-                    for col in num_cols {
-                        if let Some(n) = arrow::compute::kernels::aggregate::min(col.as_ref()) {
-                            mv = Some(mv.map(|m| m.min(n)).unwrap_or(n));
+                    for res in view.numbers_slices() {
+                        let (_, _, num_cols) = res?;
+                        for col in num_cols {
+                            if let Some(n) = arrow::compute::kernels::aggregate::min(col.as_ref())
+                                && mv.is_none_or(|current| n < current)
+                            {
+                                mv = Some(n);
+                                mv_format =
+                                    (view.dims() == (1, 1)).then_some(argument_format).flatten();
+                            }
                         }
                     }
                 }
-            } else {
-                let v = a.value()?.into_literal();
-                match v {
+                AggregateArgument::ReferenceError(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                AggregateArgument::Scalar(v) => match v {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
                     other => {
-                        if let Ok(n) = coerce_num(&other) {
-                            mv = Some(mv.map(|m| m.min(n)).unwrap_or(n));
+                        if let Ok(n) = coerce_num(&other)
+                            && mv.is_none_or(|current| n < current)
+                        {
+                            mv = Some(n);
+                            mv_format = argument_format;
                         }
                     }
-                }
+                },
             }
         }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            mv.unwrap_or(0.0),
-        )))
+        Ok(
+            crate::traits::CalcValue::Scalar(super::super::utils::aggregate_result(
+                mv.unwrap_or(0.0),
+            ))
+            .with_format(mv_format),
+        )
     }
 }
 
@@ -193,6 +220,13 @@ pub struct MaxFn; // MAX(...)
 /// Caps: PURE, REDUCTION, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for MaxFn {
+    fn propagate_format(
+        &self,
+        result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        result.format_id()
+    }
+
     func_caps!(PURE, REDUCTION, NUMERIC_ONLY);
     fn name(&self) -> &'static str {
         "MAX"
@@ -203,67 +237,85 @@ impl Function for MaxFn {
     fn variadic(&self) -> bool {
         true
     }
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract::static_reduction(arity, self.min_args())
+    }
     fn arg_schema(&self) -> &'static [ArgSchema] {
         &ARG_RANGE_NUM_LENIENT_ONE[..]
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut mv: Option<f64> = None;
+        let mut mv_format = None;
         for a in args {
-            if let Ok(view) = a.range_view() {
-                // Propagate errors from range first
-                for res in view.errors_slices() {
-                    let (_, _, err_cols) = res?;
-                    for col in err_cols {
-                        if col.null_count() < col.len() {
-                            for i in 0..col.len() {
-                                if !col.is_null(i) {
-                                    return Ok(crate::traits::CalcValue::Scalar(
-                                        LiteralValue::Error(ExcelError::new(
-                                            crate::arrow_store::unmap_error_code(col.value(i)),
-                                        )),
-                                    ));
+            let argument_format = a.value()?.format_id();
+            match resolve_aggregate_argument(a, ctx)? {
+                AggregateArgument::Range(view) => {
+                    // Propagate errors from range first
+                    for res in view.errors_slices() {
+                        let (_, _, err_cols) = res?;
+                        for col in err_cols {
+                            if col.null_count() < col.len() {
+                                for i in 0..col.len() {
+                                    if !col.is_null(i) {
+                                        return Ok(crate::traits::CalcValue::Scalar(
+                                            LiteralValue::Error(ExcelError::new(
+                                                crate::arrow_store::unmap_error_code(col.value(i)),
+                                            )),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                for res in view.numbers_slices() {
-                    let (_, _, num_cols) = res?;
-                    for col in num_cols {
-                        if let Some(n) = arrow::compute::kernels::aggregate::max(col.as_ref()) {
-                            mv = Some(mv.map(|m| m.max(n)).unwrap_or(n));
+                    for res in view.numbers_slices() {
+                        let (_, _, num_cols) = res?;
+                        for col in num_cols {
+                            if let Some(n) = arrow::compute::kernels::aggregate::max(col.as_ref())
+                                && mv.is_none_or(|current| n > current)
+                            {
+                                mv = Some(n);
+                                mv_format =
+                                    (view.dims() == (1, 1)).then_some(argument_format).flatten();
+                            }
                         }
                     }
                 }
-            } else {
-                let v = a.value()?.into_literal();
-                match v {
+                AggregateArgument::ReferenceError(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                AggregateArgument::Scalar(v) => match v {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
                     other => {
-                        if let Ok(n) = coerce_num(&other) {
-                            mv = Some(mv.map(|m| m.max(n)).unwrap_or(n));
+                        if let Ok(n) = coerce_num(&other)
+                            && mv.is_none_or(|current| n > current)
+                        {
+                            mv = Some(n);
+                            mv_format = argument_format;
                         }
                     }
-                }
+                },
             }
         }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            mv.unwrap_or(0.0),
-        )))
+        Ok(
+            crate::traits::CalcValue::Scalar(super::super::utils::aggregate_result(
+                mv.unwrap_or(0.0),
+            ))
+            .with_format(mv_format),
+        )
     }
 }
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(MinFn));
-    crate::function_registry::register_function(Arc::new(MaxFn));
+    crate::function_registry::register_builtin(Arc::new(MinFn));
+    crate::function_registry::register_builtin(Arc::new(MaxFn));
 }
 
 #[cfg(test)]

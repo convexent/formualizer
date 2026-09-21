@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::errors::ExcelEvaluationError;
+use crate::errors::excel_error_to_pyerr;
 use crate::value::{literal_to_py, py_to_literal};
 use crate::workbook::PyWorkbook;
 use formualizer::common::LiteralValue;
@@ -17,6 +17,7 @@ use pyo3::conversion::IntoPyObjectExt;
 use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
+#[cfg(not(target_os = "emscripten"))]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde_json::Value as JsonValue;
 
@@ -77,14 +78,14 @@ type RuntimeResult<T> = Result<T, RuntimeSheetPortError>;
 ///     out = session.evaluate_once(freeze_volatile=True)
 ///     print(out["final_price"])
 /// ```
-#[gen_stub_pyclass]
-#[pyclass(name = "SheetPortSession", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass)]
+#[pyclass(name = "SheetPortSession", module = "formualizer.formualizer_py")]
 pub struct PySheetPortSession {
     workbook: PyWorkbook,
     bindings: ManifestBindings,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PySheetPortSession {
     #[classmethod]
@@ -109,6 +110,8 @@ impl PySheetPortSession {
             &py.get_type::<PyWorkbook>(),
             workbook_path,
             backend,
+            None,
+            None,
             None,
             None,
         )?;
@@ -286,7 +289,7 @@ impl PySheetPortSession {
     }
 }
 
-fn parse_timezone_spec(obj: &Bound<'_, PyAny>) -> PyResult<TimeZoneSpec> {
+pub(crate) fn parse_timezone_spec(obj: &Bound<'_, PyAny>) -> PyResult<TimeZoneSpec> {
     if let Ok(s) = obj.extract::<String>() {
         match s.to_ascii_lowercase().as_str() {
             "utc" => Ok(TimeZoneSpec::Utc),
@@ -310,25 +313,62 @@ impl PySheetPortSession {
         Ok(Self { workbook, bindings })
     }
 
+    /// Run `f` against a `SheetPort` bound to the session's workbook **with the
+    /// GIL released**.
+    ///
+    /// `evaluate_once` drives a full engine evaluation, which fans out onto
+    /// rayon workers; if one of those workers reaches a Python-backed custom
+    /// function it blocks in `PyGILState_Ensure` while this thread waits for
+    /// the parallel layer to finish — the exact deadlock #327 fixed on
+    /// `Workbook.evaluate_*`. `PySheetPortSession` owns a `PyWorkbook` and
+    /// `from_manifest_yaml` takes a user-supplied one, so Python custom
+    /// functions are fully reachable here and the same treatment is required.
+    ///
+    /// Everything inside the detached region is plain Rust: the workbook lock,
+    /// the SheetPort run, and a `SheetPortError` carried back out. Errors are
+    /// converted to Python exceptions only after the GIL is re-attached.
     fn with_sheetport<'py, F, T>(&mut self, py: Python<'py>, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut SheetPort<'_>) -> RuntimeResult<T>,
+        F: FnOnce(&mut SheetPort<'_>) -> RuntimeResult<T> + Send,
+        T: Send,
     {
         let bindings_clone = self.bindings.clone();
-        let mut updated: Option<ManifestBindings> = None;
-        let result = self.workbook.with_workbook_mut(|workbook| {
-            let mut sheetport = SheetPort::from_bindings(workbook, bindings_clone)
-                .map_err(|err| map_sheetport_err(py, err))?;
-            let output = f(&mut sheetport).map_err(|err| map_sheetport_err(py, err))?;
-            let (_, bindings) = sheetport.into_parts();
-            updated = Some(bindings);
-            Ok(output)
-        })?;
-        if let Some(new_bindings) = updated {
-            self.bindings = new_bindings;
+        let workbook = self.workbook.clone();
+        let outcome = py.detach(
+            move || -> Result<(T, ManifestBindings), SheetPortCallError> {
+                let mut guard = workbook
+                    .write_inner_detached()
+                    .map_err(|err| SheetPortCallError::Runtime(err.into()))?;
+                // Internal mutations bypass the legacy `sheets` compatibility
+                // cache, so it is invalidated alongside the write (mirrors
+                // `PyWorkbook::with_workbook_mut`).
+                let mut sheetport = SheetPort::from_bindings(&mut guard, bindings_clone)
+                    .map_err(SheetPortCallError::Runtime)?;
+                let output = f(&mut sheetport).map_err(SheetPortCallError::Runtime)?;
+                let (_, bindings) = sheetport.into_parts();
+                Ok((output, bindings))
+            },
+        );
+
+        // The cache is cleared regardless of outcome: a failed write may still
+        // have mutated cells before erroring.
+        self.workbook.clear_sheet_cache();
+
+        match outcome {
+            Ok((output, bindings)) => {
+                self.bindings = bindings;
+                Ok(output)
+            }
+            Err(SheetPortCallError::Runtime(err)) => Err(map_sheetport_err(py, err)),
         }
-        Ok(result)
     }
+}
+
+/// Error escaping the detached region in [`PySheetPortSession::with_sheetport`].
+/// It must not reference Python state, so lock failures ride along as the
+/// runtime error's `Workbook` variant.
+enum SheetPortCallError {
+    Runtime(RuntimeSheetPortError),
 }
 
 fn bind_manifest(
@@ -683,12 +723,11 @@ fn map_sheetport_err(py: Python<'_>, err: RuntimeSheetPortError) -> PyErr {
                 }
             }
         }
-        RuntimeSheetPortError::Workbook { source } => {
-            SheetPortWorkbookError::new_err(source.to_string())
-        }
-        RuntimeSheetPortError::Engine { source } => {
-            ExcelEvaluationError::new_err(source.to_string())
-        }
+        RuntimeSheetPortError::Workbook { source } => match source {
+            formualizer::workbook::IoError::Engine(error) => excel_error_to_pyerr(error),
+            other => SheetPortWorkbookError::new_err(other.to_string()),
+        },
+        RuntimeSheetPortError::Engine { source } => excel_error_to_pyerr(source),
         RuntimeSheetPortError::UnsupportedSelector { port, reason } => {
             SheetPortError::new_err(format!("port `{port}` uses unsupported selector: {reason}"))
         }
@@ -705,6 +744,37 @@ fn map_sheetport_err(py: Python<'_>, err: RuntimeSheetPortError) -> PyErr {
         RuntimeSheetPortError::InvariantViolation { port, message } => {
             SheetPortError::new_err(format!("port `{port}` invariant violation: {message}"))
         }
+        RuntimeSheetPortError::LayoutExhausted {
+            port,
+            sheet,
+            termination,
+            scan_start,
+            limit,
+            observed,
+        } => {
+            let error = SheetPortError::new_err(format!(
+                "layout `{termination}` exhausted for port `{port}` on `{sheet}`"
+            ));
+            let value = error.value(py);
+            let _ = value.setattr("kind", "LayoutExhausted");
+            let _ = value.setattr("port", port);
+            let _ = value.setattr("sheet", sheet);
+            let _ = value.setattr("termination", termination);
+            let _ = value.setattr("scan_start", scan_start);
+            let _ = value.setattr("limit", limit);
+            let _ = value.setattr("observed", observed);
+            error
+        }
+        RuntimeSheetPortError::SelectorSafety { port, reason } => {
+            SheetPortError::new_err(format!("port `{port}` selector safety error: {reason}"))
+        }
+        RuntimeSheetPortError::BatchRestoration {
+            primary,
+            restoration,
+        } => SheetPortError::new_err(format!(
+            "batch failed ({primary}); baseline restoration also failed ({restoration})"
+        )),
+        other => SheetPortError::new_err(other.to_string()),
     }
 }
 

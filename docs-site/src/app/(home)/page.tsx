@@ -30,7 +30,7 @@ const runtimeCards = [
 
 const featureCards = [
   {
-    title: '320+ Excel-compatible built-ins',
+    title: '400+ Excel-compatible built-ins',
     href: '/docs/reference/functions',
     image: '/home/feature-builtins-v1.png',
     badge: 'Function depth',
@@ -64,7 +64,7 @@ export default function HomePage() {
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Cross-platform',
     description:
-      'Embeddable spreadsheet formula engine with 320+ Excel-compatible functions, Arrow-powered storage, and deterministic evaluation. Available for Rust, Python, and JavaScript/WASM.',
+      'Embeddable spreadsheet formula engine with 400+ Excel-compatible functions, Arrow-powered storage, and deterministic evaluation. Available for Rust, Python, and JavaScript/WASM.',
     url: base,
     offers: {
       '@type': 'Offer',
@@ -76,7 +76,7 @@ export default function HomePage() {
     license: 'https://opensource.org/licenses/MIT',
     codeRepository: 'https://github.com/psu3d0/formualizer',
     featureList: [
-      '320+ Excel-compatible built-in functions',
+      '400+ Excel-compatible built-in functions',
       'Incremental dependency graph with cycle detection',
       'SheetPort: treat spreadsheets as typed deterministic functions',
       'Arrow-powered columnar storage',
@@ -183,7 +183,7 @@ export default function HomePage() {
               <p className="text-xs font-medium uppercase tracking-wide text-violet-800 dark:text-violet-300">
                 Function depth
               </p>
-              <p className="mt-1 text-lg font-semibold">320+ Excel-compatible built-ins</p>
+              <p className="mt-1 text-lg font-semibold">400+ Excel-compatible built-ins</p>
               <p className="mt-1 text-sm text-fd-muted-foreground">
                 Math, lookup, text, financial, stats, and dynamic arrays in one registry.
               </p>
@@ -220,7 +220,13 @@ export default function HomePage() {
         <p className="text-2xl leading-relaxed text-fd-muted-foreground md:text-4xl md:leading-snug">
           Formualizer is a permissively licensed spreadsheet engine with{' '}
           <span className="font-semibold text-fd-foreground">Arrow-powered performance</span>,{' '}
-          <span className="font-semibold text-fd-foreground">deterministic evaluation for agents</span>, and{' '}
+          <Link
+            href="/spreadsheet-engine-for-ai-agents"
+            className="font-semibold text-fd-foreground underline decoration-fd-muted-foreground/40 underline-offset-4 hover:decoration-fd-foreground"
+          >
+            deterministic evaluation for agents
+          </Link>
+          , and{' '}
           <span className="font-semibold text-fd-foreground">consistent Rust, Python, and WASM APIs</span>.
         </p>
       </section>
@@ -296,6 +302,21 @@ export default function HomePage() {
       </section>
 
       <WorkflowTabs />
+
+      <section className="rounded-2xl border bg-fd-card p-8 text-center">
+        <h2 className="text-2xl font-semibold tracking-tight">Formualizer in production</h2>
+        <p className="mx-auto mt-2 max-w-2xl text-fd-muted-foreground">
+          This engine powers{' '}
+          <a
+            href="https://formualizer.com"
+            className="font-medium text-fd-foreground underline underline-offset-4"
+          >
+            formualizer.com
+          </a>
+          {' '}— permissioned, traceable statements published straight from Excel models, where
+          every figure traces to the cells that produced it.
+        </p>
+      </section>
     </div>
     </>
   );

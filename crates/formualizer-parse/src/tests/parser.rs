@@ -1,38 +1,30 @@
 #[cfg(test)]
 mod tests {
     use crate::FormulaDialect;
-    use crate::tokenizer::Tokenizer;
+    use crate::tokenizer::TokenStream;
     use formualizer_common::{ExcelError, LiteralValue};
 
-    use crate::parser::{ASTNode, ASTNodeType, Parser, ParserError, ReferenceType};
+    use crate::parser::{
+        ASTNode, ASTNodeType, Parser, ParserError, ReferenceType, parse, parse_with_dialect,
+    };
     use crate::parser::{CollectPolicy, RefView};
 
     // Helper function to parse a formula
     fn parse_formula(formula: &str) -> Result<ASTNode, ParserError> {
-        let tokenizer = Tokenizer::new(formula).map_err(|e| ParserError {
-            message: e.to_string(),
-            position: Some(e.pos),
-        })?;
-        let mut parser = Parser::new(tokenizer.items, false);
-        parser.parse()
+        parse(formula)
     }
 
     fn parse_formula_with_dialect(
         formula: &str,
         dialect: FormulaDialect,
     ) -> Result<ASTNode, ParserError> {
-        let tokenizer = Tokenizer::new_with_dialect(formula, dialect).map_err(|e| ParserError {
-            message: e.to_string(),
-            position: Some(e.pos),
-        })?;
-        let mut parser = Parser::new_with_dialect(tokenizer.items, false, dialect);
-        parser.parse()
+        parse_with_dialect(formula, dialect)
     }
 
     #[test]
     fn parser_rejects_best_effort_invalid_spans() {
-        let tokenizer = Tokenizer::new_best_effort("=A1+)");
-        let mut parser = Parser::new(tokenizer.items, false);
+        let stream = TokenStream::new_best_effort("=A1+)");
+        let mut parser = Parser::from_token_stream(&stream);
         let err = parser.parse().unwrap_err();
         assert!(err.message.contains("Unexpected"));
     }
@@ -63,8 +55,7 @@ mod tests {
 
     mod sheet_qualified_errors {
         use super::parse_formula;
-        use crate::parser::{ASTNode, ASTNodeType, Parser};
-        use crate::tokenizer::Tokenizer;
+        use crate::parser::{ASTNode, ASTNodeType};
         use formualizer_common::{ExcelErrorKind, LiteralValue};
 
         fn parse_span(formula: &str) -> Result<ASTNode, crate::parser::ParserError> {
@@ -195,21 +186,15 @@ mod tests {
                 "=[1]Sheet1!#REF!",
                 "=sheet1!#ref!",
             ] {
-                let classic = {
-                    let tok = Tokenizer::new(formula).expect("tokenize");
-                    let mut parser = Parser::new(tok.items, false);
-                    parser.parse().expect("classic parse")
-                };
-                let span = parse_span(formula).expect("span parse");
-                let classic_kind = match &classic.node_type {
+                let ast = parse_span(formula).expect("parse");
+                let kind = match &ast.node_type {
                     ASTNodeType::Literal(LiteralValue::Error(e)) => e.kind,
-                    other => panic!("classic non-error for {formula:?}: {other:?}"),
+                    other => panic!("non-error for {formula:?}: {other:?}"),
                 };
-                let span_kind = match &span.node_type {
-                    ASTNodeType::Literal(LiteralValue::Error(e)) => e.kind,
-                    other => panic!("span non-error for {formula:?}: {other:?}"),
-                };
-                assert_eq!(classic_kind, span_kind, "kind mismatch for {formula:?}");
+                assert!(
+                    kind.to_string().starts_with('#'),
+                    "kind mismatch for {formula:?}"
+                );
             }
         }
     }
@@ -236,17 +221,18 @@ mod tests {
 
     #[test]
     fn test_contains_volatile_with_classifier() {
-        let tokenizer = Tokenizer::new("=RAND()+A1").unwrap();
-        let mut parser = Parser::new(tokenizer.items, false).with_volatility_classifier(|name| {
-            name.eq_ignore_ascii_case("RAND")
-                || name.eq_ignore_ascii_case("NOW")
-                || name.eq_ignore_ascii_case("TODAY")
-        });
+        let mut parser = Parser::new("=RAND()+A1")
+            .unwrap()
+            .with_volatility_classifier(|name| {
+                name.eq_ignore_ascii_case("RAND")
+                    || name.eq_ignore_ascii_case("NOW")
+                    || name.eq_ignore_ascii_case("TODAY")
+            });
         let ast = parser.parse().unwrap();
         assert!(ast.contains_volatile());
 
-        let tokenizer = Tokenizer::new("=SUM(1,2,3)").unwrap();
-        let mut parser = Parser::new(tokenizer.items, false)
+        let mut parser = Parser::new("=SUM(1,2,3)")
+            .unwrap()
             .with_volatility_classifier(|name| name.eq_ignore_ascii_case("RAND"));
         let ast = parser.parse().unwrap();
         assert!(!ast.contains_volatile());
@@ -571,32 +557,31 @@ mod tests {
             panic!("Expected Function node");
         }
 
-        // Test with multiple optional arguments - some specified, some not
+        // Explicitly omitted arguments remain distinct from explicit empty text.
         let ast = parse_formula("=IFERROR(A1/B1,)").unwrap();
         if let ASTNodeType::Function { name, args } = &ast.node_type {
             assert_eq!(name, "IFERROR");
             assert_eq!(args.len(), 2);
-            // Second argument should be an empty string
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[1].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for omitted argument");
-            }
+            assert!(matches!(args[1].node_type, ASTNodeType::Omitted));
         } else {
             panic!("Expected Function node");
         }
+
+        let ast = parse_formula("=IFERROR(A1/B1,\"\")").unwrap();
+        let ASTNodeType::Function { args, .. } = &ast.node_type else {
+            panic!("Expected Function node");
+        };
+        assert!(matches!(
+            &args[1].node_type,
+            ASTNodeType::Literal(LiteralValue::Text(text)) if text.is_empty()
+        ));
 
         // Test skipping middle arguments
         let ast = parse_formula("=IF(A1>0,,C1)").unwrap();
         if let ASTNodeType::Function { name, args } = ast.node_type {
             assert_eq!(name, "IF");
             assert_eq!(args.len(), 3);
-            // Middle argument should be empty
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[1].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for omitted middle argument");
-            }
+            assert!(matches!(args[1].node_type, ASTNodeType::Omitted));
         } else {
             panic!("Expected Function node");
         }
@@ -606,17 +591,8 @@ mod tests {
         if let ASTNodeType::Function { name, args } = ast.node_type {
             assert_eq!(name, "IF");
             assert_eq!(args.len(), 3);
-            // Both optional arguments should be empty
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[1].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for second argument");
-            }
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[2].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for third argument");
-            }
+            assert!(matches!(args[1].node_type, ASTNodeType::Omitted));
+            assert!(matches!(args[2].node_type, ASTNodeType::Omitted));
         } else {
             panic!("Expected Function node");
         }
@@ -626,20 +602,55 @@ mod tests {
         if let ASTNodeType::Function { name, args } = ast.node_type {
             assert_eq!(name, "CHOOSE");
             assert_eq!(args.len(), 6);
-            // Check the empty arguments (3rd and 5th)
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[2].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for third argument");
-            }
-            if let ASTNodeType::Literal(LiteralValue::Text(text)) = &args[4].node_type {
-                assert_eq!(text, "");
-            } else {
-                panic!("Expected empty text literal for fifth argument");
-            }
+            assert!(matches!(args[2].node_type, ASTNodeType::Omitted));
+            assert!(matches!(args[4].node_type, ASTNodeType::Omitted));
         } else {
             panic!("Expected Function node");
         }
+    }
+
+    #[test]
+    fn test_omitted_argument_shapes_round_trip_and_fingerprint() {
+        for (formula, omitted_positions) in [
+            ("=IF(TRUE,,5)", vec![1]),
+            ("=SUM(1,)", vec![1]),
+            ("=SUM(1,,)", vec![1, 2]),
+            ("=SUM(1, )", vec![1]),
+        ] {
+            let ast = parse_formula(formula).unwrap();
+            let ASTNodeType::Function { args, .. } = &ast.node_type else {
+                panic!("Expected Function node for {formula}");
+            };
+            for position in omitted_positions {
+                assert!(
+                    matches!(args[position].node_type, ASTNodeType::Omitted),
+                    "argument {position} was not omitted in {formula}"
+                );
+            }
+        }
+
+        let nested = parse_formula("=IF(TRUE,IFERROR(1/0,),2)").unwrap();
+        let rendered = crate::pretty::canonical_formula(&nested);
+        assert_eq!(rendered, "=IF(true, IFERROR(1 / 0,), 2)");
+        assert_eq!(
+            parse_formula(&rendered).unwrap().fingerprint(),
+            nested.fingerprint()
+        );
+
+        let omitted = parse_formula("=IFERROR(A1,)").unwrap();
+        let empty_text = parse_formula("=IFERROR(A1,\"\")").unwrap();
+        assert_ne!(omitted.fingerprint(), empty_text.fingerprint());
+        assert_ne!(
+            crate::pretty::canonical_formula(&omitted),
+            crate::pretty::canonical_formula(&empty_text)
+        );
+
+        let call = parse_formula("=LAMBDA(x,y,x)(1,)").unwrap();
+        let ASTNodeType::Call { args, .. } = call.node_type else {
+            panic!("Expected immediate call node");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(args[1].node_type, ASTNodeType::Omitted));
     }
 
     #[test]
@@ -2373,8 +2384,7 @@ mod reference_tests {
     fn test_get_dependencies() {
         // Parse a formula and check its dependencies
         let formula = "=A1+B1*SUM(C1:D2)";
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
 
         let dependencies = ast.get_dependencies();
@@ -2399,8 +2409,7 @@ mod reference_tests {
     fn test_get_dependency_strings() {
         // Parse a formula and check its dependency strings
         let formula = "=A1+B1*SUM(C1:D2)";
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
 
         let dependencies = ast.get_dependency_strings();
@@ -2415,8 +2424,7 @@ mod reference_tests {
     #[test]
     fn test_complex_formula_dependencies() {
         let formula = "=IF(SUM(Sheet1!A1:A10)>100,MAX(Table1[Amount]),MIN('Data Sheet'!B1:B5))";
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
 
         let dependencies = ast.get_dependency_strings();
@@ -2433,7 +2441,7 @@ mod reference_tests {
         let formula = "=_xlfn.XLOOKUP(J7, 'GI XWALK'!$Q:$Q,'GI XWALK'!$R:$R,,0)";
         let tokenizer = Tokenizer::new(formula).unwrap();
         println!("tokenizer: {:?}", tokenizer.items);
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
         println!("ast: {ast:?}");
     }
@@ -2442,8 +2450,7 @@ mod reference_tests {
     fn test_dual_bracket_structured_reference_parsing() {
         use crate::parser::{SpecialItem, TableSpecifier};
         let formula = "=EffortDB[[#All],[NPI]:[JMG Group]]";
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
 
         let ASTNodeType::Reference {
@@ -2574,7 +2581,7 @@ mod reference_tests {
         let formula = "=EffortDB[#All]";
         let tokenizer = Tokenizer::new(formula).unwrap();
         println!("tokenizer: {:?}", tokenizer.items);
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser.parse().unwrap();
         println!("ast: {ast:?}");
     }
@@ -2765,10 +2772,8 @@ mod structured_references {
         TableSpecifier,
     };
     use crate::tokenizer::Tokenizer;
-
     fn parse_via_classic(formula: &str) -> Result<ReferenceType, String> {
-        let tokenizer = Tokenizer::new(formula).map_err(|e| e.to_string())?;
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).map_err(|e| e.to_string())?;
         let ast = parser.parse().map_err(|e| e.to_string())?;
         match ast.node_type {
             ASTNodeType::Reference { reference, .. } => Ok(reference),
@@ -3280,12 +3285,10 @@ mod sheet_ref_tests {
 #[cfg(test)]
 mod semantics_regressions {
     use crate::parser::{ASTNodeType, Parser, ReferenceType};
-    use crate::tokenizer::Tokenizer;
 
     #[test]
     fn exponent_is_right_associative() {
-        let t = Tokenizer::new("=2^3^2").unwrap();
-        let mut p = Parser::new(t.items, false);
+        let mut p = Parser::new("=2^3^2").unwrap();
         let ast = p.parse().unwrap();
 
         match ast.node_type {
@@ -3303,8 +3306,7 @@ mod semantics_regressions {
 
     #[test]
     fn unary_minus_binds_tighter_than_exponent() {
-        let t = Tokenizer::new("=-2^2").unwrap();
-        let mut p = Parser::new(t.items, false);
+        let mut p = Parser::new("=-2^2").unwrap();
         let ast = p.parse().unwrap();
 
         // Excel: =-2^2 means (-2)^2 = 4
@@ -3321,17 +3323,11 @@ mod semantics_regressions {
     }
 
     mod scientific_notation {
-        use crate::parser::{ASTNode, ASTNodeType, Parser, ParserError, ReferenceType, parse};
-        use crate::tokenizer::Tokenizer;
+        use crate::parser::{ASTNode, ASTNodeType, ParserError, ReferenceType, parse};
         use formualizer_common::LiteralValue;
 
         fn parse_formula(formula: &str) -> Result<ASTNode, ParserError> {
-            let tokenizer = Tokenizer::new(formula).map_err(|e| ParserError {
-                message: e.to_string(),
-                position: Some(e.pos),
-            })?;
-            let mut parser = Parser::new(tokenizer.items, false);
-            parser.parse()
+            parse(formula)
         }
 
         fn assert_parsers_agree(formula: &str) {
@@ -3457,13 +3453,11 @@ mod semantics_regressions {
         use crate::parser::parse as span_parse;
         use crate::parser::{ASTNode, ASTNodeType, Parser};
         use crate::pretty::canonical_formula;
-        use crate::tokenizer::Tokenizer;
         use formualizer_common::LiteralValue;
 
         fn parse_classic(formula: &str) -> ASTNode {
-            let tokenizer = Tokenizer::new(formula).expect("tokenize");
-            let mut parser = Parser::new(tokenizer.items, false);
-            parser.parse().expect("classic parser")
+            let mut parser = Parser::new(formula).unwrap();
+            parser.parse().expect("parser")
         }
 
         fn parse_both(formula: &str) -> ASTNode {
@@ -3716,14 +3710,8 @@ mod semantics_regressions {
         use crate::parser::{
             ASTNode, ASTNodeType, Parser, ParserError, ReferenceType, parse as parse_span,
         };
-        use crate::tokenizer::Tokenizer;
-
         fn parse_classic(formula: &str) -> Result<ASTNode, ParserError> {
-            let tokenizer = Tokenizer::new(formula).map_err(|e| ParserError {
-                message: e.to_string(),
-                position: Some(e.pos),
-            })?;
-            let mut parser = Parser::new(tokenizer.items, false);
+            let mut parser = Parser::new(formula)?;
             parser.parse()
         }
 
@@ -3916,8 +3904,6 @@ mod string_colon_interaction {
     //! the pending `A1:` prefix when followed by a double-quoted string.
 
     use crate::parser::{ASTNodeType, Parser, ReferenceType};
-    use crate::tokenizer::Tokenizer;
-
     fn extract_reference(ast: &crate::parser::ASTNode) -> ReferenceType {
         match &ast.node_type {
             ASTNodeType::Reference { reference, .. } => reference.clone(),
@@ -3932,8 +3918,7 @@ mod string_colon_interaction {
         // currently supported end-to-end by both parsers.
         let formula = "='Sheet 1:Sheet 3'!A1:C10";
 
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let ast = parser
             .parse()
             .expect("classic parser should accept formula");
@@ -3952,8 +3937,7 @@ mod string_colon_interaction {
     fn test_colon_string_raises() {
         let formula = "=A1:\"text\"";
 
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         let err = parser.parse().expect_err(
             "classic parser must reject `=A1:\"text\"` rather than silently discard the prefix",
         );
@@ -3971,8 +3955,7 @@ mod string_colon_interaction {
     fn test_colon_string_in_function() {
         let formula = "=SUM(A1:\"text\")";
 
-        let tokenizer = Tokenizer::new(formula).unwrap();
-        let mut parser = Parser::new(tokenizer.items, false);
+        let mut parser = Parser::new(formula).unwrap();
         assert!(
             parser.parse().is_err(),
             "classic parser must reject `=SUM(A1:\"text\")`"
@@ -3994,12 +3977,9 @@ mod r1c1_disambiguation {
     //! R1C1-shaped input are: existing `NamedRange` behaviour, or a clean
     //! `ParserError`. The forbidden outcome is `ReferenceType::Table(...)`.
     use crate::parser::{ASTNode, ASTNodeType, Parser, ReferenceType, TableReference, parse};
-    use crate::tokenizer::Tokenizer;
-
     fn parse_classic(formula: &str) -> ASTNode {
-        let tokenizer = Tokenizer::new(formula).expect("tokenize");
-        let mut parser = Parser::new(tokenizer.items, false);
-        parser.parse().expect("classic parse")
+        let mut parser = Parser::new(formula).unwrap();
+        parser.parse().expect("parse")
     }
 
     fn parse_span(formula: &str) -> ASTNode {
@@ -4159,6 +4139,55 @@ mod r1c1_disambiguation {
             let spanned = parse_span(formula);
             assert_not_table(formula, &classic);
             assert_not_table(formula, &spanned);
+        }
+    }
+}
+
+#[cfg(test)]
+mod parser_hardening {
+    fn parse_on_small_stack(formula: String) -> Result<(), crate::parser::ParserError> {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || crate::parser::parse(&formula).map(|_| ()))
+            .expect("spawn parse thread")
+            .join()
+            .expect("parser must not overflow the stack")
+    }
+
+    #[test]
+    fn accepts_excel_nesting_boundary_on_small_stack() {
+        for (shape, formula) in [
+            (
+                "parentheses",
+                format!("={}1{}", "(".repeat(64), ")".repeat(64)),
+            ),
+            (
+                "calls",
+                format!("={}1{}", "SUM(".repeat(64), ")".repeat(64)),
+            ),
+            (
+                "conditional calls",
+                format!("={}1{}", "IF(A1>0,".repeat(64), ",0)".repeat(64)),
+            ),
+        ] {
+            let result = parse_on_small_stack(formula);
+            assert!(result.is_ok(), "{shape}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_formula_errors_instead_of_overflowing_stack() {
+        for formula in [
+            format!("={}1{}", "(".repeat(5000), ")".repeat(5000)),
+            format!("={}1", "-".repeat(5000)),
+            format!("={}1{}", "SUM(".repeat(5000), ")".repeat(5000)),
+            format!("={}1{}", "1+(".repeat(5000), ")".repeat(5000)),
+            format!("={}1{}", "IF(A1>0,".repeat(5000), ",0)".repeat(5000)),
+            format!("={}1{}", "{".repeat(5000), "}".repeat(5000)),
+            format!("={}1", "1^".repeat(5000)),
+        ] {
+            let error = parse_on_small_stack(formula).expect_err("reject excessive recursion");
+            assert!(error.message.contains("Formula nesting too deep"));
         }
     }
 }

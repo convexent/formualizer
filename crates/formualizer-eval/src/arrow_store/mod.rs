@@ -1,13 +1,13 @@
 use arrow_array::Array;
 use arrow_array::new_null_array;
 use arrow_schema::DataType;
-use chrono::Timelike;
 use std::sync::Arc;
 
 use arrow_array::builder::{BooleanBuilder, Float64Builder, StringBuilder, UInt8Builder};
 use arrow_array::{ArrayRef, BooleanArray, Float64Array, StringArray, UInt8Array, UInt32Array};
 use once_cell::sync::OnceCell;
 
+use crate::format::FormatId;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
@@ -70,6 +70,59 @@ pub struct ColumnChunkMeta {
     pub non_null_err: usize,
 }
 
+/// Run-end encoded per-cell format ids. Run ends are exclusive logical offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatRuns {
+    run_ends: Vec<u32>,
+    format_ids: Vec<u16>,
+}
+
+impl FormatRuns {
+    pub fn from_ids(ids: &[u16]) -> Option<Self> {
+        if ids.iter().all(|id| *id == FormatId::GENERAL.0) {
+            return None;
+        }
+        let mut run_ends = Vec::new();
+        let mut format_ids = Vec::new();
+        for (idx, id) in ids.iter().copied().enumerate() {
+            if format_ids.last().copied() != Some(id) {
+                format_ids.push(id);
+                if idx > 0 {
+                    run_ends.push(idx as u32);
+                }
+            }
+        }
+        run_ends.push(ids.len() as u32);
+        Some(Self {
+            run_ends,
+            format_ids,
+        })
+    }
+
+    #[inline]
+    pub fn get(&self, offset: usize) -> FormatId {
+        let run = self
+            .run_ends
+            .partition_point(|end| (*end as usize) <= offset);
+        self.format_ids
+            .get(run)
+            .copied()
+            .map(FormatId)
+            .unwrap_or_default()
+    }
+
+    pub fn to_ids(&self, len: usize) -> Vec<u16> {
+        (0..len).map(|offset| self.get(offset).0).collect()
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> Option<Self> {
+        let ids: Vec<_> = (offset..offset.saturating_add(len))
+            .map(|i| self.get(i).0)
+            .collect();
+        Self::from_ids(&ids)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnChunk {
     pub numbers: Option<Arc<Float64Array>>,
@@ -78,6 +131,8 @@ pub struct ColumnChunk {
     pub errors: Option<Arc<UInt8Array>>, // compact error code (UInt8)
     pub type_tag: Arc<UInt8Array>,
     pub formula_id: Option<Arc<UInt32Array>>, // reserved for Phase A+
+    /// Optional two-vec run-end format lane; absent means General throughout.
+    pub format: Option<FormatRuns>,
     pub meta: ColumnChunkMeta,
     // Lazy null providers (per-chunk)
     lazy_null_numbers: OnceCell<Arc<Float64Array>>,
@@ -103,11 +158,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn numbers_or_null(&self) -> Arc<Float64Array> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[0] += 1);
         if let Some(a) = &self.numbers {
             return a.clone();
         }
         self.lazy_null_numbers
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[0] += 1;
+                    w.provider_slots[0] += self.len();
+                });
                 let arr = new_null_array(&DataType::Float64, self.len());
                 Arc::new(arr.as_any().downcast_ref::<Float64Array>().unwrap().clone())
             })
@@ -115,11 +177,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn booleans_or_null(&self) -> Arc<BooleanArray> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[1] += 1);
         if let Some(a) = &self.booleans {
             return a.clone();
         }
         self.lazy_null_booleans
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[1] += 1;
+                    w.provider_slots[1] += self.len();
+                });
                 let arr = new_null_array(&DataType::Boolean, self.len());
                 Arc::new(arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone())
             })
@@ -127,11 +196,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn errors_or_null(&self) -> Arc<UInt8Array> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[2] += 1);
         if let Some(a) = &self.errors {
             return a.clone();
         }
         self.lazy_null_errors
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[2] += 1;
+                    w.provider_slots[2] += self.len();
+                });
                 let arr = new_null_array(&DataType::UInt8, self.len());
                 Arc::new(arr.as_any().downcast_ref::<UInt8Array>().unwrap().clone())
             })
@@ -139,11 +215,20 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn text_or_null(&self) -> ArrayRef {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[3] += 1);
         if let Some(a) = &self.text {
             return a.clone();
         }
         self.lazy_null_text
-            .get_or_init(|| new_null_array(&DataType::Utf8, self.len()))
+            .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[3] += 1;
+                    w.provider_slots[3] += self.len();
+                });
+                new_null_array(&DataType::Utf8, self.len())
+            })
             .clone()
     }
 
@@ -250,6 +335,12 @@ impl ColumnChunk {
             self.text = Some(Arc::new(b.finish()) as ArrayRef);
         }
 
+        if let Some(format) = &self.format {
+            let mut ids = format.to_ids(old_len);
+            ids.resize(new_len, FormatId::GENERAL.0);
+            self.format = FormatRuns::from_ids(&ids);
+        }
+
         // Length-dependent caches must be dropped.
         self.lazy_null_numbers = OnceCell::new();
         self.lazy_null_booleans = OnceCell::new();
@@ -301,6 +392,11 @@ impl ArrowColumn {
 #[derive(Debug, Clone)]
 pub struct ArrowSheet {
     pub name: Arc<str>,
+    /// Serial encoding used by every temporal lane in this sheet.
+    ///
+    /// Changing this value requires re-encoding all temporal cells; engine and
+    /// workbook constructors therefore set it once when the sheet is created.
+    pub date_system: crate::engine::DateSystem,
     pub columns: Vec<ArrowColumn>,
     pub nrows: u32,
     pub chunk_starts: Vec<usize>,
@@ -338,6 +434,7 @@ pub struct IngestBuilder {
     text_builders: Vec<StringBuilder>,
     err_builders: Vec<UInt8Builder>,
     tag_builders: Vec<UInt8Builder>,
+    format_builders: Vec<Vec<u16>>,
 
     // Per-column per-lane non-null counters for current chunk
     lane_counts: Vec<LaneCounts>,
@@ -385,6 +482,7 @@ impl IngestBuilder {
             tag_builders: (0..ncols)
                 .map(|_| UInt8Builder::with_capacity(chunk_rows))
                 .collect(),
+            format_builders: (0..ncols).map(|_| Vec::with_capacity(chunk_rows)).collect(),
             lane_counts: vec![LaneCounts::default(); ncols],
             chunks,
             row_in_chunk: 0,
@@ -397,6 +495,15 @@ impl IngestBuilder {
     pub fn append_row_cells<'a>(&mut self, row: &[CellIngest<'a>]) -> Result<(), ExcelError> {
         assert_eq!(row.len(), self.ncols, "row width mismatch");
         for (c, cell) in row.iter().enumerate() {
+            self.format_builders[c].push(match cell {
+                CellIngest::DateSerial(serial) if serial.fract().abs() > f64::EPSILON => {
+                    FormatId::DATETIME.0
+                }
+                CellIngest::DateSerial(_) => FormatId::DATE.0,
+                CellIngest::FormattedNumber(_, id) => id.0,
+                CellIngest::DurationSerial(_) => FormatId::DURATION.0,
+                _ => FormatId::GENERAL.0,
+            });
             match cell {
                 CellIngest::Empty => {
                     self.tag_builders[c].append_value(TypeTag::Empty as u8);
@@ -437,8 +544,16 @@ impl IngestBuilder {
                     self.err_builders[c].append_value(*code);
                     self.lane_counts[c].n_err += 1;
                 }
-                CellIngest::DateSerial(serial) => {
-                    self.tag_builders[c].append_value(TypeTag::DateTime as u8);
+                CellIngest::DateSerial(serial) | CellIngest::FormattedNumber(serial, _) => {
+                    self.tag_builders[c].append_value(TypeTag::Number as u8);
+                    self.num_builders[c].append_value(*serial);
+                    self.lane_counts[c].n_num += 1;
+                    self.bool_builders[c].append_null();
+                    self.text_builders[c].append_null();
+                    self.err_builders[c].append_null();
+                }
+                CellIngest::DurationSerial(serial) => {
+                    self.tag_builders[c].append_value(TypeTag::Number as u8);
                     self.num_builders[c].append_value(*serial);
                     self.lane_counts[c].n_num += 1;
                     self.bool_builders[c].append_null();
@@ -470,6 +585,15 @@ impl IngestBuilder {
     {
         assert_eq!(iter.len(), self.ncols, "row width mismatch");
         for (c, cell) in iter.enumerate() {
+            self.format_builders[c].push(match cell {
+                CellIngest::DateSerial(serial) if serial.fract().abs() > f64::EPSILON => {
+                    FormatId::DATETIME.0
+                }
+                CellIngest::DateSerial(_) => FormatId::DATE.0,
+                CellIngest::FormattedNumber(_, id) => id.0,
+                CellIngest::DurationSerial(_) => FormatId::DURATION.0,
+                _ => FormatId::GENERAL.0,
+            });
             match cell {
                 CellIngest::Empty => {
                     self.tag_builders[c].append_value(TypeTag::Empty as u8);
@@ -510,8 +634,16 @@ impl IngestBuilder {
                     self.err_builders[c].append_value(code);
                     self.lane_counts[c].n_err += 1;
                 }
-                CellIngest::DateSerial(serial) => {
-                    self.tag_builders[c].append_value(TypeTag::DateTime as u8);
+                CellIngest::DateSerial(serial) | CellIngest::FormattedNumber(serial, _) => {
+                    self.tag_builders[c].append_value(TypeTag::Number as u8);
+                    self.num_builders[c].append_value(serial);
+                    self.lane_counts[c].n_num += 1;
+                    self.bool_builders[c].append_null();
+                    self.text_builders[c].append_null();
+                    self.err_builders[c].append_null();
+                }
+                CellIngest::DurationSerial(serial) => {
+                    self.tag_builders[c].append_value(TypeTag::Number as u8);
                     self.num_builders[c].append_value(serial);
                     self.lane_counts[c].n_num += 1;
                     self.bool_builders[c].append_null();
@@ -540,7 +672,20 @@ impl IngestBuilder {
         assert_eq!(row.len(), self.ncols, "row width mismatch");
 
         for (c, v) in row.iter().enumerate() {
-            let tag = TypeTag::from_value(v) as u8;
+            self.format_builders[c].push(match v {
+                LiteralValue::Date(_) => FormatId::DATE.0,
+                LiteralValue::DateTime(_) => FormatId::DATETIME.0,
+                LiteralValue::Time(_) => FormatId::TIME.0,
+                LiteralValue::Duration(_) => FormatId::DURATION.0,
+                _ => FormatId::GENERAL.0,
+            });
+            let tag = match v {
+                LiteralValue::Date(_)
+                | LiteralValue::DateTime(_)
+                | LiteralValue::Time(_)
+                | LiteralValue::Duration(_) => TypeTag::Number,
+                _ => TypeTag::from_value(v),
+            } as u8;
             self.tag_builders[c].append_value(tag);
 
             match v {
@@ -588,8 +733,7 @@ impl IngestBuilder {
                 // Phase A: coerce temporal to serials in numeric lane with DateTime tag
                 LiteralValue::Date(d) => {
                     let dt = d.and_hms_opt(0, 0, 0).unwrap();
-                    let serial =
-                        crate::builtins::datetime::datetime_to_serial_for(self.date_system, &dt);
+                    let serial = formualizer_common::datetime_to_serial_for(self.date_system, &dt);
                     self.num_builders[c].append_value(serial);
                     self.lane_counts[c].n_num += 1;
                     self.bool_builders[c].append_null();
@@ -597,8 +741,7 @@ impl IngestBuilder {
                     self.err_builders[c].append_null();
                 }
                 LiteralValue::DateTime(dt) => {
-                    let serial =
-                        crate::builtins::datetime::datetime_to_serial_for(self.date_system, dt);
+                    let serial = formualizer_common::datetime_to_serial_for(self.date_system, dt);
                     self.num_builders[c].append_value(serial);
                     self.lane_counts[c].n_num += 1;
                     self.bool_builders[c].append_null();
@@ -606,7 +749,7 @@ impl IngestBuilder {
                     self.err_builders[c].append_null();
                 }
                 LiteralValue::Time(t) => {
-                    let serial = t.num_seconds_from_midnight() as f64 / 86_400.0;
+                    let serial = formualizer_common::time_to_fraction(t);
                     self.num_builders[c].append_value(serial);
                     self.lane_counts[c].n_num += 1;
                     self.bool_builders[c].append_null();
@@ -684,6 +827,7 @@ impl IngestBuilder {
                 errors: errors_arc,
                 type_tag: Arc::new(tags),
                 formula_id: None,
+                format: FormatRuns::from_ids(&self.format_builders[c]),
                 meta: ColumnChunkMeta {
                     len,
                     non_null_num: self.lane_counts[c].n_num,
@@ -708,6 +852,7 @@ impl IngestBuilder {
                 StringBuilder::with_capacity(self.chunk_rows, self.chunk_rows * 12);
             self.err_builders[c] = UInt8Builder::with_capacity(self.chunk_rows);
             self.tag_builders[c] = UInt8Builder::with_capacity(self.chunk_rows);
+            self.format_builders[c] = Vec::with_capacity(self.chunk_rows);
             self.lane_counts[c] = LaneCounts::default();
         }
         self.row_in_chunk = 0;
@@ -758,6 +903,7 @@ impl IngestBuilder {
         }
         ArrowSheet {
             name: self.name,
+            date_system: self.date_system,
             columns,
             nrows: self.total_rows,
             chunk_starts,
@@ -781,6 +927,7 @@ pub fn map_error_code(kind: ExcelErrorKind) -> u8 {
         ExcelErrorKind::Calc => 11,
         ExcelErrorKind::Circ => 12,
         ExcelErrorKind::Cancelled => 13,
+        _ => 8,
     }
 }
 
@@ -813,6 +960,8 @@ pub enum CellIngest<'a> {
     Text(&'a str),
     ErrorCode(u8),
     DateSerial(f64),
+    DurationSerial(f64),
+    FormattedNumber(f64, FormatId),
     Pending,
 }
 
@@ -831,6 +980,33 @@ pub enum OverlayValue {
 }
 
 impl OverlayValue {
+    pub fn from_literal_value(
+        value: &LiteralValue,
+        date_system: crate::engine::DateSystem,
+    ) -> Self {
+        match value {
+            LiteralValue::Empty => OverlayValue::Empty,
+            LiteralValue::Int(i) => OverlayValue::Number(*i as f64),
+            LiteralValue::Number(n) => OverlayValue::Number(*n),
+            LiteralValue::Boolean(b) => OverlayValue::Boolean(*b),
+            LiteralValue::Text(s) => OverlayValue::Text(Arc::from(s.clone())),
+            LiteralValue::Error(e) => OverlayValue::Error(map_error_code(e.kind)),
+            LiteralValue::Date(d) => {
+                let dt = d.and_hms_opt(0, 0, 0).unwrap();
+                OverlayValue::DateTime(formualizer_common::datetime_to_serial_for(date_system, &dt))
+            }
+            LiteralValue::DateTime(dt) => {
+                OverlayValue::DateTime(formualizer_common::datetime_to_serial_for(date_system, dt))
+            }
+            LiteralValue::Time(t) => {
+                OverlayValue::DateTime(formualizer_common::time_to_fraction(t))
+            }
+            LiteralValue::Duration(d) => OverlayValue::Duration(d.num_seconds() as f64 / 86_400.0),
+            LiteralValue::Pending => OverlayValue::Pending,
+            LiteralValue::Array(_) => OverlayValue::Error(map_error_code(ExcelErrorKind::Value)),
+        }
+    }
+
     #[inline]
     pub(crate) fn estimated_payload_bytes(&self) -> usize {
         match self {
@@ -904,15 +1080,13 @@ impl OverlayValue {
         }
     }
 
-    pub(crate) fn to_literal(&self) -> LiteralValue {
+    pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
         match self {
             OverlayValue::Empty => LiteralValue::Empty,
             OverlayValue::Number(n) => LiteralValue::Number(*n),
-            OverlayValue::DateTime(serial) => LiteralValue::from_serial_number(*serial),
-            OverlayValue::Duration(serial) => {
-                let nanos_f = *serial * 86_400.0 * 1_000_000_000.0;
-                let nanos = nanos_f.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-                LiteralValue::Duration(chrono::Duration::nanoseconds(nanos))
+            OverlayValue::DateTime(serial) | OverlayValue::Duration(serial) => {
+                let _ = date_system;
+                LiteralValue::Number(*serial)
             }
             OverlayValue::Boolean(b) => LiteralValue::Boolean(*b),
             OverlayValue::Text(s) => LiteralValue::Text((**s).to_string()),
@@ -921,6 +1095,11 @@ impl OverlayValue {
             }
             OverlayValue::Pending => LiteralValue::Pending,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_literal(&self) -> LiteralValue {
+        self.to_literal_for(crate::engine::DateSystem::Excel1900)
     }
 }
 
@@ -973,8 +1152,13 @@ impl<'a> OverlayScalar<'a> {
         self.as_value().lowered_text_value()
     }
 
+    pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
+        self.as_value().to_literal_for(date_system)
+    }
+
+    #[cfg(test)]
     pub(crate) fn to_literal(&self) -> LiteralValue {
-        self.as_value().to_literal()
+        self.to_literal_for(crate::engine::DateSystem::Excel1900)
     }
 }
 
@@ -1809,6 +1993,7 @@ impl OverlayFragment {
 #[derive(Debug, Default, Clone)]
 pub struct Overlay {
     points: HashMap<usize, OverlayValue>,
+    format_points: HashMap<usize, FormatId>,
     fragments: Vec<OverlayFragment>,
     // Deterministic (and intentionally approximate) accounting of overlay memory.
     // This is used for budget enforcement/observability; it does not attempt to reflect
@@ -1824,6 +2009,7 @@ impl Overlay {
     pub fn new() -> Self {
         Self {
             points: HashMap::new(),
+            format_points: HashMap::new(),
             fragments: Vec::new(),
             estimated_bytes: 0,
         }
@@ -1854,6 +2040,48 @@ impl Overlay {
     #[inline]
     pub fn get(&self, off: usize) -> Option<OverlayValue> {
         self.get_scalar(off).map(|value| value.to_overlay_value())
+    }
+
+    #[inline]
+    pub fn get_format(&self, off: usize) -> Option<FormatId> {
+        self.format_points.get(&off).copied()
+    }
+
+    #[inline]
+    pub(crate) fn has_formats(&self) -> bool {
+        !self.format_points.is_empty()
+    }
+
+    #[inline]
+    pub fn set_format(&mut self, off: usize, format: Option<FormatId>) {
+        match format.filter(|id| *id != FormatId::GENERAL) {
+            Some(id) => {
+                self.format_points.insert(off, id);
+            }
+            None => {
+                self.format_points.remove(&off);
+            }
+        }
+    }
+
+    /// Clear computed formats in `[start, end)`. Empty lanes return in O(1);
+    /// populated lanes pay for existing formatted entries, not range length.
+    pub(crate) fn clear_format_range(&mut self, start: usize, end: usize) {
+        if self.format_points.is_empty() || start >= end {
+            return;
+        }
+        self.format_points
+            .retain(|off, _| *off < start || *off >= end);
+    }
+
+    /// Clear exact computed-format offsets for a sparse computed write.
+    pub(crate) fn clear_format_offsets(&mut self, offsets: &[usize]) {
+        if self.format_points.is_empty() {
+            return;
+        }
+        for off in offsets {
+            self.format_points.remove(off);
+        }
     }
 
     #[inline]
@@ -1975,6 +2203,47 @@ impl Overlay {
         self.remove_scalar(off)
     }
 
+    pub(crate) fn remove_range(&mut self, range: core::ops::Range<usize>) -> isize {
+        if range.is_empty() {
+            return 0;
+        }
+
+        let mut delta = 0isize;
+        let removed_points: Vec<_> = self
+            .points
+            .keys()
+            .copied()
+            .filter(|off| range.contains(off))
+            .collect();
+        for off in removed_points {
+            if let Some(old) = self.points.remove(&off) {
+                let old_est = Self::point_estimate(&old);
+                self.estimated_bytes = self.estimated_bytes.saturating_sub(old_est);
+                delta = delta.saturating_sub(old_est as isize);
+            }
+        }
+
+        if !self.fragments.is_empty() {
+            let mut fragment_delta = 0isize;
+            let mut fragments = Vec::with_capacity(self.fragments.len());
+            for fragment in self.fragments.drain(..) {
+                let old_est = fragment.estimated_bytes();
+                let replacements = fragment.subtract_interval(range.clone());
+                let new_est = replacements
+                    .iter()
+                    .map(OverlayFragment::estimated_bytes)
+                    .fold(0usize, usize::saturating_add);
+                fragments.extend(replacements);
+                fragment_delta = fragment_delta.saturating_add(new_est as isize - old_est as isize);
+            }
+            self.fragments = fragments;
+            self.adjust_estimated_bytes(fragment_delta);
+            delta = delta.saturating_add(fragment_delta);
+        }
+
+        delta
+    }
+
     #[inline]
     pub(crate) fn clear_all(&mut self) -> usize {
         let freed = self.estimated_bytes;
@@ -2034,6 +2303,11 @@ impl Overlay {
         for (k, v) in self.points.iter() {
             if *k >= off && *k < end {
                 let _ = out.set_scalar(*k - off, v.clone());
+            }
+        }
+        for (k, format) in &self.format_points {
+            if *k >= off && *k < end {
+                out.set_format(*k - off, Some(*format));
             }
         }
         out
@@ -2213,6 +2487,13 @@ impl<'a> OverlayCascade<'a> {
         self.user
             .get_scalar(off)
             .or_else(|| self.computed.get_scalar(off))
+    }
+
+    #[inline]
+    pub(crate) fn get_format(&self, off: usize) -> Option<FormatId> {
+        self.user
+            .get_format(off)
+            .or_else(|| self.computed.get_format(off))
     }
 
     #[inline]
@@ -3271,6 +3552,116 @@ fn append_overlay_value_to_lane_builders(
 }
 
 impl ArrowSheet {
+    /// Create a logical sheet whose cells are initially implicit empty values.
+    ///
+    /// Columns start with no materialized chunks; callers can populate only touched
+    /// column/chunk pairs via `set_sparse_overlay_value`. Missing chunks remain
+    /// observable as empty cells through scalar and range reads.
+    pub fn new_sparse(sheet_name: &str, ncols: usize, nrows: usize, chunk_rows: usize) -> Self {
+        Self::new_sparse_with_date_system(
+            sheet_name,
+            ncols,
+            nrows,
+            chunk_rows,
+            crate::engine::DateSystem::Excel1900,
+        )
+    }
+
+    /// Create a sparse sheet using an explicitly selected workbook date system.
+    pub fn new_sparse_with_date_system(
+        sheet_name: &str,
+        ncols: usize,
+        nrows: usize,
+        chunk_rows: usize,
+        date_system: crate::engine::DateSystem,
+    ) -> Self {
+        let chunk_rows = chunk_rows.max(1);
+        let columns = (0..ncols)
+            .map(|idx| ArrowColumn {
+                chunks: Vec::new(),
+                sparse_chunks: FxHashMap::default(),
+                index: idx as u32,
+            })
+            .collect();
+        let mut sheet = Self {
+            name: Arc::from(sheet_name.to_string()),
+            date_system,
+            columns,
+            nrows: 0,
+            chunk_starts: Vec::new(),
+            chunk_rows,
+        };
+        sheet.ensure_row_capacity(nrows);
+        sheet
+    }
+
+    /// Populate a single sparse cell using the overlay cascade while preserving
+    /// implicit-empty chunks elsewhere. This is intended for sparse initial ingest,
+    /// not for user edits; no graph/changelog side effects are triggered here.
+    pub fn set_sparse_overlay_value(
+        &mut self,
+        abs_row: usize,
+        abs_col: usize,
+        value: OverlayValue,
+    ) -> isize {
+        if abs_col >= self.columns.len() {
+            let start = self.columns.len();
+            self.columns
+                .extend((start..=abs_col).map(|idx| ArrowColumn {
+                    chunks: Vec::new(),
+                    sparse_chunks: FxHashMap::default(),
+                    index: idx as u32,
+                }));
+        }
+        if abs_row >= self.nrows as usize {
+            self.ensure_row_capacity(abs_row + 1);
+        }
+        let Some((ch_idx, in_off)) = self.chunk_of_row(abs_row) else {
+            return 0;
+        };
+        let Some(ch) = self.ensure_column_chunk_mut(abs_col, ch_idx) else {
+            return 0;
+        };
+        ch.overlay.set(in_off, value)
+    }
+
+    pub fn set_sparse_overlay_format(
+        &mut self,
+        abs_row: usize,
+        abs_col: usize,
+        format: Option<FormatId>,
+    ) {
+        if abs_row >= self.nrows as usize || abs_col >= self.columns.len() {
+            return;
+        }
+        let Some((ch_idx, in_off)) = self.chunk_of_row(abs_row) else {
+            return;
+        };
+        if let Some(ch) = self.ensure_column_chunk_mut(abs_col, ch_idx) {
+            ch.overlay.set_format(in_off, format);
+        }
+    }
+
+    /// Clear every explicit and computed format source at a grid position.
+    pub(crate) fn clear_format(&mut self, abs_row: usize, abs_col: usize) {
+        if abs_row >= self.nrows as usize || abs_col >= self.columns.len() {
+            return;
+        }
+        let Some((ch_idx, in_off)) = self.chunk_of_row(abs_row) else {
+            return;
+        };
+        let Some(ch) = self.ensure_column_chunk_mut(abs_col, ch_idx) else {
+            return;
+        };
+        ch.overlay.set_format(in_off, None);
+        ch.computed_overlay.set_format(in_off, None);
+        if let Some(runs) = &ch.format {
+            let mut ids = runs.to_ids(ch.len());
+            ids[in_off] = FormatId::GENERAL.0;
+            ch.format = FormatRuns::from_ids(&ids);
+        }
+    }
+
     /// Return a summary of each column's chunk counts, total rows, and lane presence.
     pub fn shape(&self) -> Vec<ColumnShape> {
         self.columns
@@ -3316,6 +3707,36 @@ impl ArrowSheet {
         )
     }
 
+    pub(crate) fn has_formats(&self) -> bool {
+        self.columns.iter().any(|column| {
+            column
+                .chunks
+                .iter()
+                .chain(column.sparse_chunks.values())
+                .any(|chunk| {
+                    chunk.format.is_some()
+                        || chunk.overlay.has_formats()
+                        || chunk.computed_overlay.has_formats()
+                })
+        })
+    }
+
+    /// Return the effective explicit/derived format for a cell.
+    pub fn format_id(&self, abs_row: usize, abs_col: usize) -> Option<FormatId> {
+        let (ch_idx, in_off) = self.chunk_of_row(abs_row)?;
+        let ch = self.columns.get(abs_col)?.chunk(ch_idx)?;
+        ch.overlay
+            .get_format(in_off)
+            .or_else(|| {
+                ch.format
+                    .as_ref()
+                    .map(|runs| runs.get(in_off))
+                    .filter(|id| *id != FormatId::GENERAL)
+            })
+            .or_else(|| ch.computed_overlay.get_format(in_off))
+            .filter(|id| *id != FormatId::GENERAL)
+    }
+
     /// Fast single-cell read (0-based row/col) with overlay precedence.
     ///
     /// This avoids constructing a 1x1 RangeView and is intended for tight read loops.
@@ -3339,7 +3760,7 @@ impl ArrowSheet {
         // Overlay takes precedence: user edits over computed over base.
         let cascade = OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
         if let Some(ov) = cascade.get_scalar(in_off) {
-            return ov.to_literal();
+            return ov.to_literal_for(self.date_system);
         }
 
         // Read tag and route to lane.
@@ -3356,25 +3777,13 @@ impl ArrowSheet {
                     LiteralValue::Empty
                 }
             }
-            TypeTag::DateTime => {
+            TypeTag::DateTime | TypeTag::Duration => {
                 if let Some(arr) = &ch.numbers {
                     if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
+                        LiteralValue::Empty
+                    } else {
+                        LiteralValue::Number(arr.value(in_off))
                     }
-                    LiteralValue::from_serial_number(arr.value(in_off))
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            TypeTag::Duration => {
-                if let Some(arr) = &ch.numbers {
-                    if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
-                    }
-                    let serial = arr.value(in_off);
-                    let nanos_f = serial * 86_400.0 * 1_000_000_000.0;
-                    let nanos = nanos_f.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-                    LiteralValue::Duration(chrono::Duration::nanoseconds(nanos))
                 } else {
                     LiteralValue::Empty
                 }
@@ -3542,6 +3951,7 @@ impl ArrowSheet {
             errors: None,
             type_tag: Arc::new(UInt8Array::from(vec![TypeTag::Empty as u8; len])),
             formula_id: None,
+            format: None,
             meta: ColumnChunkMeta {
                 len,
                 non_null_num: 0,
@@ -3612,6 +4022,7 @@ impl ArrowSheet {
             errors: errors.clone(),
             type_tag,
             formula_id: None,
+            format: ch.format.as_ref().and_then(|runs| runs.slice(off, len)),
             meta: ColumnChunkMeta {
                 len,
                 non_null_num,
@@ -4504,9 +4915,150 @@ pub struct ColumnShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_format_precedence_and_general_filter_are_stable() {
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let mut ingest = IngestBuilder::new("Sheet1", 1, 16, crate::engine::DateSystem::Excel1900);
+        ingest.append_row(&[LiteralValue::Date(date)]).unwrap();
+        ingest.append_row(&[LiteralValue::Number(1.0)]).unwrap();
+        let mut sheet = ingest.finish();
+
+        let chunk = sheet.columns[0].chunk_mut(0).unwrap();
+        chunk.computed_overlay.set_format(0, Some(FormatId::TIME));
+        assert_eq!(
+            sheet.format_id(0, 0),
+            Some(FormatId::DATE),
+            "base explicit format must beat the derived overlay"
+        );
+
+        sheet.columns[0]
+            .chunk_mut(0)
+            .unwrap()
+            .overlay
+            .set_format(0, Some(FormatId::DATETIME));
+        assert_eq!(
+            sheet.format_id(0, 0),
+            Some(FormatId::DATETIME),
+            "user explicit overlay must beat base and derived formats"
+        );
+        assert_eq!(
+            sheet.format_id(1, 0),
+            None,
+            "General is absence, not an effective explicit format"
+        );
+        sheet.ensure_row_capacity(3);
+        assert_eq!(
+            sheet.format_id(2, 0),
+            None,
+            "growing a formatted chunk must fill new rows with General"
+        );
+    }
+
+    #[test]
+    fn known_error_storage_codes_are_stable() {
+        let cases = [
+            (ExcelErrorKind::Null, 1),
+            (ExcelErrorKind::Ref, 2),
+            (ExcelErrorKind::Name, 3),
+            (ExcelErrorKind::Value, 4),
+            (ExcelErrorKind::Div, 5),
+            (ExcelErrorKind::Na, 6),
+            (ExcelErrorKind::Num, 7),
+            (ExcelErrorKind::Error, 8),
+            (ExcelErrorKind::NImpl, 9),
+            (ExcelErrorKind::Spill, 10),
+            (ExcelErrorKind::Calc, 11),
+            (ExcelErrorKind::Circ, 12),
+            (ExcelErrorKind::Cancelled, 13),
+        ];
+        for (kind, code) in cases {
+            assert_eq!(map_error_code(kind), code, "{kind:?}");
+            assert_eq!(unmap_error_code(code), kind, "code {code}");
+        }
+        assert_eq!(unmap_error_code(u8::MAX), ExcelErrorKind::Error);
+    }
     use arrow_array::Array;
     use arrow_schema::DataType;
-    use chrono::Datelike;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn sparse_constructor_defaults_to_excel_1900_and_decodes_excel_1904() {
+        let date = chrono::NaiveDate::from_ymd_opt(1904, 1, 1).unwrap();
+        let _datetime = date.and_hms_opt(12, 0, 0).unwrap();
+
+        let mut default_sheet = ArrowSheet::new_sparse("Default", 1, 1, 16);
+        assert_eq!(
+            default_sheet.date_system,
+            crate::engine::DateSystem::Excel1900
+        );
+        default_sheet.set_sparse_overlay_value(0, 0, OverlayValue::DateTime(1462.5));
+        assert_eq!(
+            default_sheet.get_cell_value(0, 0),
+            LiteralValue::Number(1462.5)
+        );
+
+        let mut excel_1904 = ArrowSheet::new_sparse_with_date_system(
+            "1904",
+            1,
+            1,
+            16,
+            crate::engine::DateSystem::Excel1904,
+        );
+        assert_eq!(excel_1904.date_system, crate::engine::DateSystem::Excel1904);
+        excel_1904.set_sparse_overlay_value(0, 0, OverlayValue::DateTime(0.5));
+        assert_eq!(excel_1904.get_cell_value(0, 0), LiteralValue::Number(0.5));
+    }
+
+    #[test]
+    fn datetime_lanes_round_trip_the_sheet_date_system() {
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let datetime = date.and_hms_opt(12, 30, 0).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(12, 30, 0).unwrap();
+
+        for system in [
+            crate::engine::DateSystem::Excel1900,
+            crate::engine::DateSystem::Excel1904,
+        ] {
+            let values = vec![
+                LiteralValue::Date(date),
+                LiteralValue::DateTime(datetime),
+                LiteralValue::Time(time),
+            ];
+            let mut ingest = IngestBuilder::new("Sheet1", 3, 16, system);
+            ingest.append_row(&values).unwrap();
+            let sheet = ingest.finish();
+
+            assert_eq!(sheet.date_system, system);
+            let date_serial = formualizer_common::date_to_serial_for(system, &date);
+            let datetime_serial = formualizer_common::datetime_to_serial_for(system, &datetime);
+            assert_eq!(
+                sheet.get_cell_value(0, 0),
+                LiteralValue::Number(date_serial)
+            );
+            assert_eq!(
+                sheet.get_cell_value(0, 1),
+                LiteralValue::Number(datetime_serial)
+            );
+            assert_eq!(sheet.format_id(0, 0), Some(FormatId::DATE));
+            assert_eq!(sheet.format_id(0, 1), Some(FormatId::DATETIME));
+            assert_eq!(sheet.format_id(0, 2), Some(FormatId::TIME));
+            let view = sheet.range_view(0, 0, 0, 1);
+            assert_eq!(view.get_cell(0, 0), LiteralValue::Number(date_serial));
+            assert_eq!(view.get_cell(0, 1), LiteralValue::Number(datetime_serial));
+
+            let mut sparse = ArrowSheet::new_sparse_with_date_system("Sparse", 1, 1, 16, system);
+            sparse.set_sparse_overlay_value(
+                0,
+                0,
+                OverlayValue::from_literal_value(&values[1], system),
+            );
+            assert_eq!(
+                sparse.get_cell_value(0, 0),
+                LiteralValue::Number(datetime_serial)
+            );
+        }
+    }
 
     fn add_overlay_stats(into: &mut OverlayDebugStats, next: OverlayDebugStats) {
         into.points += next.points;
@@ -5075,6 +5627,51 @@ mod tests {
         assert!(remove_delta < 0);
         assert!(overlay.is_empty());
         assert!(overlay.get_scalar(1).is_none());
+    }
+
+    #[test]
+    fn overlay_remove_range_splits_fragments_and_points() {
+        let mut overlay = Overlay::new();
+        overlay.set_scalar(2, OverlayValue::Number(20.0));
+        overlay.apply_fragment(
+            OverlayFragment::dense_range(
+                0,
+                (0..6)
+                    .map(|i| OverlayValue::Number(i as f64))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        overlay.set_scalar(3, OverlayValue::Number(30.0));
+        overlay.set_scalar(8, OverlayValue::Number(80.0));
+
+        let delta = overlay.remove_range(2..5);
+
+        assert!(delta < 0);
+        assert_eq!(
+            overlay.get_scalar(0).unwrap().to_literal(),
+            LiteralValue::Number(0.0)
+        );
+        assert_eq!(
+            overlay.get_scalar(1).unwrap().to_literal(),
+            LiteralValue::Number(1.0)
+        );
+        assert!(overlay.get_scalar(2).is_none());
+        assert!(overlay.get_scalar(3).is_none());
+        assert!(overlay.get_scalar(4).is_none());
+        assert_eq!(
+            overlay.get_scalar(5).unwrap().to_literal(),
+            LiteralValue::Number(5.0)
+        );
+        assert_eq!(
+            overlay.get_scalar(8).unwrap().to_literal(),
+            LiteralValue::Number(80.0)
+        );
+        assert!(overlay.debug_is_normalized());
+        assert_eq!(
+            overlay.estimated_bytes(),
+            overlay.debug_recomputed_estimated_bytes()
+        );
     }
 
     #[test]

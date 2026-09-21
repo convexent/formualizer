@@ -11,13 +11,13 @@ fn normalize_table_key(name: &str) -> String {
 
 /// Native workbook table (Excel ListObject) metadata.
 #[derive(Debug, Clone)]
-pub struct TableEntry {
-    pub name: String,
-    pub range: RangeRef,
-    pub header_row: bool,
-    pub headers: Vec<String>,
-    pub totals_row: bool,
-    pub vertex: VertexId,
+pub(crate) struct TableEntry {
+    pub(crate) name: String,
+    pub(crate) range: RangeRef,
+    pub(crate) header_row: bool,
+    pub(crate) headers: Vec<String>,
+    pub(crate) totals_row: bool,
+    pub(crate) vertex: VertexId,
 }
 
 impl TableEntry {
@@ -48,7 +48,7 @@ impl DependencyGraph {
         self.tables_lookup.get(&key).cloned()
     }
 
-    pub fn resolve_table_entry(&self, name: &str) -> Option<&TableEntry> {
+    pub(crate) fn resolve_table_entry(&self, name: &str) -> Option<&TableEntry> {
         if self.config.case_sensitive_tables {
             self.tables.get(name)
         } else {
@@ -59,10 +59,17 @@ impl DependencyGraph {
         }
     }
 
-    pub fn table_by_vertex(&self, vertex: VertexId) -> Option<&TableEntry> {
+    pub(crate) fn table_by_vertex(&self, vertex: VertexId) -> Option<&TableEntry> {
         self.table_vertex_lookup
             .get(&vertex)
             .and_then(|name| self.tables.get(name))
+    }
+
+    /// Canonical names of every defined table, sorted for deterministic output.
+    pub fn table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.values().map(|t| t.name.clone()).collect();
+        names.sort();
+        names
     }
 
     pub fn define_table(
@@ -85,14 +92,12 @@ impl DependencyGraph {
             )));
         }
 
-        let anchor = range.start;
-        let sheet_id = anchor.sheet_id;
-        let packed_coord = formualizer_common::Coord::new(anchor.coord.row(), anchor.coord.col());
-        let vertex = self.store.allocate(packed_coord, sheet_id, 0x01);
-        self.edges.add_vertex(packed_coord, vertex.0);
-        self.sheet_index_mut(sheet_id)
-            .add_vertex(packed_coord, vertex);
-        self.store.set_kind(vertex, VertexKind::Table);
+        // A table has a range, but the *vertex* that represents the table symbol has no
+        // position: it is identified by name. Parking it on the range's anchor cell put it
+        // in the sheet index, where grid queries and structural edits could reach it (#304).
+        // Dependencies on the table's cells are carried by the stripe registration below.
+        let sheet_id = range.start.sheet_id;
+        let vertex = self.allocate_symbol_vertex(VertexKind::Table, sheet_id);
 
         // Register stripes for the full table region so cell edits inside the table
         // propagate to formulas that depend on the table.
@@ -112,6 +117,7 @@ impl DependencyGraph {
         self.tables_lookup
             .insert(self.table_lookup_key(&original), original.clone());
         self.table_vertex_lookup.insert(vertex, original);
+        self.bump_symbol_revision();
         Ok(())
     }
 
@@ -145,6 +151,7 @@ impl DependencyGraph {
 
         // Propagate to dependents.
         self.mark_dirty(vertex);
+        self.bump_symbol_revision();
         Ok(())
     }
 
@@ -171,8 +178,9 @@ impl DependencyGraph {
         self.store.mark_deleted(vertex, true);
         self.vertex_values.remove(&vertex);
         self.vertex_formulas.remove(&vertex);
-        self.dirty_vertices.remove(&vertex);
+        self.clear_formula_vertex_dirty(vertex);
         self.volatile_vertices.remove(&vertex);
+        self.bump_symbol_revision();
 
         Ok(())
     }

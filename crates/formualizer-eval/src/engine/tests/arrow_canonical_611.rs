@@ -1,9 +1,9 @@
 //! Ticket 611: Structural invalidation in canonical (Arrow-truth) mode.
 //!
 //! These tests ensure structural operations that induce #REF! correctly:
-//! - record the invalidation in the dependency graph (via `is_ref_error`)
-//! - propagate dirtying so downstream dependents recompute
-//! - mirror results into Arrow truth so `Engine::get_cell_value` reflects #REF!
+//! - preserve invalid references as ordinary AST error literals where an expression survives;
+//! - propagate dirtying so downstream dependents recompute;
+//! - mirror results into Arrow truth so `Engine::get_cell_value` reflects #REF!.
 
 use crate::engine::eval::Engine;
 use crate::test_workbook::TestWorkbook;
@@ -264,12 +264,15 @@ fn canonical_insert_rows_shifts_values_and_formulas_and_rewrites_references() {
 }
 
 #[test]
-fn canonical_insert_rows_does_not_move_fully_absolute_reference_address() {
+fn canonical_insert_rows_moves_fully_absolute_reference_with_its_target() {
     let cfg = arrow_eval_config();
     let mut engine = Engine::new(TestWorkbook::default(), cfg);
 
-    // A2 = $A$1. After inserting a row before row 1, the formula cell shifts to A3,
-    // but $A$1 should remain $A$1 (so it now points at an empty cell).
+    // A2 = $A$1. After inserting a row before row 1, the referenced value
+    // physically moves to A2 and the formula cell shifts to A3. Policy
+    // pinned on issue #168: absolute references TRACK structural
+    // inserts/deletes (the `$` pins copy/fill relocation only), so the
+    // formula must now reference $A$2 and keep computing 99.
     engine
         .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(99.0))
         .unwrap();
@@ -292,15 +295,18 @@ fn canonical_insert_rows_does_not_move_fully_absolute_reference_address() {
         Some(LiteralValue::Number(99.0))
     );
 
-    // Formula moved to A3 and still references $A$1, which is now empty.
+    // Formula moved to A3 and its absolute reference tracked the target.
     let (ast_opt, _) = engine.get_cell("Sheet1", 3, 1).expect("A3 exists");
     let ast = ast_opt.expect("A3 has formula");
     let f = canonical_formula(&ast);
     assert!(
-        f.contains("$A$1"),
-        "expected absolute ref to remain, got: {f}"
+        f.contains("$A$2"),
+        "expected absolute ref to track its moved target, got: {f}"
     );
-    assert_eq!(engine.get_cell_value("Sheet1", 3, 1), None);
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 1),
+        Some(LiteralValue::Number(99.0))
+    );
 }
 
 #[test]
@@ -433,4 +439,112 @@ fn canonical_delete_rows_creates_ref_and_propagates_downstream() {
         Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Ref),
         other => panic!("expected Sheet1!B2 to be #REF! (propagated), got {other:?}"),
     }
+}
+
+#[test]
+fn structural_ref_literal_preserves_lazy_error_semantics_and_round_trips() {
+    let cfg = arrow_eval_config();
+    let mut engine = Engine::new(TestWorkbook::default(), cfg);
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 3, parse("=IF(FALSE,A1,5)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 4, 3, parse("=IFERROR(A1,7)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 4, parse("=C3+1").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    engine.delete_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Number(5.0)),
+        "an invalid reference in an unselected IF branch must not poison the formula"
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 3),
+        Some(LiteralValue::Number(7.0)),
+        "IFERROR must catch the structurally synthesized #REF! literal"
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 4),
+        Some(LiteralValue::Number(6.0)),
+        "downstream formulas must recompute from the lazy result"
+    );
+
+    for (row, expected) in [(2, "=IF(false, #REF!, 5)"), (3, "=IFERROR(#REF!, 7)")] {
+        let (ast, _) = engine
+            .get_cell("Sheet1", row, 3)
+            .expect("formula cell exists");
+        let ast = ast.expect("formula AST exists");
+        let rendered = canonical_formula(&ast);
+        assert_eq!(rendered, expected);
+        assert_eq!(
+            canonical_formula(&parse(&rendered).expect("rendered #REF! formula must reparse")),
+            rendered
+        );
+    }
+}
+
+#[test]
+fn structural_adjustment_is_sheet_local_and_ref_is_a_valid_sheet_name() {
+    let cfg = arrow_eval_config();
+    let mut engine = Engine::new(TestWorkbook::default(), cfg);
+
+    engine.add_sheet("Other").unwrap();
+    engine.add_sheet("#REF").unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    engine
+        .set_cell_value("Other", 1, 1, LiteralValue::Number(20.0))
+        .unwrap();
+    engine
+        .set_cell_value("#REF", 1, 1, LiteralValue::Number(30.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Other", 2, 2, parse("=A1").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Other", 3, 2, parse("=Sheet1!A1").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Other", 4, 2, parse("='#REF'!A1").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    engine.delete_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Other", 2, 2),
+        Some(LiteralValue::Number(20.0)),
+        "unqualified references on another sheet must remain local"
+    );
+    match engine.get_cell_value("Other", 3, 2) {
+        Some(LiteralValue::Error(error)) => assert_eq!(error.kind, ExcelErrorKind::Ref),
+        other => panic!("expected the matching qualified reference to become #REF!, got {other:?}"),
+    }
+    assert_eq!(
+        engine.get_cell_value("Other", 4, 2),
+        Some(LiteralValue::Number(30.0)),
+        "a real sheet named #REF must remain addressable"
+    );
+
+    let formula = |row| {
+        let (ast, _) = engine
+            .get_cell("Other", row, 2)
+            .expect("formula cell exists");
+        canonical_formula(&ast.expect("formula AST exists"))
+    };
+    assert_eq!(formula(2), "=A1");
+    assert_eq!(formula(3), "=#REF!");
+    assert_eq!(formula(4), "='#REF'!A1");
 }

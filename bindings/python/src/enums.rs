@@ -3,11 +3,16 @@ use std::fmt::Display;
 use formualizer::parse::tokenizer::{TokenSubType as CoreTokenSubType, TokenType as CoreTokenType};
 use formualizer::parse::types::FormulaDialect as CoreFormulaDialect;
 use pyo3::prelude::*;
+#[cfg(not(target_os = "emscripten"))]
 use pyo3_stub_gen::derive::{gen_stub_pyclass_enum, gen_stub_pymethods};
 
 /// Python-exposed token type enum
-#[gen_stub_pyclass_enum]
-#[pyclass(name = "TokenType", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass_enum)]
+#[pyclass(
+    name = "TokenType",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyTokenType {
     Literal,
@@ -28,7 +33,7 @@ impl Display for PyTokenType {
     }
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyTokenType {
     fn __str__(&self) -> &'static str {
@@ -86,8 +91,12 @@ impl From<PyTokenType> for CoreTokenType {
 }
 
 /// Python-exposed token subtype enum
-#[gen_stub_pyclass_enum]
-#[pyclass(name = "TokenSubType", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass_enum)]
+#[pyclass(
+    name = "TokenSubType",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyTokenSubType {
     #[pyo3(name = "None_")]
@@ -109,7 +118,7 @@ impl Display for PyTokenSubType {
     }
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyTokenSubType {
     fn __str__(&self) -> &'static str {
@@ -167,15 +176,19 @@ impl From<PyTokenSubType> for CoreTokenSubType {
 }
 
 /// Formula dialect enum exposed to Python
-#[gen_stub_pyclass_enum]
-#[pyclass(name = "FormulaDialect", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass_enum)]
+#[pyclass(
+    name = "FormulaDialect",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyFormulaDialect {
     Excel,
     OpenFormula,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyFormulaDialect {
     fn __str__(&self) -> &'static str {
@@ -208,16 +221,66 @@ impl From<CoreFormulaDialect> for PyFormulaDialect {
     }
 }
 
+/// XLSX filesystem backing source used by Calamine path loads.
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass_enum)]
+#[pyclass(
+    name = "XlsxPathSource",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PyXlsxPathSource {
+    /// Safe default: one retained file handle with shared serialized I/O.
+    #[default]
+    #[pyo3(name = "SHARED_FILE")]
+    SharedFile,
+    /// Explicit read-only mmap; see the filesystem mutation contract.
+    #[pyo3(name = "DIRECT_MMAP")]
+    DirectMmap,
+}
+
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
+#[pymethods]
+impl PyXlsxPathSource {
+    fn __str__(&self) -> &'static str {
+        match self {
+            Self::SharedFile => "shared_file",
+            Self::DirectMmap => "direct_mmap",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self {
+            Self::SharedFile => "XlsxPathSource.SHARED_FILE".to_string(),
+            Self::DirectMmap => "XlsxPathSource.DIRECT_MMAP".to_string(),
+        }
+    }
+}
+
+#[cfg(not(target_os = "emscripten"))]
+impl From<PyXlsxPathSource> for formualizer::workbook::XlsxPathSource {
+    fn from(value: PyXlsxPathSource) -> Self {
+        match value {
+            PyXlsxPathSource::SharedFile => Self::SharedFile,
+            PyXlsxPathSource::DirectMmap => Self::DirectMmap,
+        }
+    }
+}
+
 /// Workbook mode enum exposed to Python.
-#[gen_stub_pyclass_enum]
-#[pyclass(name = "WorkbookMode", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass_enum)]
+#[pyclass(
+    name = "WorkbookMode",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyWorkbookMode {
     Ephemeral,
     Interactive,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyWorkbookMode {
     fn __str__(&self) -> &'static str {
@@ -236,6 +299,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenType>()?;
     m.add_class::<PyTokenSubType>()?;
     m.add_class::<PyFormulaDialect>()?;
+    m.add_class::<PyXlsxPathSource>()?;
     m.add_class::<PyWorkbookMode>()?;
     Ok(())
 }

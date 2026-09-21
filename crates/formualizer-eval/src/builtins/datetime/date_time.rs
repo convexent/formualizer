@@ -1,11 +1,11 @@
 //! DATE and TIME functions
 
-use super::serial::{create_date_normalized, time_to_fraction};
+use super::serial::create_date_normalized;
 use crate::args::ArgSchema;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use chrono::NaiveTime;
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, LiteralValue, date_to_serial_for, time_to_fraction};
 use formualizer_macros::func_caps;
 
 fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
@@ -69,6 +69,13 @@ pub struct DateFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for DateFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::DATE)
+    }
+
     func_caps!(PURE);
 
     fn name(&self) -> &'static str {
@@ -109,7 +116,7 @@ impl Function for DateFn {
         };
 
         let date = create_date_normalized(adjusted_year, month, day)?;
-        let serial = super::serial::date_to_serial_for(ctx.date_system(), &date);
+        let serial = date_to_serial_for(ctx.date_system(), &date);
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             serial,
@@ -162,6 +169,13 @@ pub struct TimeFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TimeFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::TIME)
+    }
+
     func_caps!(PURE);
 
     fn name(&self) -> &'static str {
@@ -225,8 +239,8 @@ impl Function for TimeFn {
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(DateFn));
-    crate::function_registry::register_function(Arc::new(TimeFn));
+    crate::function_registry::register_builtin(Arc::new(DateFn));
+    crate::function_registry::register_builtin(Arc::new(TimeFn));
 }
 
 #[cfg(test)]

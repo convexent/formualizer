@@ -120,25 +120,31 @@ impl DataStore {
             }
 
             LiteralValue::DateTime(dt) => {
-                // Store serial number as float
-                let serial = formualizer_common::datetime_to_serial(&dt);
+                // The arena uses Excel1900 only as a private, symmetric binary
+                // encoding for chrono values. This is not workbook serial
+                // state and the raw float is never exposed to formula logic.
+                let serial = formualizer_common::datetime_to_serial_for(
+                    formualizer_common::DateSystem::Excel1900,
+                    &dt,
+                );
                 let idx = self.scalars.insert_float(serial);
                 ValueRef::date_time(idx.as_u32())
             }
 
             LiteralValue::Date(d) => {
-                // Convert date to datetime at midnight
+                // Use the same private arena encoding as DateTime values.
                 let dt = d.and_hms_opt(0, 0, 0).unwrap();
-                let serial = formualizer_common::datetime_to_serial(&dt);
+                let serial = formualizer_common::datetime_to_serial_for(
+                    formualizer_common::DateSystem::Excel1900,
+                    &dt,
+                );
                 let idx = self.scalars.insert_float(serial);
                 ValueRef::date_time(idx.as_u32())
             }
 
             LiteralValue::Time(t) => {
-                // Store time as fractional day
-                use chrono::Timelike;
-                let seconds = (t.hour() * 3600 + t.minute() * 60 + t.second()) as f64;
-                let fraction = seconds / 86400.0;
+                // Store time as fractional day.
+                let fraction = formualizer_common::time_to_fraction(&t);
                 let idx = self.scalars.insert_float(fraction);
                 ValueRef::date_time(idx.as_u32())
             }
@@ -261,8 +267,11 @@ impl DataStore {
                 if let Some(idx) = value_ref.arena_index() {
                     let scalar_ref = super::scalar::ScalarRef::from_raw(idx);
                     if let Some(serial) = self.scalars.get_float(scalar_ref) {
-                        let dt = formualizer_common::serial_to_datetime(serial);
-                        LiteralValue::DateTime(dt)
+                        // This is a trusted private encoding, not an untrusted
+                        // workbook serial boundary. Use the compatibility
+                        // decoder so the arena retains its historical
+                        // pre-epoch behavior.
+                        LiteralValue::DateTime(formualizer_common::serial_to_datetime(serial))
                     } else {
                         LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))
                     }
@@ -308,6 +317,10 @@ impl DataStore {
         self.asts.resolve_string(id)
     }
 
+    pub(crate) fn ast_strings(&self) -> &StringInterner {
+        self.asts.strings()
+    }
+
     pub fn reconstruct_reference_type_for_eval(
         &self,
         ref_type: &CompactRefType,
@@ -328,6 +341,43 @@ impl DataStore {
         self.asts.get_array_elements_info(id)
     }
 
+    pub fn ast_needs_structural_rewrite(&self, id: AstNodeId) -> bool {
+        let mut stack = vec![id];
+        while let Some(node_id) = stack.pop() {
+            let Some(node) = self.get_node(node_id) else {
+                continue;
+            };
+            match node {
+                super::ast::AstNodeData::Reference { ref_type, .. } => {
+                    if let CompactRefType::Table { name_id, .. } = ref_type
+                        && self.resolve_ast_string(*name_id).is_empty()
+                    {
+                        return true;
+                    }
+                }
+                super::ast::AstNodeData::UnaryOp { expr_id, .. } => stack.push(*expr_id),
+                super::ast::AstNodeData::BinaryOp {
+                    left_id, right_id, ..
+                } => {
+                    stack.push(*right_id);
+                    stack.push(*left_id);
+                }
+                super::ast::AstNodeData::Function { .. } => {
+                    if let Some(args) = self.get_args(node_id) {
+                        stack.extend(args.iter().rev().copied());
+                    }
+                }
+                super::ast::AstNodeData::Array { .. } => {
+                    if let Some((_, _, elems)) = self.get_array_elems(node_id) {
+                        stack.extend(elems.iter().rev().copied());
+                    }
+                }
+                super::ast::AstNodeData::Literal(_) | super::ast::AstNodeData::Omitted => {}
+            }
+        }
+        false
+    }
+
     /// Convert ASTNode to arena representation
     fn convert_ast_node(&mut self, node: &ASTNode, sheet_registry: &SheetRegistry) -> AstNodeId {
         match &node.node_type {
@@ -335,6 +385,8 @@ impl DataStore {
                 let value_ref = self.store_value(lit.clone());
                 self.asts.insert_literal(value_ref)
             }
+
+            ASTNodeType::Omitted => self.asts.insert_omitted(),
 
             ASTNodeType::Reference {
                 original,
@@ -537,7 +589,7 @@ impl DataStore {
     }
 
     /// Reconstruct an ASTNode from arena representation
-    fn reconstruct_ast_node(
+    pub(crate) fn reconstruct_ast_node(
         &self,
         id: AstNodeId,
         sheet_registry: &SheetRegistry,
@@ -551,6 +603,8 @@ impl DataStore {
                 let lit = self.retrieve_value(*value_ref);
                 ASTNodeType::Literal(lit)
             }
+
+            AstNodeData::Omitted => ASTNodeType::Omitted,
 
             AstNodeData::Reference {
                 original_id,
@@ -885,6 +939,27 @@ mod tests {
 
         let retrieved = store.retrieve_value(value_ref);
         assert_eq!(retrieved, LiteralValue::Number(42.5));
+    }
+
+    #[test]
+    fn test_data_store_datetime_private_encoding_round_trips() {
+        let mut store = DataStore::new();
+        for datetime in [
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(12, 30, 0)
+                .unwrap(),
+            chrono::NaiveDate::from_ymd_opt(1899, 12, 30)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        ] {
+            let value_ref = store.store_value(LiteralValue::DateTime(datetime));
+            assert_eq!(
+                store.retrieve_value(value_ref),
+                LiteralValue::DateTime(datetime)
+            );
+        }
     }
 
     #[test]

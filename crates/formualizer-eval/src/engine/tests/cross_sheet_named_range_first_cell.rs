@@ -105,18 +105,12 @@ fn first_cell_of_cross_sheet_dn_range_resolves_via_evaluate_cell() {
 }
 
 #[test]
-fn cross_sheet_evaluate_cell_drains_all_staged_sheets() {
+fn cross_sheet_evaluate_cell_prepares_transitive_staged_formulas() {
     // ``defer_graph_building`` mode is what the xlsx loader uses
     // (``Workbook::interactive()``). Formulas land in a staging map and
-    // are promoted to the graph on first evaluate. Before the fix,
-    // ``evaluate_cell`` only promoted the *target* sheet's staged
-    // formulas — so a target cell whose formula referenced another
-    // sheet would read the still-unevaluated source and silently
-    // return ``None``. This test mirrors the xlsx-load path by staging
-    // formulas explicitly, then evaluating a single cross-sheet target
-    // cell. The fix in ``evaluate_cell`` calls ``build_graph_all`` so
-    // every staged sheet is materialized before the target's formula
-    // tries to read its dependencies.
+    // are prepared transactionally on first evaluation. This test mirrors
+    // the xlsx-load path and verifies target preparation discovers the
+    // complete cross-sheet precedent closure before evaluation.
     let cfg = EvalConfig {
         defer_graph_building: true,
         ..Default::default()
@@ -137,10 +131,8 @@ fn cross_sheet_evaluate_cell_drains_all_staged_sheets() {
     engine.stage_formula_text("Schedule", 6, 3, "=SUM(C2:C5)".to_string());
     engine.stage_formula_text("Model", 7, 4, "='Schedule'!C6".to_string());
 
-    // Target a cell on Model. Before the fix, only ``Model``'s staged
-    // formulas were promoted — so ``Schedule!C6`` remained unevaluated
-    // and the target read ``None``. After the fix, all staged sheets
-    // are promoted and the cross-sheet ref resolves cleanly.
+    // Target a cell on Model. The reachable Schedule formulas must be
+    // prepared before the cross-sheet reference is evaluated.
     let v = engine.evaluate_cell("Model", 7, 4).unwrap();
     assert_eq!(
         v,
@@ -149,4 +141,87 @@ fn cross_sheet_evaluate_cell_drains_all_staged_sheets() {
          to formula cells resolve; got {:?}",
         v
     );
+}
+
+fn build_delta_cross_sheet_engine(deferred: bool) -> Engine<TestWorkbook> {
+    let cfg = EvalConfig {
+        defer_graph_building: deferred,
+        ..Default::default()
+    };
+    let mut engine = Engine::new(TestWorkbook::default(), cfg);
+
+    engine.graph.add_sheet("Schedule").unwrap();
+    engine.graph.add_sheet("Model").unwrap();
+    for row in 2..=5u32 {
+        engine
+            .set_cell_value("Schedule", row, 1, LiteralValue::Number(row as f64 * 100.0))
+            .unwrap();
+    }
+
+    let formulas = [
+        ("Schedule", 2, 3, "=$A$2"),
+        ("Schedule", 3, 3, "=$A$3"),
+        ("Schedule", 4, 3, "=$A$4"),
+        ("Schedule", 5, 3, "=$A$5"),
+        ("Schedule", 6, 3, "=SUM(C2:C5)"),
+        ("Model", 7, 4, "='Schedule'!C6"),
+    ];
+    for (sheet, row, col, formula) in formulas {
+        if deferred {
+            engine.stage_formula_text(sheet, row, col, formula.to_string());
+        } else {
+            engine
+                .set_cell_formula(sheet, row, col, parse(formula).unwrap())
+                .unwrap();
+        }
+    }
+    engine
+}
+
+#[test]
+fn cross_sheet_evaluate_cells_with_delta_drains_all_staged_sheets() {
+    let mut deferred = build_delta_cross_sheet_engine(true);
+    let mut oracle = build_delta_cross_sheet_engine(false);
+
+    assert_eq!(deferred.staged_formula_count(), 6);
+    let (deferred_values, deferred_delta) = deferred
+        .evaluate_cells_with_delta(&[("Model", 7, 4)])
+        .unwrap();
+    let (oracle_values, oracle_delta) = oracle
+        .evaluate_cells_with_delta(&[("Model", 7, 4)])
+        .unwrap();
+
+    assert_eq!(deferred_values, vec![Some(LiteralValue::Number(1400.0))]);
+    assert_eq!(deferred_values, oracle_values);
+    assert_eq!(deferred_delta, oracle_delta);
+    assert_eq!(deferred_delta.changed_cells.len(), 6);
+    assert_eq!(deferred.staged_formula_count(), 0);
+}
+
+#[test]
+fn cross_sheet_evaluate_cells_with_delta_parse_failure_restores_all_staged_formulas() {
+    let cfg = EvalConfig {
+        defer_graph_building: true,
+        ..Default::default()
+    };
+    let mut engine = Engine::new(TestWorkbook::default(), cfg);
+    engine.graph.add_sheet("Schedule").unwrap();
+    engine.graph.add_sheet("Model").unwrap();
+    engine.stage_formula_text("Schedule", 1, 1, "=1+".to_string());
+    engine.stage_formula_text("Model", 1, 1, "=Schedule!A1+1".to_string());
+
+    let before = engine.baseline_stats();
+    assert!(
+        engine
+            .evaluate_cells_with_delta(&[("Model", 1, 1)])
+            .is_err()
+    );
+    let after = engine.baseline_stats();
+
+    assert_eq!(after.staged_formula_count, before.staged_formula_count);
+    assert_eq!(
+        after.graph_formula_vertex_count,
+        before.graph_formula_vertex_count
+    );
+    assert_eq!(engine.get_cell_value("Model", 1, 1), None);
 }

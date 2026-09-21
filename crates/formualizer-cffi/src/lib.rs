@@ -2,6 +2,7 @@
 
 use std::ffi::{c_char, c_int};
 
+use serde::Serialize;
 use std::ptr;
 use std::slice;
 
@@ -53,6 +54,11 @@ pub struct fz_status {
     pub error: fz_buffer, // JSON encoded error if code != OK
 }
 
+#[derive(Serialize)]
+struct StatusError<'a> {
+    message: &'a str,
+}
+
 impl fz_status {
     pub fn ok() -> Self {
         fz_status {
@@ -62,10 +68,15 @@ impl fz_status {
     }
 
     pub fn error(msg: String) -> Self {
-        let error_json = format!("{{\"message\": {:?}}}", msg);
+        let error_json = match serde_json::to_vec(&StatusError { message: &msg }) {
+            Ok(json) => json,
+            // String serialization cannot fail, but keep the C boundary total if the
+            // serializer gains a fallible path in the future.
+            Err(_) => br#"{"message":"failed to serialize error"}"#.to_vec(),
+        };
         fz_status {
             code: fz_status_code::FZ_STATUS_ERROR,
-            error: fz_buffer::from_vec(error_json.into_bytes()),
+            error: fz_buffer::from_vec(error_json),
         }
     }
 }
@@ -102,6 +113,32 @@ pub enum fz_encoding_format {
     FZ_ENCODING_CBOR = 1,
 }
 
+pub(crate) const EXCEL_MAX_ROWS: u32 = 1_048_576;
+pub(crate) const EXCEL_MAX_COLS: u32 = 16_384;
+
+/// Validate a range after it crosses the CFFI serialization boundary.
+pub(crate) fn validate_cffi_range(addr: &formualizer_common::RangeAddress) -> Result<(), String> {
+    if addr.start_row == 0 || addr.start_col == 0 || addr.end_row == 0 || addr.end_col == 0 {
+        return Err("range bounds must be 1-based".to_string());
+    }
+    if addr.start_row > addr.end_row || addr.start_col > addr.end_col {
+        return Err("range bounds must be ordered: start <= end".to_string());
+    }
+    if addr.end_row > EXCEL_MAX_ROWS {
+        return Err(format!(
+            "range ends at row {}, outside Excel's valid range 1..={EXCEL_MAX_ROWS}",
+            addr.end_row
+        ));
+    }
+    if addr.end_col > EXCEL_MAX_COLS {
+        return Err(format!(
+            "range ends at column {}, outside Excel's valid range 1..={EXCEL_MAX_COLS}",
+            addr.end_col
+        ));
+    }
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct fz_parse_options {
@@ -125,6 +162,34 @@ impl From<fz_formula_dialect> for formualizer_parse::FormulaDialect {
                 formualizer_parse::FormulaDialect::OpenFormula
             }
         }
+    }
+}
+
+/// Render a formula with the selected dialect while preserving the CFFI
+/// canonical-rendering contract.
+fn cffi_pretty_parse_render(
+    formula: &str,
+    dialect: formualizer_parse::FormulaDialect,
+) -> Result<String, String> {
+    if formula.is_empty() {
+        return Ok(String::new());
+    }
+
+    let needs_equals = !formula.starts_with('=');
+    let formula_to_parse = if needs_equals {
+        format!("={formula}")
+    } else {
+        formula.to_string()
+    };
+
+    let ast = formualizer_parse::parse_with_dialect(&formula_to_parse, dialect)
+        .map_err(|e| e.to_string())?;
+    let pretty_printed = formualizer_parse::pretty_print(&ast);
+
+    if needs_equals {
+        Ok(pretty_printed)
+    } else {
+        Ok(format!("={pretty_printed}"))
     }
 }
 
@@ -203,8 +268,7 @@ pub unsafe extern "C" fn fz_parse_ast(
 ) -> fz_buffer {
     use crate::parse::CffiASTNode;
     use formualizer_parse::FormulaDialect;
-    use formualizer_parse::parser::Parser;
-    use formualizer_parse::tokenizer::Tokenizer;
+    use formualizer_parse::parser::parse_with_dialect;
     use std::ffi::CStr;
 
     if formula.is_null() {
@@ -220,11 +284,7 @@ pub unsafe extern "C" fn fz_parse_ast(
 
     let result: Result<Vec<u8>, String> = (|| {
         let dialect = FormulaDialect::from(options.dialect);
-        let tokens = Tokenizer::new_with_dialect(&input, dialect)
-            .map_err(|e| e.to_string())?
-            .items;
-        let mut parser = Parser::new_with_dialect(tokens, true, dialect);
-        let ast = parser.parse().map_err(|e| e.to_string())?;
+        let ast = parse_with_dialect(&input, dialect).map_err(|e| e.to_string())?;
 
         let cffi_ast = CffiASTNode::from_core(&ast, options.include_spans);
 
@@ -266,7 +326,7 @@ pub unsafe extern "C" fn fz_parse_canonical_formula(
     dialect: fz_formula_dialect,
     status: *mut fz_status,
 ) -> fz_buffer {
-    use formualizer_parse::{FormulaDialect, pretty_parse_render};
+    use formualizer_parse::FormulaDialect;
     use std::ffi::CStr;
 
     if formula.is_null() {
@@ -280,8 +340,7 @@ pub unsafe extern "C" fn fz_parse_canonical_formula(
 
     let input = unsafe { CStr::from_ptr(formula).to_string_lossy() };
 
-    let _ = FormulaDialect::from(dialect);
-    let result: Result<String, String> = pretty_parse_render(&input).map_err(|e| e.to_string());
+    let result = cffi_pretty_parse_render(&input, FormulaDialect::from(dialect));
 
     match result {
         Ok(v) => {
@@ -341,6 +400,7 @@ pub unsafe extern "C" fn fz_common_parse_range_a1(
         let (er, ec, _, _) = coord::parse_a1_1based(end_str).map_err(|e| e.to_string())?;
 
         let addr = RangeAddress::new(sheet, sr, sc, er, ec).map_err(|e| e.to_string())?;
+        crate::validate_cffi_range(&addr)?;
 
         match format {
             fz_encoding_format::FZ_ENCODING_JSON => {
@@ -402,6 +462,7 @@ pub unsafe extern "C" fn fz_common_format_range_a1(
                 ciborium::from_reader(payload).map_err(|e| e.to_string())?
             }
         };
+        crate::validate_cffi_range(&addr)?;
 
         let start_col =
             coord::col_letters_from_1based(addr.start_col).map_err(|e| e.to_string())?;

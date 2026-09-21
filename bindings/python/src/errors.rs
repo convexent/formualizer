@@ -4,6 +4,7 @@ use formualizer::common::error::{
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+#[cfg(not(target_os = "emscripten"))]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 // Create custom exception types
@@ -12,8 +13,189 @@ pyo3::create_exception!(formualizer, ParserError, PyException);
 pyo3::create_exception!(formualizer, FormualizerHostError, PyException);
 // Raised when evaluating a cell returns an Excel error value
 pyo3::create_exception!(formualizer, ExcelEvaluationError, PyException);
+pyo3::create_exception!(formualizer, InspectionError, PyException);
+pyo3::create_exception!(formualizer, SheetNotFoundError, InspectionError);
+pyo3::create_exception!(formualizer, InvalidInspectionAddressError, InspectionError);
+pyo3::create_exception!(formualizer, InvalidInspectionOptionsError, InspectionError);
+pyo3::create_exception!(
+    formualizer,
+    DependencyStateUnavailableError,
+    InspectionError
+);
+pyo3::create_exception!(
+    formualizer,
+    InspectionRevisionMismatchError,
+    InspectionError
+);
+pyo3::create_exception!(
+    formualizer,
+    InspectionResourceExhaustedError,
+    InspectionError
+);
 
 type PyObject = pyo3::Py<pyo3::PyAny>;
+
+fn error_context_to_py(py: Python<'_>, context: &ErrorContext) -> PyObject {
+    let dict = PyDict::new(py);
+    let _ = dict.set_item("row", context.row);
+    let _ = dict.set_item("col", context.col);
+    let _ = dict.set_item("origin_row", context.origin_row);
+    let _ = dict.set_item("origin_col", context.origin_col);
+    let _ = dict.set_item("origin_sheet", &context.origin_sheet);
+    dict.into_any().unbind()
+}
+
+fn error_extra_to_py(py: Python<'_>, extra: &ExcelErrorExtra) -> Option<PyObject> {
+    let dict = PyDict::new(py);
+    match extra {
+        ExcelErrorExtra::None => return None,
+        ExcelErrorExtra::Spill {
+            expected_rows,
+            expected_cols,
+        } => {
+            let _ = dict.set_item("expected_rows", expected_rows);
+            let _ = dict.set_item("expected_cols", expected_cols);
+        }
+        ExcelErrorExtra::Resource { detail } => {
+            let _ = dict.set_item("resource_reason", detail.reason.as_str());
+            let _ = dict.set_item("limit", detail.limit);
+            let _ = dict.set_item("observed", detail.observed);
+            let _ = dict.set_item("request_id", detail.request_id);
+        }
+        ExcelErrorExtra::PreparationStale { reason } => {
+            let _ = dict.set_item("preparation_stale_reason", reason.as_str());
+        }
+        ExcelErrorExtra::PlanStale { reason } => {
+            let _ = dict.set_item("plan_stale_reason", reason.as_str());
+        }
+        _ => return None,
+    }
+    Some(dict.into_any().unbind())
+}
+
+/// Map a canonical engine error to the Python evaluation exception without
+/// flattening its structured Excel-domain fields.
+pub(crate) fn excel_error_to_pyerr(error: RustExcelError) -> PyErr {
+    let pyerr = ExcelEvaluationError::new_err(error.to_string());
+    Python::attach(|py| {
+        let value = pyerr.value(py);
+        let kind = format!("{:?}", error.kind);
+        let _ = value.setattr("kind", &kind);
+        let _ = value.setattr("excel_kind", kind);
+        let _ = value.setattr("message", error.message.clone());
+        let _ = value.setattr("excel_message", error.message.clone());
+
+        let context = error
+            .context
+            .as_ref()
+            .map(|context| error_context_to_py(py, context));
+        let _ = value.setattr("context", context);
+        if let Some(context) = &error.context {
+            let _ = value.setattr("row", context.row);
+            let _ = value.setattr("col", context.col);
+            let _ = value.setattr("origin_row", context.origin_row);
+            let _ = value.setattr("origin_col", context.origin_col);
+            let _ = value.setattr("origin_sheet", &context.origin_sheet);
+        }
+
+        let extra = error_extra_to_py(py, &error.extra);
+        let _ = value.setattr("extra", extra.as_ref().map(|extra| extra.bind(py)));
+        if let ExcelErrorExtra::Resource { detail } = &error.extra {
+            let _ = value.setattr("resource_reason", detail.reason.as_str());
+            let _ = value.setattr("limit", detail.limit);
+            let _ = value.setattr("observed", detail.observed);
+            let _ = value.setattr("request_id", detail.request_id);
+        }
+        if let ExcelErrorExtra::PreparationStale { reason } = &error.extra {
+            let _ = value.setattr("preparation_stale_reason", reason.as_str());
+        }
+        if let ExcelErrorExtra::PlanStale { reason } = &error.extra {
+            let _ = value.setattr("plan_stale_reason", reason.as_str());
+        }
+    });
+    pyerr
+}
+
+pub(crate) fn workbook_error_to_pyerr(error: formualizer::workbook::IoError) -> PyErr {
+    match error {
+        formualizer::workbook::IoError::Engine(error) => excel_error_to_pyerr(error),
+        other => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(other.to_string()),
+    }
+}
+
+fn inspection_error_with_code<T>(message: impl Into<String>, code: &str) -> PyErr
+where
+    T: pyo3::PyTypeInfo,
+{
+    let pyerr = PyErr::new::<T, _>(message.into());
+    Python::attach(|py| {
+        let value = pyerr.value(py);
+        let _ = value.setattr("code", code);
+    });
+    pyerr
+}
+
+pub(crate) fn invalid_inspection_address(message: impl Into<String>) -> PyErr {
+    inspection_error_with_code::<InvalidInspectionAddressError>(message, "invalid_address")
+}
+
+pub(crate) fn unknown_inspection_variant(name: &str) -> PyErr {
+    inspection_error_with_code::<InspectionError>(
+        format!("unknown inspection variant: {name}"),
+        "unknown_variant",
+    )
+}
+
+/// Convert engine inspection failures into a stable, distinguishable exception
+/// hierarchy. Every exception also carries a short `code` attribute.
+pub(crate) fn inspect_error_to_pyerr(
+    error: formualizer::eval::engine::inspect::InspectError,
+) -> PyErr {
+    use formualizer::eval::engine::inspect::InspectError;
+
+    let (pyerr, code) = match &error {
+        InspectError::SheetNotFound { .. } => (
+            SheetNotFoundError::new_err(error.to_string()),
+            "sheet_not_found",
+        ),
+        InspectError::InvalidAddress { .. } => (
+            InvalidInspectionAddressError::new_err(error.to_string()),
+            "invalid_address",
+        ),
+        InspectError::InvalidOptions { .. } => (
+            InvalidInspectionOptionsError::new_err(error.to_string()),
+            "invalid_options",
+        ),
+        InspectError::DependencyStateUnavailable { .. } => (
+            DependencyStateUnavailableError::new_err(error.to_string()),
+            "dependency_state_unavailable",
+        ),
+        InspectError::RevisionMismatch { .. } => (
+            InspectionRevisionMismatchError::new_err(error.to_string()),
+            "revision_mismatch",
+        ),
+        InspectError::ResourceExhausted { .. } => (
+            InspectionResourceExhaustedError::new_err(error.to_string()),
+            "resource_exhausted",
+        ),
+        _ => (InspectionError::new_err(error.to_string()), "unknown"),
+    };
+    Python::attach(|py| {
+        let _ = pyerr.value(py).setattr("code", code);
+        if let InspectError::SheetNotFound { sheet } = &error {
+            let _ = pyerr.value(py).setattr("sheet", sheet);
+        }
+        if let InspectError::RevisionMismatch { expected, actual } = &error {
+            let _ = pyerr
+                .value(py)
+                .setattr("expected", crate::inspect::PyStateStamp::from(*expected));
+            let _ = pyerr
+                .value(py)
+                .setattr("actual", crate::inspect::PyStateStamp::from(*actual));
+        }
+    });
+    pyerr
+}
 
 // Helper functions to create errors with position information
 impl TokenizerError {
@@ -39,14 +221,18 @@ impl ParserError {
 }
 
 /// Python representation of Excel domain errors
-#[gen_stub_pyclass]
-#[pyclass(name = "ExcelError", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass)]
+#[pyclass(
+    name = "ExcelError",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
 #[derive(Clone, Debug)]
 pub struct PyExcelError {
     pub(crate) inner: RustExcelError,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyExcelError {
     /// Create a new Excel error
@@ -142,18 +328,7 @@ impl PyExcelError {
     /// Get extra error data
     #[getter]
     pub fn extra(&self, py: Python) -> Option<PyObject> {
-        match &self.inner.extra {
-            ExcelErrorExtra::None => None,
-            ExcelErrorExtra::Spill {
-                expected_rows,
-                expected_cols,
-            } => {
-                let dict = PyDict::new(py);
-                let _ = dict.set_item("expected_rows", expected_rows);
-                let _ = dict.set_item("expected_cols", expected_cols);
-                Some(dict.into_pyobject(py).unwrap().unbind().into())
-            }
-        }
+        error_extra_to_py(py, &self.inner.extra)
     }
 
     /// Check if this is a #DIV/0! error
@@ -257,6 +432,7 @@ impl PyExcelError {
             ExcelErrorKind::Cancelled => "#CANCELLED!".to_string(),
             ExcelErrorKind::Error => "#ERROR!".to_string(),
             ExcelErrorKind::NImpl => "#N/IMPL!".to_string(),
+            _ => self.inner.kind.to_string(),
         }
     }
 }
@@ -277,6 +453,31 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "ExcelEvaluationError",
         m.py().get_type::<ExcelEvaluationError>(),
+    )?;
+    m.add("InspectionError", m.py().get_type::<InspectionError>())?;
+    m.add(
+        "SheetNotFoundError",
+        m.py().get_type::<SheetNotFoundError>(),
+    )?;
+    m.add(
+        "InvalidInspectionAddressError",
+        m.py().get_type::<InvalidInspectionAddressError>(),
+    )?;
+    m.add(
+        "InvalidInspectionOptionsError",
+        m.py().get_type::<InvalidInspectionOptionsError>(),
+    )?;
+    m.add(
+        "DependencyStateUnavailableError",
+        m.py().get_type::<DependencyStateUnavailableError>(),
+    )?;
+    m.add(
+        "InspectionRevisionMismatchError",
+        m.py().get_type::<InspectionRevisionMismatchError>(),
+    )?;
+    m.add(
+        "InspectionResourceExhaustedError",
+        m.py().get_type::<InspectionResourceExhaustedError>(),
     )?;
     m.add_class::<PyExcelError>()?;
     Ok(())

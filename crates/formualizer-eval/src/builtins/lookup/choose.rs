@@ -8,7 +8,7 @@
 
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::builtins::utils::collapse_if_scalar;
-use crate::function::Function;
+use crate::function::{Function, FunctionResolution, resolution_to_reference};
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
@@ -62,9 +62,16 @@ pub struct ChooseRowsFn;
 /// Variadic: false
 /// Signature: CHOOSE(arg1: number@scalar, arg2: any@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}
-/// Caps: PURE, LOOKUP
+/// Caps: PURE, LOOKUP, RETURNS_REFERENCE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for ChooseFn {
+    fn propagate_format(
+        &self,
+        result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        result.format_id()
+    }
+
     fn name(&self) -> &'static str {
         "CHOOSE"
     }
@@ -73,7 +80,9 @@ impl Function for ChooseFn {
         2
     }
 
-    func_caps!(PURE, LOOKUP);
+    // SHORT_CIRCUIT: only the selected choice is evaluated; untaken choices
+    // must not be materialized (see `Function::dispatch`).
+    func_caps!(PURE, LOOKUP, SHORT_CIRCUIT, RETURNS_REFERENCE, MAY_SPILL);
 
     fn arg_schema(&self) -> &'static [ArgSchema] {
         use once_cell::sync::Lazy;
@@ -106,6 +115,23 @@ impl Function for ChooseFn {
         &SCHEMA
     }
 
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        resolution_to_reference(resolve_choose_reference_or_value(args, ctx))
+    }
+
+    fn resolve_reference_or_value<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+        _value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Result<FunctionResolution<'b>, ExcelError> {
+        resolve_choose_reference_or_value(args, ctx)
+    }
+
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
@@ -123,10 +149,12 @@ impl Function for ChooseFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
 
+        // NumberStrict index semantics (previously enforced by eager dispatch
+        // validation): only genuine numbers are accepted; numeric text,
+        // booleans, etc. yield #VALUE!.
         let index = match index_val {
             LiteralValue::Number(n) => n as i64,
             LiteralValue::Int(i) => i,
-            LiteralValue::Text(s) => s.parse::<f64>().map(|n| n as i64).unwrap_or(-1),
             _ => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
@@ -145,6 +173,36 @@ impl Function for ChooseFn {
         let selected_arg = &args[index as usize];
         selected_arg.value()
     }
+}
+
+fn resolve_choose_reference_or_value<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    _ctx: &dyn FunctionContext<'b>,
+) -> Result<FunctionResolution<'b>, ExcelError> {
+    let value_error = || {
+        FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Value),
+        )))
+    };
+    if args.len() < 2 {
+        return Ok(value_error());
+    }
+    let index_value = args[0].value()?.into_literal();
+    let index = match index_value {
+        LiteralValue::Number(value) => value as i64,
+        LiteralValue::Int(value) => value,
+        LiteralValue::Error(error) => {
+            return Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(
+                LiteralValue::Error(error),
+            )));
+        }
+        _ => return Ok(value_error()),
+    };
+    if index < 1 || index as usize > args.len() - 1 {
+        return Ok(value_error());
+    }
+    let selected = &args[index as usize];
+    selected.resolve_reference_or_value()
 }
 
 /* ───────────────────────── CHOOSECOLS() / CHOOSEROWS() ───────────────────────── */
@@ -228,7 +286,7 @@ fn materialize_rows_2d<'b>(
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for ChooseColsFn {
-    func_caps!(PURE, LOOKUP);
+    func_caps!(PURE, LOOKUP, MAY_SPILL);
     fn name(&self) -> &'static str {
         "CHOOSECOLS"
     }
@@ -278,7 +336,7 @@ impl Function for ChooseColsFn {
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
-        let view = args[0].range_view()?;
+        let view = args[0].range_view_or_scalar()?;
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
@@ -384,7 +442,7 @@ impl Function for ChooseColsFn {
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for ChooseRowsFn {
-    func_caps!(PURE, LOOKUP);
+    func_caps!(PURE, LOOKUP, MAY_SPILL);
     fn name(&self) -> &'static str {
         "CHOOSEROWS"
     }
@@ -434,7 +492,7 @@ impl Function for ChooseRowsFn {
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
-        let view = args[0].range_view()?;
+        let view = args[0].range_view_or_scalar()?;
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
@@ -590,6 +648,44 @@ mod tests {
             .unwrap()
             .into_literal();
         assert!(matches!(result2, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value));
+    }
+
+    #[test]
+    fn choose_len_boundary_value_path() {
+        let wb = TestWorkbook::new().with_function(Arc::new(ChooseFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "CHOOSE").unwrap();
+
+        let a = lit(LiteralValue::Text("A".into()));
+        let b = lit(LiteralValue::Text("B".into()));
+
+        // CHOOSE(len, ...): the last choice is the highest valid index.
+        let two = lit(LiteralValue::Int(2));
+        let args = vec![
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&a, &ctx),
+            ArgumentHandle::new(&b, &ctx),
+        ];
+        let result = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(result, LiteralValue::Text("B".into()));
+
+        // CHOOSE(len + 1, ...): exactly one past the last choice must be
+        // #VALUE!, not an out-of-bounds argument access. A bound widened by
+        // one panics here while every wider overflow still errors.
+        let three = lit(LiteralValue::Int(3));
+        let args = vec![
+            ArgumentHandle::new(&three, &ctx),
+            ArgumentHandle::new(&a, &ctx),
+            ArgumentHandle::new(&b, &ctx),
+        ];
+        let result = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert!(matches!(result, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value));
     }
 
     #[test]

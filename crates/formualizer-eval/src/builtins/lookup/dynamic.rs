@@ -22,16 +22,75 @@
 use super::super::utils::collapse_if_scalar;
 use super::lookup_utils::{PreparedLookupMatcher, cmp_for_lookup, value_to_f64_lenient};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
+use crate::engine::lookup_index_cache::LookupAxis;
 use crate::function::Function; // FnCaps imported via macro
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 use std::collections::HashMap;
 
+/* ─────────────────── generated-array allocation guard ───────────────────
+ *
+ * Generator functions (SEQUENCE, RANDARRAY) materialize their full result
+ * as `Vec<Vec<LiteralValue>>` before the engine ever sees it, so dimension
+ * args taken from user input must be guarded BEFORE allocating — e.g.
+ * `=SEQUENCE(1e6,1e6)` would otherwise attempt a 10^12-cell allocation.
+ *
+ * Cap rationale:
+ * - Per-dimension: Excel sheet limits (1,048,576 rows × 16,384 cols — the
+ *   same values as `EvalConfig::default().max_sheet_rows/max_sheet_cols`).
+ *   A generated array larger than a sheet can never spill successfully
+ *   (`SpillBoundsPolicy::Strict`), so it is `#NUM!` unconditionally.
+ * - Total cells: 2^24 (16,777,216). `LiteralValue` is ≥32 bytes, so this
+ *   already bounds the transient allocation near ~0.5 GiB — three orders
+ *   of magnitude above the engine's default spill cap
+ *   (`SpillConfig::max_spill_cells` = 10,000) which would reject the
+ *   result downstream anyway. Anything larger risks OOM before that
+ *   downstream guard can run.
+ */
+const GENERATED_ARRAY_MAX_ROWS: i64 = 1_048_576;
+const GENERATED_ARRAY_MAX_COLS: i64 = 16_384;
+const GENERATED_ARRAY_MAX_CELLS: i64 = 1 << 24;
+
+/// Returns `Some(#NUM!)` when a `rows x cols` generated array exceeds the
+/// allocation guard; uses checked arithmetic so overflowing products fail
+/// closed. Callers have already rejected `rows <= 0 || cols <= 0`.
+fn generated_array_too_large(rows: i64, cols: i64) -> Option<ExcelError> {
+    if rows > GENERATED_ARRAY_MAX_ROWS || cols > GENERATED_ARRAY_MAX_COLS {
+        return Some(ExcelError::new(ExcelErrorKind::Num));
+    }
+    match rows.checked_mul(cols) {
+        Some(total) if total <= GENERATED_ARRAY_MAX_CELLS => None,
+        _ => Some(ExcelError::new(ExcelErrorKind::Num)),
+    }
+}
+
 /* ───────────────────────── helpers ───────────────────────── */
 
 pub fn super_wildcard_match(pattern: &str, text: &str) -> bool {
     super::lookup_utils::wildcard_pattern_match(pattern, text)
+}
+
+fn find_semantic_empty(
+    view: &crate::engine::range_view::RangeView<'_>,
+    len: usize,
+    vertical: bool,
+    reverse: bool,
+) -> Option<usize> {
+    let is_empty = |i| {
+        let value = if vertical {
+            view.get_cell(i, 0)
+        } else {
+            view.get_cell(0, i)
+        };
+        matches!(value, LiteralValue::Empty)
+    };
+
+    if reverse {
+        (0..len).rev().find(|&i| is_empty(i))
+    } else {
+        (0..len).find(|&i| is_empty(i))
+    }
 }
 
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
@@ -45,6 +104,7 @@ pub struct XLookupFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
@@ -98,11 +158,11 @@ pub struct XLookupFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: XLOOKUP(arg1: any@scalar, arg2: range@range, arg3: range@range, arg4?: any@scalar, arg5?: number@scalar, arg6?...: number@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for XLookupFn {
-    func_caps!(PURE, LOOKUP);
+    func_caps!(PURE, LOOKUP, MAY_SPILL);
     fn name(&self) -> &'static str {
         "XLOOKUP"
     }
@@ -131,7 +191,7 @@ impl Function for XLookupFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -142,7 +202,7 @@ impl Function for XLookupFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -202,11 +262,11 @@ impl Function for XLookupFn {
                 e.clone(),
             )));
         }
-        let lookup_view = match args[1].range_view() {
+        let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
-        let ret_view = match args[2].range_view() {
+        let ret_view = match args[2].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -276,12 +336,35 @@ impl Function for XLookupFn {
 
         let mut found: Option<usize> = None;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard);
         if match_mode == 0 || wildcard {
-            if search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
-                found =
-                    super::lookup_utils::find_exact_index_in_view(&lookup_view, &needle, wildcard)?;
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(&lookup_view, lookup_len, vertical, search_mode == -1);
+            } else if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
+                let axis = if vertical {
+                    LookupAxis::ColumnInView(0)
+                } else {
+                    LookupAxis::RowInView(0)
+                };
+                if let Some(index) = _ctx.get_lookup_index(&lookup_view, axis) {
+                    found = index.find_first_exact(&needle);
+                } else {
+                    found = super::lookup_utils::find_exact_index_in_view(
+                        &lookup_view,
+                        &needle,
+                        false,
+                        _ctx.date_system(),
+                    )?;
+                }
+            } else if search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
+                found = super::lookup_utils::find_exact_index_in_view(
+                    &lookup_view,
+                    &needle,
+                    wildcard,
+                    _ctx.date_system(),
+                )?;
             } else if search_mode == -1 {
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -296,6 +379,8 @@ impl Function for XLookupFn {
             } else {
                 // Fallback linear scan (also used when the lookup view is empty and
                 // we are treating missing cells as Empty).
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -309,7 +394,7 @@ impl Function for XLookupFn {
                 }
             }
         } else if match_mode == -1 || match_mode == 1 {
-            let needle_num = value_to_f64_lenient(&needle);
+            let needle_num = value_to_f64_lenient(&needle, _ctx.date_system());
             let mut best_idx: Option<usize> = None;
             let mut best_val: f64 = if match_mode == -1 {
                 f64::NEG_INFINITY
@@ -326,7 +411,8 @@ impl Function for XLookupFn {
                 };
 
                 if let Some(p) = prev.as_ref() {
-                    let sorted_ok = cmp_for_lookup(p, &cand).is_some_and(|o| o <= 0);
+                    let sorted_ok =
+                        cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0);
                     if !sorted_ok {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                             ExcelError::new(ExcelErrorKind::Na),
@@ -335,12 +421,14 @@ impl Function for XLookupFn {
                 }
                 prev = Some(cand.clone());
 
-                if cmp_for_lookup(&cand, &needle).is_some_and(|o| o == 0) {
+                if cmp_for_lookup(&cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
                     found = Some(i);
                     break;
                 }
 
-                if let (Some(nn), Some(vv)) = (needle_num, value_to_f64_lenient(&cand)) {
+                if let (Some(nn), Some(vv)) =
+                    (needle_num, value_to_f64_lenient(&cand, _ctx.date_system()))
+                {
                     if match_mode == -1 {
                         if vv <= nn && vv > best_val {
                             best_val = vv;
@@ -398,7 +486,9 @@ impl Function for XLookupFn {
             ));
         }
 
-        if args.len() >= 4 {
+        // An omitted-in-place slot (`XLOOKUP(v,l,r,,mode)`) is not a supplied
+        // if_not_found; Excel returns #N/A, not the omitted slot's 0.
+        if args.len() >= 4 && !args[3].is_omitted() {
             return args[3].value();
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -417,6 +507,7 @@ pub struct XMatchFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse, `2` ascending binary intent, `-2` descending binary intent.
 /// - `lookup_array` must be a single row or single column, otherwise returns `#VALUE!`.
@@ -461,11 +552,11 @@ pub struct XMatchFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: XMATCH(arg1: any@scalar, arg2: range@range, arg3?: number@scalar, arg4?...: number@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for XMatchFn {
-    func_caps!(PURE, LOOKUP);
+    func_caps!(PURE, LOOKUP, MAY_SPILL);
     fn name(&self) -> &'static str {
         "XMATCH"
     }
@@ -494,7 +585,7 @@ impl Function for XMatchFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -545,7 +636,7 @@ impl Function for XMatchFn {
                 e.clone(),
             )));
         }
-        let lookup_view = match args[1].range_view() {
+        let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -576,10 +667,15 @@ impl Function for XMatchFn {
         }
 
         let match_mode = if args.len() >= 3 {
-            match args[2].value()?.into_literal() {
-                LiteralValue::Int(i) => i,
-                LiteralValue::Number(n) => n as i64,
-                _ => 0,
+            // Defensive: value() currently materializes omission as Number(0), so this is redundant.
+            if args[2].is_omitted() {
+                0
+            } else {
+                match args[2].value()?.into_literal() {
+                    LiteralValue::Int(i) => i,
+                    LiteralValue::Number(n) => n as i64,
+                    _ => 0,
+                }
             }
         } else {
             0
@@ -596,23 +692,32 @@ impl Function for XMatchFn {
 
         let wildcard = match_mode == 2;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard);
 
         let mut found: Option<usize> = None;
 
         if match_mode == 0 || wildcard {
             // Exact match or wildcard match
-            if search_mode == 1 || search_mode == 2 {
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(
+                    &lookup_view,
+                    lookup_len,
+                    vertical,
+                    search_mode == -1 || search_mode == -2,
+                );
+            } else if search_mode == 1 || search_mode == 2 {
                 // Forward search (first to last) or binary ascending (treated as forward for exact)
                 if lookup_rows > 0 && lookup_cols > 0 {
                     found = super::lookup_utils::find_exact_index_in_view(
                         &lookup_view,
                         &needle,
                         wildcard,
+                        _ctx.date_system(),
                     )?;
                 }
             } else if search_mode == -1 || search_mode == -2 {
                 // Reverse search (last to first) or binary descending (treated as reverse for exact)
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -626,6 +731,8 @@ impl Function for XMatchFn {
                 }
             } else {
                 // Fallback linear scan
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -640,7 +747,7 @@ impl Function for XMatchFn {
             }
         } else if match_mode == -1 || match_mode == 1 {
             // Approximate match: -1 = exact or next smaller, 1 = exact or next larger
-            let needle_num = value_to_f64_lenient(&needle);
+            let needle_num = value_to_f64_lenient(&needle, _ctx.date_system());
             let mut best_idx: Option<usize> = None;
             let mut best_val: f64 = if match_mode == -1 {
                 f64::NEG_INFINITY
@@ -669,9 +776,9 @@ impl Function for XMatchFn {
                     };
                     if let Some(p) = prev.as_ref() {
                         let sorted_ok = if ascending {
-                            cmp_for_lookup(p, &cand).is_some_and(|o| o <= 0)
+                            cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0)
                         } else {
-                            cmp_for_lookup(p, &cand).is_some_and(|o| o >= 0)
+                            cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o >= 0)
                         };
                         if !sorted_ok {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -690,12 +797,14 @@ impl Function for XMatchFn {
                     lookup_view.get_cell(0, i)
                 };
 
-                if cmp_for_lookup(&cand, &needle).is_some_and(|o| o == 0) {
+                if cmp_for_lookup(&cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
                     found = Some(i);
                     break;
                 }
 
-                if let (Some(nn), Some(vv)) = (needle_num, value_to_f64_lenient(&cand)) {
+                if let (Some(nn), Some(vv)) =
+                    (needle_num, value_to_f64_lenient(&cand, _ctx.date_system()))
+                {
                     if match_mode == -1 {
                         // exact or next smaller
                         if vv <= nn && vv > best_val {
@@ -792,11 +901,11 @@ pub struct SortFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: SORT(arg1: range@range, arg2?: number@scalar, arg3?: number@scalar, arg4?...: logical@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for SortFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "SORT"
     }
@@ -814,7 +923,7 @@ impl Function for SortFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -863,7 +972,7 @@ impl Function for SortFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -925,7 +1034,7 @@ impl Function for SortFn {
             columns.sort_by(|a, b| {
                 let val_a = &a.1[sort_row_idx];
                 let val_b = &b.1[sort_row_idx];
-                let cmp = cmp_for_lookup(val_a, val_b).unwrap_or(0);
+                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
                 if ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) }
             });
 
@@ -961,7 +1070,7 @@ impl Function for SortFn {
             row_data.sort_by(|a, b| {
                 let val_a = &a[sort_col_idx];
                 let val_b = &b[sort_col_idx];
-                let cmp = cmp_for_lookup(val_a, val_b).unwrap_or(0);
+                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
                 if ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) }
             });
 
@@ -1030,11 +1139,11 @@ pub struct SortByFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: SORTBY(arg1: range@range, arg2: range@range, arg3?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for SortByFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "SORTBY"
     }
@@ -1052,7 +1161,7 @@ impl Function for SortByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -1063,7 +1172,7 @@ impl Function for SortByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -1097,7 +1206,7 @@ impl Function for SortByFn {
             )));
         }
 
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -1115,7 +1224,7 @@ impl Function for SortByFn {
 
         while arg_idx < args.len() {
             // by_array
-            let by_view = match args[arg_idx].range_view() {
+            let by_view = match args[arg_idx].range_view_or_scalar() {
                 Ok(v) => v,
                 Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             };
@@ -1193,7 +1302,7 @@ impl Function for SortByFn {
             for (by_values, ascending) in &sort_criteria {
                 let val_a = &by_values[a.0];
                 let val_b = &by_values[b.0];
-                let cmp = cmp_for_lookup(val_a, val_b).unwrap_or(0);
+                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
                 if cmp != 0 {
                     return if *ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) };
                 }
@@ -1254,12 +1363,11 @@ pub struct RandArrayFn;
 /// Variadic: true
 /// Signature: RANDARRAY(arg1?: number@scalar, arg2?: number@scalar, arg3?: number@scalar, arg4?: number@scalar, arg5?...: logical@scalar)
 /// Arg schema: arg1{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg2{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg5{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
-/// Caps: none
+/// Caps: VOLATILE
 /// [formualizer-docgen:schema:end]
 impl Function for RandArrayFn {
-    // Note: RANDARRAY is NOT pure - it returns different values on each evaluation
     fn caps(&self) -> crate::function::FnCaps {
-        crate::function::FnCaps::empty()
+        crate::function::FnCaps::VOLATILE | crate::function::FnCaps::MAY_SPILL
     }
     fn name(&self) -> &'static str {
         "RANDARRAY"
@@ -1382,6 +1490,10 @@ impl Function for RandArrayFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
+        }
+
+        if let Some(e) = generated_array_too_large(rows, cols) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
 
         let mut rng = ctx.rng_for_current(self.function_salt());
@@ -1629,11 +1741,11 @@ pub struct GroupByFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: GROUPBY(arg1: range@range, arg2: range@range, arg3: any@scalar, arg4?: number@scalar, arg5?: number@scalar, arg6?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for GroupByFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "GROUPBY"
     }
@@ -1651,7 +1763,7 @@ impl Function for GroupByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -1662,7 +1774,7 @@ impl Function for GroupByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -1730,11 +1842,11 @@ impl Function for GroupByFn {
         }
 
         // Get row_fields and values ranges
-        let row_fields_view = match args[0].range_view() {
+        let row_fields_view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
-        let values_view = match args[1].range_view() {
+        let values_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -2003,11 +2115,11 @@ pub struct PivotByFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: PIVOTBY(arg1: range@range, arg2: range@range, arg3: range@range, arg4: any@scalar, arg5?: number@scalar, arg6?: number@scalar, arg7?: number@scalar, arg8?: number@scalar, arg9?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg7{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg8{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg9{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg7{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg8{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg9{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for PivotByFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "PIVOTBY"
     }
@@ -2025,7 +2137,7 @@ impl Function for PivotByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2036,7 +2148,7 @@ impl Function for PivotByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2047,7 +2159,7 @@ impl Function for PivotByFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2137,15 +2249,15 @@ impl Function for PivotByFn {
         }
 
         // Get ranges
-        let row_fields_view = match args[0].range_view() {
+        let row_fields_view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
-        let col_fields_view = match args[1].range_view() {
+        let col_fields_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
-        let values_view = match args[2].range_view() {
+        let values_view = match args[2].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -2474,11 +2586,11 @@ pub struct FilterFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: FILTER(arg1: range@range, arg2: range@range, arg3?...: any@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for FilterFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "FILTER"
     }
@@ -2496,7 +2608,7 @@ impl Function for FilterFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2504,10 +2616,15 @@ impl Function for FilterFn {
                     default: None,
                 },
                 // include
+                //
+                // Not `by_ref`: in practice this argument is a computed boolean
+                // array (`B2:B5="Jakarta"`) rather than a bare reference, and a
+                // by-ref argument that does not resolve to a reference is
+                // rejected with #REF! during argument preparation.
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2539,8 +2656,8 @@ impl Function for FilterFn {
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
-        let array_view = args[0].range_view()?;
-        let include_view = args[1].range_view()?;
+        let array_view = args[0].range_view_or_scalar()?;
+        let include_view = args[1].range_view_or_scalar()?;
 
         let (array_rows, array_cols) = array_view.dims();
         if array_rows == 0 || array_cols == 0 {
@@ -2647,11 +2764,11 @@ pub struct UniqueFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: UNIQUE(arg1: range@range, arg2?: logical@scalar, arg3?...: logical@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}; arg3{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}; arg3{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for UniqueFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "UNIQUE"
     }
@@ -2668,7 +2785,7 @@ impl Function for UniqueFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -2704,7 +2821,7 @@ impl Function for UniqueFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -2830,7 +2947,7 @@ pub struct SequenceFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for SequenceFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "SEQUENCE"
     }
@@ -2921,8 +3038,9 @@ impl Function for SequenceFn {
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
-        let total = rows.saturating_mul(cols);
-        // TODO(perf): guard extremely large allocations (#NUM!).
+        if let Some(e) = generated_array_too_large(rows, cols) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows as usize);
         let mut current = start;
         for _r in 0..rows {
@@ -2996,11 +3114,11 @@ pub struct TransposeFn;
 /// Max args: 1
 /// Variadic: false
 /// Signature: TRANSPOSE(arg1: range@range)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TransposeFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "TRANSPOSE"
     }
@@ -3016,7 +3134,7 @@ impl Function for TransposeFn {
             vec![ArgSchema {
                 kinds: smallvec::smallvec![ArgKind::Range],
                 required: true,
-                by_ref: true,
+                by_ref: false,
                 shape: ShapeKind::Range,
                 coercion: CoercionPolicy::None,
                 max: None,
@@ -3031,7 +3149,7 @@ impl Function for TransposeFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -3108,11 +3226,11 @@ pub struct TakeFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: TAKE(arg1: range@range, arg2: number@scalar, arg3?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TakeFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "TAKE"
     }
@@ -3129,7 +3247,7 @@ impl Function for TakeFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -3165,7 +3283,7 @@ impl Function for TakeFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -3292,11 +3410,11 @@ pub struct DropFn;
 /// Max args: variadic
 /// Variadic: true
 /// Signature: DROP(arg1: range@range, arg2: number@scalar, arg3?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for DropFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "DROP"
     }
@@ -3313,7 +3431,7 @@ impl Function for DropFn {
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Range],
                     required: true,
-                    by_ref: true,
+                    by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
@@ -3349,7 +3467,7 @@ impl Function for DropFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let view = match args[0].range_view() {
+        let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
@@ -3413,21 +3531,21 @@ impl Function for DropFn {
 }
 
 pub fn register_builtins() {
-    use crate::function_registry::register_function;
+    use crate::function_registry::register_builtin;
     use std::sync::Arc;
-    register_function(Arc::new(XLookupFn));
-    register_function(Arc::new(FilterFn));
-    register_function(Arc::new(UniqueFn));
-    register_function(Arc::new(SequenceFn));
-    register_function(Arc::new(TransposeFn));
-    register_function(Arc::new(TakeFn));
-    register_function(Arc::new(DropFn));
-    register_function(Arc::new(XMatchFn));
-    register_function(Arc::new(SortFn));
-    register_function(Arc::new(SortByFn));
-    register_function(Arc::new(RandArrayFn));
-    register_function(Arc::new(GroupByFn));
-    register_function(Arc::new(PivotByFn));
+    register_builtin(Arc::new(XLookupFn));
+    register_builtin(Arc::new(FilterFn));
+    register_builtin(Arc::new(UniqueFn));
+    register_builtin(Arc::new(SequenceFn));
+    register_builtin(Arc::new(TransposeFn));
+    register_builtin(Arc::new(TakeFn));
+    register_builtin(Arc::new(DropFn));
+    register_builtin(Arc::new(XMatchFn));
+    register_builtin(Arc::new(SortFn));
+    register_builtin(Arc::new(SortByFn));
+    register_builtin(Arc::new(RandArrayFn));
+    register_builtin(Arc::new(GroupByFn));
+    register_builtin(Arc::new(PivotByFn));
 }
 
 /* ───────────────────────── tests ───────────────────────── */
@@ -3517,6 +3635,122 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v_nf, LiteralValue::Text("NF".into()));
+    }
+
+    #[test]
+    fn modern_reverse_array_numeric_zero_only_matches_numeric_zero_candidates() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(XLookupFn))
+            .with_function(Arc::new(XMatchFn));
+        let ctx = wb.interpreter();
+        let xlookup = ctx.context.get_function("", "XLOOKUP").unwrap();
+        let xmatch = ctx.context.get_function("", "XMATCH").unwrap();
+        let zero_mode = lit(LiteralValue::Int(0));
+        let reverse = lit(LiteralValue::Int(-1));
+        let not_found = lit(LiteralValue::Text("NF".into()));
+        let needles = [LiteralValue::Number(0.0), LiteralValue::Number(-0.0)];
+
+        for vertical in [false, true] {
+            let candidates = vec![
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+                LiteralValue::Number(-0.0),
+                LiteralValue::Number(0.0),
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+            ];
+            let payloads = vec![
+                LiteralValue::Int(10),
+                LiteralValue::Int(20),
+                LiteralValue::Int(30),
+                LiteralValue::Int(40),
+                LiteralValue::Int(50),
+                LiteralValue::Int(60),
+            ];
+            let no_zero = vec![
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+                LiteralValue::Text(String::new()),
+                LiteralValue::Empty,
+                LiteralValue::Text("0".into()),
+                LiteralValue::Boolean(false),
+            ];
+            let rows = |values: Vec<LiteralValue>| {
+                if vertical {
+                    values.into_iter().map(|value| vec![value]).collect()
+                } else {
+                    vec![values]
+                }
+            };
+            let lookup_array = lit(LiteralValue::Array(rows(candidates)));
+            let return_array = lit(LiteralValue::Array(rows(payloads.clone())));
+            let no_zero_array = lit(LiteralValue::Array(rows(no_zero)));
+            let no_zero_returns = lit(LiteralValue::Array(rows(payloads)));
+
+            for needle_value in needles.clone() {
+                let needle = lit(needle_value);
+                let xmatch_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&lookup_array, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xmatch
+                        .dispatch(&xmatch_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Int(4)
+                );
+
+                let xlookup_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&lookup_array, &ctx),
+                    ArgumentHandle::new(&return_array, &ctx),
+                    ArgumentHandle::new(&not_found, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xlookup
+                        .dispatch(&xlookup_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Number(40.0)
+                );
+
+                let missing_match_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&no_zero_array, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                let missing_match = xmatch
+                    .dispatch(&missing_match_args, &ctx.function_context(None))
+                    .unwrap()
+                    .into_literal();
+                assert!(
+                    matches!(missing_match, LiteralValue::Error(ref error) if error.kind == ExcelErrorKind::Na),
+                    "XMATCH should reject non-numeric zero candidates, got {missing_match:?}"
+                );
+
+                let missing_lookup_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&no_zero_array, &ctx),
+                    ArgumentHandle::new(&no_zero_returns, &ctx),
+                    ArgumentHandle::new(&not_found, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xlookup
+                        .dispatch(&missing_lookup_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Text("NF".into())
+                );
+            }
+        }
     }
 
     #[test]
@@ -3894,6 +4128,52 @@ mod tests {
         assert_eq!(v_empty, LiteralValue::Text("EMPTY".into()));
     }
 
+    /// `include` is usually a computed boolean array (`B2:B5="Jakarta"`) rather
+    /// than a bare reference. The existing coverage only ever passed a
+    /// reference, so a `by_ref` schema on that argument went unnoticed while
+    /// rejecting every idiomatic call with #REF!.
+    #[test]
+    fn filter_accepts_computed_include() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(FilterFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(20))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(30));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "FILTER").unwrap();
+
+        let array_range = range("A1:A3", 1, 1, 3, 1);
+        // {TRUE;FALSE;TRUE} as an inline array rather than a reference
+        let include_array = ASTNode::new(
+            ASTNodeType::Array(vec![
+                vec![lit(LiteralValue::Boolean(true))],
+                vec![lit(LiteralValue::Boolean(false))],
+                vec![lit(LiteralValue::Boolean(true))],
+            ]),
+            None,
+        );
+
+        let v = f
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&array_range, &ctx),
+                    ArgumentHandle::new(&include_array, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+
+        match v {
+            LiteralValue::Array(a) => {
+                assert_eq!(a.len(), 2, "expected the two included rows, got {a:?}");
+                assert_eq!(a[0], vec![LiteralValue::Number(10.0)]);
+                assert_eq!(a[1], vec![LiteralValue::Number(30.0)]);
+            }
+            other => panic!("expected array got {other:?}"),
+        }
+    }
+
     #[test]
     fn unique_basic_and_exactly_once() {
         let wb = TestWorkbook::new().with_function(Arc::new(UniqueFn));
@@ -3917,6 +4197,148 @@ mod tests {
             }
             _ => panic!("expected array"),
         }
+    }
+
+    #[test]
+    fn generated_array_guard_boundaries() {
+        // Exactly at the total-cells cap: allowed (4096 * 4096 == 2^24).
+        assert!(generated_array_too_large(4096, 4096).is_none());
+        // One past the cap: #NUM!.
+        assert!(generated_array_too_large(4096, 4097).is_some());
+        // Per-dimension Excel sheet limits.
+        assert!(generated_array_too_large(1_048_576, 1).is_none());
+        assert!(generated_array_too_large(1_048_577, 1).is_some());
+        assert!(generated_array_too_large(1, 16_384).is_none());
+        assert!(generated_array_too_large(1, 16_385).is_some());
+        // checked_mul overflow path fails closed.
+        assert!(generated_array_too_large(i64::MAX, i64::MAX).is_some());
+    }
+
+    #[test]
+    fn sequence_oversized_returns_num_error_quickly() {
+        let wb = TestWorkbook::new().with_function(Arc::new(SequenceFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "SEQUENCE").unwrap();
+        // =SEQUENCE(1e6, 1e6): 10^12 cells must fail fast, not allocate.
+        let rows = lit(LiteralValue::Number(1e6));
+        let cols = lit(LiteralValue::Number(1e6));
+        let args = vec![
+            ArgumentHandle::new(&rows, &ctx),
+            ArgumentHandle::new(&cols, &ctx),
+        ];
+        let started = std::time::Instant::now();
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        let elapsed = started.elapsed();
+        match v {
+            LiteralValue::Error(e) => {
+                assert_eq!(e.kind, formualizer_common::ExcelErrorKind::Num)
+            }
+            other => panic!("expected #NUM! got {other:?}"),
+        }
+        assert!(
+            elapsed.as_millis() < 250,
+            "oversized SEQUENCE must short-circuit, took {elapsed:?}"
+        );
+
+        // Total-cells cap: full-sheet request (1,048,576 x 16,384) is #NUM!.
+        let rows = lit(LiteralValue::Int(1_048_576));
+        let cols = lit(LiteralValue::Int(16_384));
+        let args = vec![
+            ArgumentHandle::new(&rows, &ctx),
+            ArgumentHandle::new(&cols, &ctx),
+        ];
+        match f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Error(e) => {
+                assert_eq!(e.kind, formualizer_common::ExcelErrorKind::Num)
+            }
+            other => panic!("expected #NUM! got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sequence_large_but_legal_succeeds() {
+        // A full Excel column (1,048,576 x 1) stays under the cap and works.
+        let wb = TestWorkbook::new().with_function(Arc::new(SequenceFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "SEQUENCE").unwrap();
+        let rows = lit(LiteralValue::Int(1_048_576));
+        let args = vec![ArgumentHandle::new(&rows, &ctx)];
+        match f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Array(a) => {
+                assert_eq!(a.len(), 1_048_576);
+                assert_eq!(a[0][0], LiteralValue::Number(1.0));
+            }
+            other => panic!("expected array got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sequence_negative_and_zero_dims_keep_value_error() {
+        let wb = TestWorkbook::new().with_function(Arc::new(SequenceFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "SEQUENCE").unwrap();
+        for (r, c) in [(0i64, 5i64), (-3, 5), (5, 0), (5, -1)] {
+            let rows = lit(LiteralValue::Int(r));
+            let cols = lit(LiteralValue::Int(c));
+            let args = vec![
+                ArgumentHandle::new(&rows, &ctx),
+                ArgumentHandle::new(&cols, &ctx),
+            ];
+            match f
+                .dispatch(&args, &ctx.function_context(None))
+                .unwrap()
+                .into_literal()
+            {
+                LiteralValue::Error(e) => {
+                    assert_eq!(
+                        e.kind,
+                        formualizer_common::ExcelErrorKind::Value,
+                        "SEQUENCE({r},{c})"
+                    )
+                }
+                other => panic!("expected #VALUE! for SEQUENCE({r},{c}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn randarray_oversized_returns_num_error_quickly() {
+        let wb = TestWorkbook::new().with_function(Arc::new(RandArrayFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "RANDARRAY").unwrap();
+        let rows = lit(LiteralValue::Number(1e6));
+        let cols = lit(LiteralValue::Number(1e6));
+        let args = vec![
+            ArgumentHandle::new(&rows, &ctx),
+            ArgumentHandle::new(&cols, &ctx),
+        ];
+        let started = std::time::Instant::now();
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        let elapsed = started.elapsed();
+        match v {
+            LiteralValue::Error(e) => {
+                assert_eq!(e.kind, formualizer_common::ExcelErrorKind::Num)
+            }
+            other => panic!("expected #NUM! got {other:?}"),
+        }
+        assert!(
+            elapsed.as_millis() < 250,
+            "oversized RANDARRAY must short-circuit, took {elapsed:?}"
+        );
     }
 
     #[test]

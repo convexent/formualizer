@@ -20,6 +20,7 @@ use crate::LiteralValue;
 ///
 /// **Note:** names are CamelCase (idiomatic Rust) while `Display`
 /// renders them exactly as Excel shows them (`#DIV/0!`, …).
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ExcelErrorKind {
@@ -98,9 +99,110 @@ pub struct ErrorContext {
     pub origin_sheet: Option<String>,
 }
 
+/// Stable reason for a resource exhaustion diagnostic.
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ResourceExhaustionReason {
+    Admission,
+    RetainedMemory,
+    ScratchMemory,
+    WorkUnits,
+    Deadline,
+    GraphVertices,
+    GraphEdges,
+    MaterializationCells,
+    ArithmeticOverflow,
+}
+
+impl ResourceExhaustionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::RetainedMemory => "retained_memory",
+            Self::ScratchMemory => "scratch_memory",
+            Self::WorkUnits => "work_units",
+            Self::Deadline => "deadline",
+            Self::GraphVertices => "graph_vertices",
+            Self::GraphEdges => "graph_edges",
+            Self::MaterializationCells => "materialization_cells",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+        }
+    }
+}
+
+/// Binding-safe typed resource exhaustion payload.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceExhaustionDetail {
+    pub reason: ResourceExhaustionReason,
+    pub limit: u64,
+    pub observed: u64,
+    pub request_id: Option<u64>,
+}
+
+/// Stable category for a target-preparation plan rejected at its final boundary.
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum PreparationStaleReason {
+    Graph,
+    Authority,
+    Staged,
+    Symbols,
+    Semantic,
+    Provider,
+}
+
+impl PreparationStaleReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graph => "graph",
+            Self::Authority => "authority",
+            Self::Staged => "staged",
+            Self::Symbols => "symbols",
+            Self::Semantic => "semantic",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// Stable category for a reusable recalculation plan rejected before execution.
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum PlanStaleReason {
+    Engine,
+    Provider,
+    Semantic,
+    Budget,
+    Staged,
+    Symbols,
+    Authority,
+    SpanGeneration,
+    Graph,
+}
+
+impl PlanStaleReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::Provider => "provider",
+            Self::Semantic => "semantic",
+            Self::Budget => "budget",
+            Self::Staged => "staged",
+            Self::Symbols => "symbols",
+            Self::Authority => "authority",
+            Self::SpanGeneration => "span_generation",
+            Self::Graph => "graph",
+        }
+    }
+}
+
 /// Kind-specific payloads (“extension slot”).
 ///
 /// Only variants that need extra data get it—rest stay at `None`.
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum ExcelErrorExtra {
@@ -112,6 +214,20 @@ pub enum ExcelErrorExtra {
     Spill {
         expected_rows: u32,
         expected_cols: u32,
+    },
+
+    /// Typed resource exhaustion. The canonical Excel error kind remains
+    /// unchanged so existing bindings and formula error handling stay compatible.
+    Resource {
+        detail: Box<ResourceExhaustionDetail>,
+    },
+
+    PreparationStale {
+        reason: PreparationStaleReason,
+    },
+
+    PlanStale {
+        reason: PlanStaleReason,
     },
     // --- Add future custom payloads below -------------------------------
     // AnotherKind { … },
@@ -274,6 +390,21 @@ impl fmt::Display for ExcelError {
             } => {
                 write!(f, " [spill {expected_rows}×{expected_cols}]")?;
             }
+            ExcelErrorExtra::Resource { detail } => {
+                write!(
+                    f,
+                    " [resource {} {}/{}]",
+                    detail.reason.as_str(),
+                    detail.observed,
+                    detail.limit
+                )?;
+            }
+            ExcelErrorExtra::PreparationStale { reason } => {
+                write!(f, " [preparation stale {}]", reason.as_str())?;
+            }
+            ExcelErrorExtra::PlanStale { reason } => {
+                write!(f, " [plan stale {}]", reason.as_str())?;
+            }
         }
 
         Ok(())
@@ -326,5 +457,28 @@ mod tests {
         let err = ExcelError::from_error_string("#BOGUS!");
         assert_eq!(err.kind, ExcelErrorKind::Error);
         assert!(err.message.unwrap_or_default().contains("#BOGUS!"));
+    }
+
+    #[test]
+    fn preparation_stale_reason_has_stable_snake_case_names() {
+        assert_eq!(PreparationStaleReason::Graph.as_str(), "graph");
+        assert_eq!(PreparationStaleReason::Authority.as_str(), "authority");
+        assert_eq!(PreparationStaleReason::Staged.as_str(), "staged");
+        assert_eq!(PreparationStaleReason::Symbols.as_str(), "symbols");
+        assert_eq!(PreparationStaleReason::Semantic.as_str(), "semantic");
+        assert_eq!(PreparationStaleReason::Provider.as_str(), "provider");
+    }
+
+    #[test]
+    fn plan_stale_reason_has_stable_snake_case_names() {
+        assert_eq!(PlanStaleReason::Engine.as_str(), "engine");
+        assert_eq!(PlanStaleReason::Provider.as_str(), "provider");
+        assert_eq!(PlanStaleReason::Semantic.as_str(), "semantic");
+        assert_eq!(PlanStaleReason::Budget.as_str(), "budget");
+        assert_eq!(PlanStaleReason::Staged.as_str(), "staged");
+        assert_eq!(PlanStaleReason::Symbols.as_str(), "symbols");
+        assert_eq!(PlanStaleReason::Authority.as_str(), "authority");
+        assert_eq!(PlanStaleReason::SpanGeneration.as_str(), "span_generation");
+        assert_eq!(PlanStaleReason::Graph.as_str(), "graph");
     }
 }

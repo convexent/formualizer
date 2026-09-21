@@ -198,7 +198,7 @@ fn eval_d_function<'a, 'b>(
     }
 
     // Get database range
-    let db_view = match args[0].range_view() {
+    let db_view = match args[0].range_view_or_scalar() {
         Ok(v) => v,
         Err(_) => {
             // Try to get as array literal
@@ -362,7 +362,7 @@ fn eval_d_stat_function<'a, 'b>(
     }
 
     // Get database range
-    let db_view = match args[0].range_view() {
+    let db_view = match args[0].range_view_or_scalar() {
         Ok(v) => v,
         Err(_) => {
             let val = args[0].value()?.into_literal();
@@ -491,7 +491,7 @@ fn eval_dget<'a, 'b>(
     }
 
     // Get database range
-    let db_view = match args[0].range_view() {
+    let db_view = match args[0].range_view_or_scalar() {
         Ok(v) => v,
         Err(_) => {
             let val = args[0].value()?.into_literal();
@@ -549,7 +549,12 @@ fn eval_dget<'a, 'b>(
 
     for row in 1..db_rows {
         if row_matches_criteria(&db_view, row, &criteria_rows) {
-            matching_values.push(db_view.get_cell(row, field_idx));
+            let field_value = db_view.get_cell(row, field_idx);
+            // DGET ignores records whose selected field is genuinely blank.
+            // An explicit empty string is still a value and must be retained.
+            if !matches!(field_value, LiteralValue::Empty) {
+                matching_values.push(field_value);
+            }
         }
     }
 
@@ -583,7 +588,7 @@ fn eval_dcounta<'a, 'b>(
     }
 
     // Get database range
-    let db_view = match args[0].range_view() {
+    let db_view = match args[0].range_view_or_scalar() {
         Ok(v) => v,
         Err(_) => {
             let val = args[0].value()?.into_literal();
@@ -647,9 +652,6 @@ fn eval_dcounta<'a, 'b>(
             match &cell_val {
                 LiteralValue::Empty => {
                     // Empty cells are NOT counted
-                }
-                LiteralValue::Text(s) if s.is_empty() => {
-                    // Empty strings are treated as blank and NOT counted
                 }
                 LiteralValue::Error(e) => {
                     // Propagate errors
@@ -2430,18 +2432,18 @@ impl Function for DCountAFn {
 /// Register all database functions.
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(DSumFn));
-    crate::function_registry::register_function(Arc::new(DAverageFn));
-    crate::function_registry::register_function(Arc::new(DCountFn));
-    crate::function_registry::register_function(Arc::new(DMaxFn));
-    crate::function_registry::register_function(Arc::new(DMinFn));
-    crate::function_registry::register_function(Arc::new(DProductFn));
-    crate::function_registry::register_function(Arc::new(DStdevFn));
-    crate::function_registry::register_function(Arc::new(DStdevPFn));
-    crate::function_registry::register_function(Arc::new(DVarFn));
-    crate::function_registry::register_function(Arc::new(DVarPFn));
-    crate::function_registry::register_function(Arc::new(DGetFn));
-    crate::function_registry::register_function(Arc::new(DCountAFn));
+    crate::function_registry::register_builtin(Arc::new(DSumFn));
+    crate::function_registry::register_builtin(Arc::new(DAverageFn));
+    crate::function_registry::register_builtin(Arc::new(DCountFn));
+    crate::function_registry::register_builtin(Arc::new(DMaxFn));
+    crate::function_registry::register_builtin(Arc::new(DMinFn));
+    crate::function_registry::register_builtin(Arc::new(DProductFn));
+    crate::function_registry::register_builtin(Arc::new(DStdevFn));
+    crate::function_registry::register_builtin(Arc::new(DStdevPFn));
+    crate::function_registry::register_builtin(Arc::new(DVarFn));
+    crate::function_registry::register_builtin(Arc::new(DVarPFn));
+    crate::function_registry::register_builtin(Arc::new(DGetFn));
+    crate::function_registry::register_builtin(Arc::new(DCountAFn));
 }
 
 #[cfg(test)]

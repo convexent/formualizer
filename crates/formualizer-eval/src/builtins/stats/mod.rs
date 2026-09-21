@@ -5,8 +5,12 @@
 //! PERCENTILE.INC, PERCENTILE.EXC, QUARTILE.INC, QUARTILE.EXC.
 //!
 //! Notes:
-//! - We currently materialize numeric values into a Vec<f64>. For large ranges this could be
-//!   optimized with streaming selection algorithms (nth_element / partial sort). TODO(perf).
+//! - We materialize numeric values into a Vec<f64>. Functions that need only one or two order
+//!   statistics (LARGE, SMALL, MEDIAN, PERCENTILE.INC/.EXC, QUARTILE.INC/.EXC) use quickselect
+//!   (`select_nth_unstable_by`) instead of a full sort. Functions that need the complete sorted
+//!   order keep the sort: RANK.EQ/RANK.AVG (positional scan), MODE.SNGL/MODE.MULT (run-length
+//!   over sorted order), TRIMMEAN (f64 summation order over the sorted middle slice must stay
+//!   bit-identical), PERCENTRANK.INC/.EXC (interpolating scan), FREQUENCY (sorted bins).
 //! - Text/boolean coercion nuance: For Excel statistical functions, values coming from range
 //!   references should ignore text and logical values (they are skipped), while direct scalar
 //!   arguments still coerce (e.g. =STDEV(1,TRUE) treats TRUE as 1). This file now implements that
@@ -18,6 +22,7 @@
 use super::super::builtins::utils::{ARG_RANGE_NUM_LENIENT_ONE, coerce_num};
 use crate::args::ArgSchema;
 use crate::function::Function;
+use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 // use std::collections::BTreeMap; // removed unused import
@@ -25,7 +30,7 @@ use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
-        crate::traits::CalcValue::Scalar(v) => v,
+        crate::traits::CalcValue::Scalar(v) | crate::traits::CalcValue::AnnotatedScalar(v, _) => v,
         crate::traits::CalcValue::Range(rv) => rv.get_cell(0, 0),
         crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
             ExcelError::new(formualizer_common::ExcelErrorKind::Calc)
@@ -62,11 +67,24 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
         }
 
         if let Ok(view) = a.range_view() {
+            let date_system = a.date_system();
             view.for_each_cell(&mut |v| {
                 match v {
                     LiteralValue::Error(e) => return Err(e.clone()),
                     LiteralValue::Number(n) => out.push(*n),
                     LiteralValue::Int(i) => out.push(*i as f64),
+                    // A date cell is a number on the sheet: SUM/AVERAGE/COUNT
+                    // already include it, so dropping it here made MEDIAN,
+                    // STDEV, LARGE, CORREL, ... silently disagree with SUM
+                    // over the very same range.
+                    LiteralValue::Date(_)
+                    | LiteralValue::DateTime(_)
+                    | LiteralValue::Time(_)
+                    | LiteralValue::Duration(_) => {
+                        if let Ok(n) = crate::coercion::to_serial_strict(v, date_system) {
+                            out.push(n);
+                        }
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -86,36 +104,79 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
     Ok(out)
 }
 
-fn percentile_inc(sorted: &[f64], p: f64) -> Result<f64, ExcelError> {
-    if sorted.is_empty() {
+/* ─────────────── order-statistic selection (quickselect) ───────────────
+ *
+ * LARGE/SMALL/MEDIAN and the PERCENTILE/QUARTILE family need at most two
+ * adjacent order statistics, so a full O(n log n) sort is wasted work;
+ * `select_nth_unstable_by` (quickselect) finds them in expected O(n).
+ *
+ * The comparator is byte-for-byte the one used by the full sorts it
+ * replaces (`partial_cmp().unwrap()`): `collect_numeric_stats` only yields
+ * coerced finite numerics, and a NaN would have panicked the old sort the
+ * same way. Ties are exact duplicates for f64s compared `Equal` (modulo
+ * the ±0.0 sign bit), so the selected element is bit-identical to the
+ * sorted element at the same index.
+ */
+
+/// k-th order statistic (0-based, ascending). Reorders `nums` in place.
+fn nth_smallest(nums: &mut [f64], k: usize) -> f64 {
+    let (_, kth, _) = nums.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+    *kth
+}
+
+/// The adjacent order statistics (k, k+1) ascending: one quickselect for k,
+/// then the (k+1)-th is the minimum of the right partition.
+/// Requires `k + 1 < nums.len()`.
+fn adjacent_smallest(nums: &mut [f64], k: usize) -> (f64, f64) {
+    let (_, kth, right) = nums.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+    let kth = *kth;
+    let mut next = right[0];
+    for &v in &right[1..] {
+        if v < next {
+            next = v;
+        }
+    }
+    (kth, next)
+}
+
+/// PERCENTILE.INC over unsorted data (reorders `nums`): rank = p*(n-1) on
+/// the ascending order needs at most the two adjacent order statistics
+/// around the rank. The interpolation formula is unchanged from the old
+/// full-sort implementation.
+fn percentile_inc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
+    if nums.is_empty() {
         return Err(ExcelError::new_num());
     }
     if !(0.0..=1.0).contains(&p) {
         return Err(ExcelError::new_num());
     }
-    if sorted.len() == 1 {
-        return Ok(sorted[0]);
+    if nums.len() == 1 {
+        return Ok(nums[0]);
     }
-    let n = sorted.len() as f64;
+    let n = nums.len() as f64;
     let rank = p * (n - 1.0); // 0-based rank
     let lo = rank.floor() as usize;
     let hi = rank.ceil() as usize;
     if lo == hi {
-        return Ok(sorted[lo]);
+        return Ok(nth_smallest(nums, lo));
     }
+    // hi == lo + 1 whenever rank is fractional.
     let frac = rank - (lo as f64);
-    Ok(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+    let (lo_v, hi_v) = adjacent_smallest(nums, lo);
+    Ok(lo_v + (hi_v - lo_v) * frac)
 }
 
-fn percentile_exc(sorted: &[f64], p: f64) -> Result<f64, ExcelError> {
-    // Excel PERCENTILE.EXC requires 0 < p < 1 and uses (n+1) basis; invalid if rank<1 or >n
-    if sorted.is_empty() {
+/// PERCENTILE.EXC over unsorted data (reorders `nums`); (n+1) rank basis,
+/// invalid when rank < 1 or > n. Same selection strategy as
+/// [`percentile_inc`]; interpolation formula unchanged.
+fn percentile_exc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
+    if nums.is_empty() {
         return Err(ExcelError::new_num());
     }
     if !(0.0..=1.0).contains(&p) || p <= 0.0 || p >= 1.0 {
         return Err(ExcelError::new_num());
     }
-    let n = sorted.len() as f64;
+    let n = nums.len() as f64;
     let rank = p * (n + 1.0); // 1..n domain
     if rank < 1.0 || rank > n {
         return Err(ExcelError::new_num());
@@ -123,12 +184,13 @@ fn percentile_exc(sorted: &[f64], p: f64) -> Result<f64, ExcelError> {
     let lo = rank.floor();
     let hi = rank.ceil();
     if (lo - hi).abs() < f64::EPSILON {
-        return Ok(sorted[(lo as usize) - 1]);
+        return Ok(nth_smallest(nums, (lo as usize) - 1));
     }
+    // hi_idx == lo_idx + 1 whenever rank is fractional.
     let frac = rank - lo;
     let lo_idx = (lo as usize) - 1;
-    let hi_idx = (hi as usize) - 1;
-    Ok(sorted[lo_idx] + (sorted[hi_idx] - sorted[lo_idx]) * frac)
+    let (lo_v, hi_v) = adjacent_smallest(nums, lo_idx);
+    Ok(lo_v + (hi_v - lo_v) * frac)
 }
 
 /// Returns the rank position of a number within a data set, with ties sharing the same rank.
@@ -407,6 +469,7 @@ impl Function for RankAvgFn {
 ///   - q: "When does LARGE return #NUM!?"
 ///     a: "It returns #NUM! when k < 1, k exceeds numeric count, or no numeric values exist."
 /// ```
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
 pub struct LARGE;
 /// [formualizer-docgen:schema:start]
@@ -463,10 +526,10 @@ impl Function for LARGE {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            nums[(k as usize) - 1],
-        )))
+        // k-th largest == (n-k)-th smallest: quickselect instead of full sort.
+        let idx = nums.len() - k as usize;
+        let v = nth_smallest(&mut nums, idx);
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)))
     }
 }
 
@@ -507,6 +570,7 @@ impl Function for LARGE {
 ///   - q: "Does SMALL include text in referenced ranges?"
 ///     a: "No. Non-numeric range values are ignored when selecting the k-th smallest value."
 /// ```
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
 pub struct SMALL;
 /// [formualizer-docgen:schema:start]
@@ -563,10 +627,9 @@ impl Function for SMALL {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            nums[(k as usize) - 1],
-        )))
+        // k-th smallest: quickselect instead of full sort.
+        let v = nth_smallest(&mut nums, k as usize - 1);
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)))
     }
 }
 
@@ -607,6 +670,7 @@ impl Function for SMALL {
 ///   - q: "When does MEDIAN return #NUM!?"
 ///     a: "MEDIAN returns #NUM! when no numeric values are available after filtering/coercion."
 /// ```
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
 pub struct MEDIAN;
 /// [formualizer-docgen:schema:start]
@@ -644,13 +708,14 @@ impl Function for MEDIAN {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Middle one/two order statistics: quickselect instead of full sort.
         let n = nums.len();
         let mid = n / 2;
         let med = if n % 2 == 1 {
-            nums[mid]
+            nth_smallest(&mut nums, mid)
         } else {
-            (nums[mid - 1] + nums[mid]) / 2.0
+            let (lo, hi) = adjacent_smallest(&mut nums, mid - 1);
+            (lo + hi) / 2.0
         };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(med)))
     }
@@ -1177,7 +1242,7 @@ pub struct ModeMultiFn;
 /// Caps: PURE, REDUCTION, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for ModeMultiFn {
-    func_caps!(PURE, NUMERIC_ONLY, REDUCTION);
+    func_caps!(PURE, NUMERIC_ONLY, REDUCTION, MAY_SPILL);
     fn name(&self) -> &'static str {
         "MODE.MULT"
     }
@@ -1322,8 +1387,7 @@ impl Function for PercentileInc {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        match percentile_inc(&nums, p) {
+        match percentile_inc(&mut nums, p) {
             Ok(v) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v))),
             Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         }
@@ -1419,8 +1483,7 @@ impl Function for PercentileExc {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        match percentile_exc(&nums, p) {
+        match percentile_exc(&mut nums, p) {
             Ok(v) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v))),
             Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         }
@@ -1525,17 +1588,15 @@ impl Function for QuartileInc {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p = match q_i {
             0 => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                    nums[0],
-                )));
+                let v = nth_smallest(&mut nums, 0);
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)));
             }
             4 => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                    nums[nums.len() - 1],
-                )));
+                let idx = nums.len() - 1;
+                let v = nth_smallest(&mut nums, idx);
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)));
             }
             1 => 0.25,
             2 => 0.5,
@@ -1546,7 +1607,7 @@ impl Function for QuartileInc {
                 )));
             }
         };
-        match percentile_inc(&nums, p) {
+        match percentile_inc(&mut nums, p) {
             Ok(v) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v))),
             Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         }
@@ -1652,7 +1713,6 @@ impl Function for QuartileExc {
                 ExcelError::new_num(),
             )));
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p = match q_i {
             1 => 0.25,
             2 => 0.5,
@@ -1663,7 +1723,7 @@ impl Function for QuartileExc {
                 )));
             }
         };
-        match percentile_exc(&nums, p) {
+        match percentile_exc(&mut nums, p) {
             Ok(v) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v))),
             Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         }
@@ -1728,6 +1788,9 @@ impl Function for ProductFn {
     }
     fn variadic(&self) -> bool {
         true
+    }
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract::static_reduction(arity, self.min_args())
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
         &ARG_RANGE_NUM_LENIENT_ONE[..]
@@ -2787,24 +2850,45 @@ impl Function for DevsqFn {
 STATISTICAL DISTRIBUTION FUNCTIONS
 ═══════════════════════════════════════════════════════════════════════════ */
 
-/// Helper: Standard normal CDF using error function approximation
+/// Helper: Standard normal CDF, Φ(z)
+///
+/// Hart (1968) algorithm 5666 as given by West (2005), "Better approximations to
+/// cumulative normal functions". Absolute error is about 1e-16 across the real line.
 fn std_norm_cdf(z: f64) -> f64 {
-    // Use the complementary error function: Φ(z) = 0.5 * erfc(-z / sqrt(2))
-    // Approximation using Abramowitz and Stegun formula 7.1.26
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-
-    let sign = if z < 0.0 { -1.0 } else { 1.0 };
-    let z_abs = z.abs() / std::f64::consts::SQRT_2;
-
-    let t = 1.0 / (1.0 + p * z_abs);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-z_abs * z_abs).exp();
-
-    0.5 * (1.0 + sign * y)
+    if z.is_nan() {
+        return f64::NAN;
+    }
+    let a = z.abs();
+    let tail = if a > 37.0 {
+        0.0
+    } else {
+        let e = (-a * a / 2.0).exp();
+        if a < 7.07106781186547 {
+            let mut n = 3.52624965998911e-2 * a + 0.700383064443688;
+            n = n * a + 6.37396220353165;
+            n = n * a + 33.912866078383;
+            n = n * a + 112.079291497871;
+            n = n * a + 221.213596169931;
+            n = n * a + 220.206867912376;
+            let mut d = 8.83883476483184e-2 * a + 1.75566716318264;
+            d = d * a + 16.064177579207;
+            d = d * a + 86.7807322029461;
+            d = d * a + 296.564248779674;
+            d = d * a + 637.333633378831;
+            d = d * a + 793.826512519948;
+            d = d * a + 440.413735824752;
+            e * n / d
+        } else {
+            // Continued fraction for the far tail.
+            let mut b = a + 0.65;
+            b = a + 4.0 / b;
+            b = a + 3.0 / b;
+            b = a + 2.0 / b;
+            b = a + 1.0 / b;
+            e / b / (2.0 * std::f64::consts::PI).sqrt()
+        }
+    };
+    if z > 0.0 { 1.0 - tail } else { tail }
 }
 
 /// Helper: Standard normal PDF
@@ -6078,7 +6162,7 @@ pub struct LinestFn;
 /// Caps: PURE, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for LinestFn {
-    func_caps!(PURE, NUMERIC_ONLY);
+    func_caps!(PURE, NUMERIC_ONLY, MAY_SPILL);
     fn name(&self) -> &'static str {
         "LINEST"
     }
@@ -6655,7 +6739,7 @@ pub struct TrendFn;
 /// Caps: PURE, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for TrendFn {
-    func_caps!(PURE, NUMERIC_ONLY);
+    func_caps!(PURE, NUMERIC_ONLY, MAY_SPILL);
     fn name(&self) -> &'static str {
         "TREND"
     }
@@ -6836,7 +6920,7 @@ pub struct GrowthFn;
 /// Caps: PURE, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for GrowthFn {
-    func_caps!(PURE, NUMERIC_ONLY);
+    func_caps!(PURE, NUMERIC_ONLY, MAY_SPILL);
     fn name(&self) -> &'static str {
         "GROWTH"
     }
@@ -7034,7 +7118,7 @@ pub struct LogestFn;
 /// Caps: PURE, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for LogestFn {
-    func_caps!(PURE, NUMERIC_ONLY);
+    func_caps!(PURE, NUMERIC_ONLY, MAY_SPILL);
     fn name(&self) -> &'static str {
         "LOGEST"
     }
@@ -7598,7 +7682,7 @@ pub struct FrequencyFn;
 /// Caps: PURE, NUMERIC_ONLY
 /// [formualizer-docgen:schema:end]
 impl Function for FrequencyFn {
-    func_caps!(PURE, NUMERIC_ONLY);
+    func_caps!(PURE, NUMERIC_ONLY, MAY_SPILL);
     fn name(&self) -> &'static str {
         "FREQUENCY"
     }
@@ -8292,6 +8376,7 @@ fn collect_numeric_a(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
         }
 
         if let Ok(view) = a.range_view() {
+            let date_system = a.date_system();
             view.for_each_cell(&mut |v| {
                 match v {
                     LiteralValue::Error(e) => return Err(e.clone()),
@@ -8300,6 +8385,16 @@ fn collect_numeric_a(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
                     LiteralValue::Boolean(b) => out.push(if *b { 1.0 } else { 0.0 }),
                     LiteralValue::Text(_) => out.push(0.0),
                     LiteralValue::Empty => {} // skip blanks
+                    // Date-bearing cells are numbers; MAXA/MINA returned 0.0
+                    // over an all-date range before this arm existed.
+                    LiteralValue::Date(_)
+                    | LiteralValue::DateTime(_)
+                    | LiteralValue::Time(_)
+                    | LiteralValue::Duration(_) => {
+                        if let Ok(n) = crate::coercion::to_serial_strict(v, date_system) {
+                            out.push(n);
+                        }
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -9945,109 +10040,109 @@ impl Function for GammaLnPreciseFn {
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(ForecastLinearFn));
-    crate::function_registry::register_function(Arc::new(LinestFn));
-    crate::function_registry::register_function(Arc::new(LARGE));
-    crate::function_registry::register_function(Arc::new(SMALL));
-    crate::function_registry::register_function(Arc::new(MEDIAN));
-    crate::function_registry::register_function(Arc::new(StdevSample));
-    crate::function_registry::register_function(Arc::new(StdevPop));
-    crate::function_registry::register_function(Arc::new(VarSample));
-    crate::function_registry::register_function(Arc::new(VarPop));
-    crate::function_registry::register_function(Arc::new(PercentileInc));
-    crate::function_registry::register_function(Arc::new(PercentileExc));
-    crate::function_registry::register_function(Arc::new(QuartileInc));
-    crate::function_registry::register_function(Arc::new(QuartileExc));
-    crate::function_registry::register_function(Arc::new(RankEqFn));
-    crate::function_registry::register_function(Arc::new(RankAvgFn));
-    crate::function_registry::register_function(Arc::new(ModeSingleFn));
-    crate::function_registry::register_function(Arc::new(ModeMultiFn));
-    crate::function_registry::register_function(Arc::new(ProductFn));
-    crate::function_registry::register_function(Arc::new(GeomeanFn));
-    crate::function_registry::register_function(Arc::new(HarmeanFn));
-    crate::function_registry::register_function(Arc::new(AvedevFn));
-    crate::function_registry::register_function(Arc::new(DevsqFn));
-    crate::function_registry::register_function(Arc::new(MaxIfsFn));
-    crate::function_registry::register_function(Arc::new(MinIfsFn));
-    crate::function_registry::register_function(Arc::new(TrimmeanFn));
-    crate::function_registry::register_function(Arc::new(CorrelFn));
-    crate::function_registry::register_function(Arc::new(SlopeFn));
-    crate::function_registry::register_function(Arc::new(InterceptFn));
+    crate::function_registry::register_builtin(Arc::new(ForecastLinearFn));
+    crate::function_registry::register_builtin(Arc::new(LinestFn));
+    crate::function_registry::register_builtin(Arc::new(LARGE));
+    crate::function_registry::register_builtin(Arc::new(SMALL));
+    crate::function_registry::register_builtin(Arc::new(MEDIAN));
+    crate::function_registry::register_builtin(Arc::new(StdevSample));
+    crate::function_registry::register_builtin(Arc::new(StdevPop));
+    crate::function_registry::register_builtin(Arc::new(VarSample));
+    crate::function_registry::register_builtin(Arc::new(VarPop));
+    crate::function_registry::register_builtin(Arc::new(PercentileInc));
+    crate::function_registry::register_builtin(Arc::new(PercentileExc));
+    crate::function_registry::register_builtin(Arc::new(QuartileInc));
+    crate::function_registry::register_builtin(Arc::new(QuartileExc));
+    crate::function_registry::register_builtin(Arc::new(RankEqFn));
+    crate::function_registry::register_builtin(Arc::new(RankAvgFn));
+    crate::function_registry::register_builtin(Arc::new(ModeSingleFn));
+    crate::function_registry::register_builtin(Arc::new(ModeMultiFn));
+    crate::function_registry::register_builtin(Arc::new(ProductFn));
+    crate::function_registry::register_builtin(Arc::new(GeomeanFn));
+    crate::function_registry::register_builtin(Arc::new(HarmeanFn));
+    crate::function_registry::register_builtin(Arc::new(AvedevFn));
+    crate::function_registry::register_builtin(Arc::new(DevsqFn));
+    crate::function_registry::register_builtin(Arc::new(MaxIfsFn));
+    crate::function_registry::register_builtin(Arc::new(MinIfsFn));
+    crate::function_registry::register_builtin(Arc::new(TrimmeanFn));
+    crate::function_registry::register_builtin(Arc::new(CorrelFn));
+    crate::function_registry::register_builtin(Arc::new(SlopeFn));
+    crate::function_registry::register_builtin(Arc::new(InterceptFn));
     // Covariance and correlation functions
-    crate::function_registry::register_function(Arc::new(CovariancePFn));
-    crate::function_registry::register_function(Arc::new(CovarianceSFn));
-    crate::function_registry::register_function(Arc::new(PearsonFn));
-    crate::function_registry::register_function(Arc::new(RsqFn));
-    crate::function_registry::register_function(Arc::new(SteyxFn));
-    crate::function_registry::register_function(Arc::new(SkewFn));
-    crate::function_registry::register_function(Arc::new(KurtFn));
-    crate::function_registry::register_function(Arc::new(FisherFn));
-    crate::function_registry::register_function(Arc::new(FisherInvFn));
+    crate::function_registry::register_builtin(Arc::new(CovariancePFn));
+    crate::function_registry::register_builtin(Arc::new(CovarianceSFn));
+    crate::function_registry::register_builtin(Arc::new(PearsonFn));
+    crate::function_registry::register_builtin(Arc::new(RsqFn));
+    crate::function_registry::register_builtin(Arc::new(SteyxFn));
+    crate::function_registry::register_builtin(Arc::new(SkewFn));
+    crate::function_registry::register_builtin(Arc::new(KurtFn));
+    crate::function_registry::register_builtin(Arc::new(FisherFn));
+    crate::function_registry::register_builtin(Arc::new(FisherInvFn));
     // Statistical distributions
-    crate::function_registry::register_function(Arc::new(NormSDistFn));
-    crate::function_registry::register_function(Arc::new(NormSInvFn));
-    crate::function_registry::register_function(Arc::new(NormDistFn));
-    crate::function_registry::register_function(Arc::new(NormInvFn));
-    crate::function_registry::register_function(Arc::new(LognormDistFn));
-    crate::function_registry::register_function(Arc::new(LognormInvFn));
-    crate::function_registry::register_function(Arc::new(PhiFn));
-    crate::function_registry::register_function(Arc::new(GaussFn));
-    crate::function_registry::register_function(Arc::new(StandardizeFn));
-    crate::function_registry::register_function(Arc::new(TDistFn));
-    crate::function_registry::register_function(Arc::new(TInvFn));
-    crate::function_registry::register_function(Arc::new(ChisqDistFn));
-    crate::function_registry::register_function(Arc::new(ChisqInvFn));
-    crate::function_registry::register_function(Arc::new(FDistFn));
-    crate::function_registry::register_function(Arc::new(FInvFn));
+    crate::function_registry::register_builtin(Arc::new(NormSDistFn));
+    crate::function_registry::register_builtin(Arc::new(NormSInvFn));
+    crate::function_registry::register_builtin(Arc::new(NormDistFn));
+    crate::function_registry::register_builtin(Arc::new(NormInvFn));
+    crate::function_registry::register_builtin(Arc::new(LognormDistFn));
+    crate::function_registry::register_builtin(Arc::new(LognormInvFn));
+    crate::function_registry::register_builtin(Arc::new(PhiFn));
+    crate::function_registry::register_builtin(Arc::new(GaussFn));
+    crate::function_registry::register_builtin(Arc::new(StandardizeFn));
+    crate::function_registry::register_builtin(Arc::new(TDistFn));
+    crate::function_registry::register_builtin(Arc::new(TInvFn));
+    crate::function_registry::register_builtin(Arc::new(ChisqDistFn));
+    crate::function_registry::register_builtin(Arc::new(ChisqInvFn));
+    crate::function_registry::register_builtin(Arc::new(FDistFn));
+    crate::function_registry::register_builtin(Arc::new(FInvFn));
     // Discrete distributions
-    crate::function_registry::register_function(Arc::new(BinomDistFn));
-    crate::function_registry::register_function(Arc::new(PoissonDistFn));
-    crate::function_registry::register_function(Arc::new(ExponDistFn));
-    crate::function_registry::register_function(Arc::new(GammaDistFn));
+    crate::function_registry::register_builtin(Arc::new(BinomDistFn));
+    crate::function_registry::register_builtin(Arc::new(PoissonDistFn));
+    crate::function_registry::register_builtin(Arc::new(ExponDistFn));
+    crate::function_registry::register_builtin(Arc::new(GammaDistFn));
     // Additional distributions
-    crate::function_registry::register_function(Arc::new(WeibullDistFn));
-    crate::function_registry::register_function(Arc::new(BetaDistFn));
-    crate::function_registry::register_function(Arc::new(NegbinomDistFn));
-    crate::function_registry::register_function(Arc::new(HypgeomDistFn));
+    crate::function_registry::register_builtin(Arc::new(WeibullDistFn));
+    crate::function_registry::register_builtin(Arc::new(BetaDistFn));
+    crate::function_registry::register_builtin(Arc::new(NegbinomDistFn));
+    crate::function_registry::register_builtin(Arc::new(HypgeomDistFn));
     // Confidence intervals and hypothesis testing
-    crate::function_registry::register_function(Arc::new(ConfidenceNormFn));
-    crate::function_registry::register_function(Arc::new(ConfidenceTFn));
-    crate::function_registry::register_function(Arc::new(ZTestFn));
+    crate::function_registry::register_builtin(Arc::new(ConfidenceNormFn));
+    crate::function_registry::register_builtin(Arc::new(ConfidenceTFn));
+    crate::function_registry::register_builtin(Arc::new(ZTestFn));
     // Regression and trend functions
-    crate::function_registry::register_function(Arc::new(TrendFn));
-    crate::function_registry::register_function(Arc::new(GrowthFn));
-    crate::function_registry::register_function(Arc::new(LogestFn));
+    crate::function_registry::register_builtin(Arc::new(TrendFn));
+    crate::function_registry::register_builtin(Arc::new(GrowthFn));
+    crate::function_registry::register_builtin(Arc::new(LogestFn));
     // Percent rank and frequency functions
-    crate::function_registry::register_function(Arc::new(PercentRankIncFn));
-    crate::function_registry::register_function(Arc::new(PercentRankExcFn));
-    crate::function_registry::register_function(Arc::new(FrequencyFn));
+    crate::function_registry::register_builtin(Arc::new(PercentRankIncFn));
+    crate::function_registry::register_builtin(Arc::new(PercentRankExcFn));
+    crate::function_registry::register_builtin(Arc::new(FrequencyFn));
     // Hypothesis testing functions
-    crate::function_registry::register_function(Arc::new(TDist2TFn));
-    crate::function_registry::register_function(Arc::new(TInv2TFn));
-    crate::function_registry::register_function(Arc::new(TTestFn));
-    crate::function_registry::register_function(Arc::new(FTestFn));
-    crate::function_registry::register_function(Arc::new(ChisqTestFn));
+    crate::function_registry::register_builtin(Arc::new(TDist2TFn));
+    crate::function_registry::register_builtin(Arc::new(TInv2TFn));
+    crate::function_registry::register_builtin(Arc::new(TTestFn));
+    crate::function_registry::register_builtin(Arc::new(FTestFn));
+    crate::function_registry::register_builtin(Arc::new(ChisqTestFn));
     // FZ-PAR-01 batch
-    crate::function_registry::register_function(Arc::new(AverageAFn));
-    crate::function_registry::register_function(Arc::new(MaxAFn));
-    crate::function_registry::register_function(Arc::new(MinAFn));
-    crate::function_registry::register_function(Arc::new(StdevAFn));
-    crate::function_registry::register_function(Arc::new(StdevPAFn));
-    crate::function_registry::register_function(Arc::new(VarAFn));
-    crate::function_registry::register_function(Arc::new(VarPAFn));
-    crate::function_registry::register_function(Arc::new(SkewPFn));
-    crate::function_registry::register_function(Arc::new(TDistRtFn));
-    crate::function_registry::register_function(Arc::new(ChisqDistRtFn));
-    crate::function_registry::register_function(Arc::new(ChisqInvRtFn));
-    crate::function_registry::register_function(Arc::new(FDistRtFn));
-    crate::function_registry::register_function(Arc::new(FInvRtFn));
-    crate::function_registry::register_function(Arc::new(BetaInvFn));
-    crate::function_registry::register_function(Arc::new(BinomDistRangeFn));
-    crate::function_registry::register_function(Arc::new(BinomInvFn));
-    crate::function_registry::register_function(Arc::new(GammaFn));
-    crate::function_registry::register_function(Arc::new(GammaInvFn));
-    crate::function_registry::register_function(Arc::new(GammaLnFn));
-    crate::function_registry::register_function(Arc::new(GammaLnPreciseFn));
+    crate::function_registry::register_builtin(Arc::new(AverageAFn));
+    crate::function_registry::register_builtin(Arc::new(MaxAFn));
+    crate::function_registry::register_builtin(Arc::new(MinAFn));
+    crate::function_registry::register_builtin(Arc::new(StdevAFn));
+    crate::function_registry::register_builtin(Arc::new(StdevPAFn));
+    crate::function_registry::register_builtin(Arc::new(VarAFn));
+    crate::function_registry::register_builtin(Arc::new(VarPAFn));
+    crate::function_registry::register_builtin(Arc::new(SkewPFn));
+    crate::function_registry::register_builtin(Arc::new(TDistRtFn));
+    crate::function_registry::register_builtin(Arc::new(ChisqDistRtFn));
+    crate::function_registry::register_builtin(Arc::new(ChisqInvRtFn));
+    crate::function_registry::register_builtin(Arc::new(FDistRtFn));
+    crate::function_registry::register_builtin(Arc::new(FInvRtFn));
+    crate::function_registry::register_builtin(Arc::new(BetaInvFn));
+    crate::function_registry::register_builtin(Arc::new(BinomDistRangeFn));
+    crate::function_registry::register_builtin(Arc::new(BinomInvFn));
+    crate::function_registry::register_builtin(Arc::new(GammaFn));
+    crate::function_registry::register_builtin(Arc::new(GammaInvFn));
+    crate::function_registry::register_builtin(Arc::new(GammaLnFn));
+    crate::function_registry::register_builtin(Arc::new(GammaLnPreciseFn));
 }
 
 #[cfg(test)]
@@ -10067,6 +10162,47 @@ mod tests_basic_stats {
             ])),
             None,
         )
+    }
+    #[test]
+    fn std_norm_cdf_is_double_precision() {
+        // Regression for #458: the A&S 7.1.26 approximation was only good to ~7e-8.
+        // Reference values are Φ(z) = erfc(-z/√2)/2 evaluated in double precision.
+        assert_eq!(std_norm_cdf(0.0), 0.5);
+        for (z, expected) in [
+            (0.5, 0.6914624612740131),
+            (1.0, 0.8413447460685429),
+            (1.96, 0.9750021048517795),
+            (2.0, 0.9772498680518208),
+            (-2.0, 0.022750131948179216),
+            (3.0, 0.9986501019683699),
+            (-3.0, 0.0013498980316300957),
+            (7.1, 0.9999999999993762),
+        ] {
+            let got = std_norm_cdf(z);
+            assert!(
+                (got - expected).abs() < 1e-15,
+                "Φ({z}) = {got} != {expected}"
+            );
+        }
+        // Tails, including both sides of the |z| ≈ 7.07 branch switch. Hart/West is
+        // accurate in absolute terms; relative error in the far tail is only ~1e-8.
+        for (z, expected) in [
+            (-5.0, 2.8665157187919455e-07),
+            (-7.0, 1.279812543885835e-12),
+            (-7.1, 6.23784446333164e-13),
+            (-8.0, 6.22096057427182e-16),
+            (-10.0, 7.619853024160595e-24),
+            (-37.0, 5.725571222525139e-300),
+        ] {
+            let got = std_norm_cdf(z);
+            assert!(
+                (got - expected).abs() < 1e-16,
+                "Φ({z}) = {got} != {expected}"
+            );
+        }
+        assert_eq!(std_norm_cdf(-38.0), 0.0);
+        assert_eq!(std_norm_cdf(38.0), 1.0);
+        assert!(std_norm_cdf(f64::NAN).is_nan());
     }
     #[test]
     fn median_even() {
@@ -10876,5 +11012,223 @@ mod tests_basic_stats {
             .unwrap()
             .into_literal();
         assert_eq!(out, LiteralValue::Number(0.0));
+    }
+}
+
+#[cfg(test)]
+mod tests_selection_vs_sort_oracle {
+    //! Property tests: the quickselect paths must be bit-identical to the
+    //! previous full-sort implementations (the "oracle" below reproduces the
+    //! removed sort-based code exactly).
+
+    use super::*;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
+    /* ───── full-sort reference oracle (the pre-quickselect implementation) ───── */
+
+    fn sorted_asc(data: &[f64]) -> Vec<f64> {
+        let mut s = data.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s
+    }
+
+    fn oracle_large(data: &[f64], k: usize) -> f64 {
+        let mut s = data.to_vec();
+        s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        s[k - 1]
+    }
+
+    fn oracle_small(data: &[f64], k: usize) -> f64 {
+        sorted_asc(data)[k - 1]
+    }
+
+    fn oracle_median(data: &[f64]) -> f64 {
+        let s = sorted_asc(data);
+        let n = s.len();
+        let mid = n / 2;
+        if n % 2 == 1 {
+            s[mid]
+        } else {
+            (s[mid - 1] + s[mid]) / 2.0
+        }
+    }
+
+    fn oracle_percentile_inc(data: &[f64], p: f64) -> Result<f64, ExcelError> {
+        let sorted = sorted_asc(data);
+        if sorted.is_empty() || !(0.0..=1.0).contains(&p) {
+            return Err(ExcelError::new_num());
+        }
+        if sorted.len() == 1 {
+            return Ok(sorted[0]);
+        }
+        let n = sorted.len() as f64;
+        let rank = p * (n - 1.0);
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        if lo == hi {
+            return Ok(sorted[lo]);
+        }
+        let frac = rank - (lo as f64);
+        Ok(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+    }
+
+    fn oracle_percentile_exc(data: &[f64], p: f64) -> Result<f64, ExcelError> {
+        let sorted = sorted_asc(data);
+        if sorted.is_empty() || !(0.0..=1.0).contains(&p) || p <= 0.0 || p >= 1.0 {
+            return Err(ExcelError::new_num());
+        }
+        let n = sorted.len() as f64;
+        let rank = p * (n + 1.0);
+        if rank < 1.0 || rank > n {
+            return Err(ExcelError::new_num());
+        }
+        let lo = rank.floor();
+        let hi = rank.ceil();
+        if (lo - hi).abs() < f64::EPSILON {
+            return Ok(sorted[(lo as usize) - 1]);
+        }
+        let frac = rank - lo;
+        let lo_idx = (lo as usize) - 1;
+        let hi_idx = (hi as usize) - 1;
+        Ok(sorted[lo_idx] + (sorted[hi_idx] - sorted[lo_idx]) * frac)
+    }
+
+    fn assert_bits_eq(new: f64, old: f64, what: &str, data: &[f64]) {
+        assert_eq!(
+            new.to_bits(),
+            old.to_bits(),
+            "{what}: selection {new:?} != sort oracle {old:?} for {data:?}"
+        );
+    }
+
+    /// 1000 seeded random vectors (mixed continuous values and a small grid
+    /// to force exact-duplicate ties) x random k / percentile.
+    #[test]
+    fn quickselect_paths_match_full_sort_oracle_bitwise() {
+        let mut rng = SmallRng::seed_from_u64(0x5EED_57A7_u64);
+        for _case in 0..1000 {
+            let n = rng.gen_range(1..=64);
+            let data: Vec<f64> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.35) {
+                        // Tie-heavy grid: exact duplicates are common.
+                        f64::from(rng.gen_range(-4i32..=4)) * 0.5
+                    } else {
+                        rng.gen_range(-1.0e6..1.0e6)
+                    }
+                })
+                .collect();
+
+            // LARGE / SMALL across every k (includes k == 1 and k == n).
+            for k in 1..=n {
+                let mut buf = data.clone();
+                let idx = buf.len() - k;
+                assert_bits_eq(
+                    nth_smallest(&mut buf, idx),
+                    oracle_large(&data, k),
+                    "LARGE",
+                    &data,
+                );
+                let mut buf = data.clone();
+                assert_bits_eq(
+                    nth_smallest(&mut buf, k - 1),
+                    oracle_small(&data, k),
+                    "SMALL",
+                    &data,
+                );
+            }
+
+            // MEDIAN (odd and even n both covered across cases).
+            {
+                let mut buf = data.clone();
+                let mid = buf.len() / 2;
+                let med = if buf.len() % 2 == 1 {
+                    nth_smallest(&mut buf, mid)
+                } else if buf.len() >= 2 {
+                    let (lo, hi) = adjacent_smallest(&mut buf, mid - 1);
+                    (lo + hi) / 2.0
+                } else {
+                    buf[0]
+                };
+                assert_bits_eq(med, oracle_median(&data), "MEDIAN", &data);
+            }
+
+            // PERCENTILE.INC / .EXC with random p, plus the exact endpoints
+            // and quartile points (0.25/0.5/0.75 also covers QUARTILE.*).
+            let ps = [
+                rng.r#gen::<f64>(),
+                0.0,
+                0.25,
+                0.5,
+                0.75,
+                1.0,
+                rng.gen_range(-0.5..1.5), // sometimes out of range
+            ];
+            for p in ps {
+                let mut buf = data.clone();
+                match (percentile_inc(&mut buf, p), oracle_percentile_inc(&data, p)) {
+                    (Ok(a), Ok(b)) => assert_bits_eq(a, b, "PERCENTILE.INC", &data),
+                    (Err(ea), Err(eb)) => assert_eq!(ea.kind, eb.kind),
+                    (a, b) => panic!("PERCENTILE.INC divergence p={p}: {a:?} vs {b:?}"),
+                }
+                let mut buf = data.clone();
+                match (percentile_exc(&mut buf, p), oracle_percentile_exc(&data, p)) {
+                    (Ok(a), Ok(b)) => assert_bits_eq(a, b, "PERCENTILE.EXC", &data),
+                    (Err(ea), Err(eb)) => assert_eq!(ea.kind, eb.kind),
+                    (a, b) => panic!("PERCENTILE.EXC divergence p={p}: {a:?} vs {b:?}"),
+                }
+            }
+        }
+    }
+
+    /// Empty input keeps the error contract.
+    #[test]
+    fn percentile_empty_input_still_num_error() {
+        let mut empty: Vec<f64> = vec![];
+        assert!(percentile_inc(&mut empty, 0.5).is_err());
+        assert!(percentile_exc(&mut empty, 0.5).is_err());
+    }
+
+    /// Perf probe (run explicitly):
+    /// `cargo test -p formualizer-eval --release --lib large_quickselect_perf_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf probe; run manually with --release --nocapture"]
+    fn large_quickselect_perf_probe() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let data: Vec<f64> = (0..100_000).map(|_| rng.gen_range(-1.0e9..1.0e9)).collect();
+        let k = 50usize;
+        let rounds = 50u32;
+
+        let t = std::time::Instant::now();
+        let mut old_v = 0.0;
+        for _ in 0..rounds {
+            let mut s = data.clone();
+            s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            old_v = s[k - 1];
+        }
+        let old_t = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let mut new_v = 0.0;
+        for _ in 0..rounds {
+            let mut s = data.clone();
+            let idx = s.len() - k;
+            new_v = nth_smallest(&mut s, idx);
+        }
+        let new_t = t.elapsed();
+
+        println!(
+            "LARGE over 100k x{rounds}: full-sort {:?} ({:?}/op), quickselect {:?} ({:?}/op)",
+            old_t,
+            old_t / rounds,
+            new_t,
+            new_t / rounds
+        );
+        assert_eq!(new_v.to_bits(), old_v.to_bits());
+        assert!(
+            new_t < old_t,
+            "quickselect should beat a full sort on 100k values"
+        );
     }
 }

@@ -6,11 +6,11 @@
 //! - ChangeLogger: Trait for pluggable logging strategies
 
 use crate::SheetId;
+use crate::engine::addr::GridAddr;
 use crate::engine::named_range::{NameScope, NamedDefinition};
 use crate::engine::row_visibility::RowVisibilitySource;
 use crate::engine::vertex::VertexId;
 use crate::reference::CellRef;
-use formualizer_common::Coord as AbsCoord;
 use formualizer_common::LiteralValue;
 use formualizer_parse::parser::ASTNode;
 
@@ -59,7 +59,7 @@ pub enum ChangeEvent {
     /// Vertex creation snapshot (for undo). Minimal for now.
     AddVertex {
         id: VertexId,
-        coord: AbsCoord,
+        coord: GridAddr,
         sheet_id: SheetId,
         value: Option<LiteralValue>,
         formula: Option<ASTNode>,
@@ -73,7 +73,7 @@ pub enum ChangeEvent {
         old_formula: Option<ASTNode>,
         old_dependencies: Vec<VertexId>, // outgoing
         old_dependents: Vec<VertexId>,   // incoming
-        coord: Option<AbsCoord>,
+        coord: Option<GridAddr>,
         sheet_id: Option<SheetId>,
         kind: Option<crate::engine::vertex::VertexKind>,
         flags: Option<u8>,
@@ -92,8 +92,8 @@ pub enum ChangeEvent {
     VertexMoved {
         id: VertexId,
         sheet_id: SheetId,
-        old_coord: AbsCoord,
-        new_coord: AbsCoord,
+        old_coord: GridAddr,
+        new_coord: GridAddr,
     },
     FormulaAdjusted {
         id: VertexId,
@@ -145,10 +145,25 @@ pub enum ChangeEvent {
         anchor: VertexId,
         old: SpillSnapshot,
     },
-    /// Workbook-level staged formula snapshot used to keep deferred edits undoable.
-    StagedFormulaStateChanged {
-        before: Vec<(String, u32, u32, String)>,
-        after: Vec<(String, u32, u32, String)>,
+    /// Workbook-level per-cell staged formula delta used to keep deferred edits
+    /// undoable.
+    ///
+    /// Replaces the former `StagedFormulaStateChanged` full before/after snapshot
+    /// pair (which made interactive `set_formula` O(N) per edit and O(N^2) in
+    /// changelog memory — see #126). Each edit records only the affected cell's
+    /// staged text transition, so a sequence of N edits costs O(N) total.
+    ///
+    /// - `old`: the staged formula text for the cell before the edit, if any.
+    /// - `new`: the staged formula text for the cell after the edit, if any.
+    ///
+    /// Undo restores `old` (re-stage if `Some`, clear if `None`); redo applies
+    /// `new` (re-stage if `Some`, clear if `None`).
+    StagedFormulaCellChanged {
+        sheet: String,
+        row: u32,
+        col: u32,
+        old: Option<String>,
+        new: Option<String>,
     },
 }
 
@@ -172,6 +187,71 @@ pub struct ChangeLog {
     next_group_id: u64,
 
     current_meta: ChangeEventMeta,
+}
+
+/// Complete, operation-local mutation capture used by `Engine` correctness paths.
+///
+/// Unlike `ChangeLog`, this sink is always enabled and never evicts. It is crate-private so
+/// audit retention remains a property of `ChangeLog`, not of graph mutation.
+#[derive(Debug)]
+pub(crate) struct MutationCapture {
+    events: Vec<ChangeEvent>,
+    compound_depth: usize,
+    current_meta: ChangeEventMeta,
+}
+
+impl MutationCapture {
+    pub(crate) fn new(current_meta: ChangeEventMeta) -> Self {
+        Self {
+            events: Vec::new(),
+            compound_depth: 0,
+            current_meta,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub(crate) fn events(&self) -> &[ChangeEvent] {
+        &self.events
+    }
+
+    pub(crate) fn close_compounds(&mut self) {
+        while self.compound_depth > 0 {
+            self.end_compound();
+        }
+    }
+
+    fn push(&mut self, event: ChangeEvent) {
+        self.events.push(event);
+    }
+}
+
+impl ChangeLogger for MutationCapture {
+    fn record(&mut self, event: ChangeEvent) {
+        self.push(event);
+    }
+
+    fn set_enabled(&mut self, _: bool) {}
+
+    fn begin_compound(&mut self, description: String) {
+        self.compound_depth += 1;
+        self.push(ChangeEvent::CompoundStart {
+            description,
+            depth: self.compound_depth,
+        });
+    }
+
+    fn end_compound(&mut self) {
+        if self.compound_depth == 0 {
+            return;
+        }
+        self.push(ChangeEvent::CompoundEnd {
+            depth: self.compound_depth,
+        });
+        self.compound_depth -= 1;
+    }
 }
 
 impl ChangeLog {
@@ -207,7 +287,7 @@ impl ChangeLog {
             return;
         };
         if max == 0 {
-            self.clear();
+            self.clear_retained();
             return;
         }
         if self.events.len() <= max {
@@ -218,6 +298,90 @@ impl ChangeLog {
         self.metas.drain(0..drop_n);
         self.seqs.drain(0..drop_n);
         self.groups.drain(0..drop_n);
+    }
+
+    fn clear_retained(&mut self) {
+        self.events.clear();
+        self.metas.clear();
+        self.seqs.clear();
+        self.groups.clear();
+    }
+
+    fn replay_record(&mut self, event: ChangeEvent, meta: &ChangeEventMeta, retain: bool) {
+        if !self.enabled {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if retain {
+            self.events.push(event);
+            self.metas.push(meta.clone());
+            self.seqs.push(seq);
+            self.groups.push(self.group_stack.last().copied());
+        }
+    }
+
+    fn replay_begin_compound(&mut self, description: String, meta: &ChangeEventMeta, retain: bool) {
+        self.compound_depth += 1;
+        if self.compound_depth == 1 {
+            let gid = self.next_group_id;
+            self.next_group_id += 1;
+            self.group_stack.push(gid);
+        } else if let Some(&gid) = self.group_stack.last() {
+            self.group_stack.push(gid);
+        }
+        self.replay_record(
+            ChangeEvent::CompoundStart {
+                description,
+                depth: self.compound_depth,
+            },
+            meta,
+            retain,
+        );
+    }
+
+    fn replay_end_compound(&mut self, meta: &ChangeEventMeta, retain: bool) {
+        if self.compound_depth == 0 {
+            return;
+        }
+        self.replay_record(
+            ChangeEvent::CompoundEnd {
+                depth: self.compound_depth,
+            },
+            meta,
+            retain,
+        );
+        self.compound_depth -= 1;
+        self.group_stack.pop();
+    }
+
+    fn replay_capture(&mut self, capture: MutationCapture, retain: bool) {
+        for event in capture.events {
+            match event {
+                ChangeEvent::CompoundStart { description, .. } => {
+                    self.replay_begin_compound(description, &capture.current_meta, retain);
+                }
+                ChangeEvent::CompoundEnd { .. } => {
+                    self.replay_end_compound(&capture.current_meta, retain);
+                }
+                event => self.replay_record(event, &capture.current_meta, retain),
+            }
+        }
+        if retain {
+            self.enforce_cap();
+        }
+    }
+
+    pub(crate) fn current_meta(&self) -> ChangeEventMeta {
+        self.current_meta.clone()
+    }
+
+    pub(crate) fn publish_capture(&mut self, capture: MutationCapture) {
+        self.replay_capture(capture, true);
+    }
+
+    pub(crate) fn discard_capture(&mut self, capture: MutationCapture) {
+        self.replay_capture(capture, false);
     }
 
     pub fn record(&mut self, event: ChangeEvent) {
@@ -286,42 +450,6 @@ impl ChangeLog {
         &self.events
     }
 
-    pub fn patch_last_cell_event_old_state(
-        &mut self,
-        addr: CellRef,
-        old_value: Option<LiteralValue>,
-        old_formula: Option<ASTNode>,
-    ) {
-        // Walk backwards to find the most recent SetValue/SetFormula for this cell.
-        // This is used by Arrow-canonical callers that must capture old_value/old_formula
-        // from Arrow truth (graph value cache may be disabled).
-        for ev in self.events.iter_mut().rev() {
-            match ev {
-                ChangeEvent::SetValue {
-                    addr: a,
-                    old_value: ov,
-                    old_formula: of,
-                    ..
-                }
-                | ChangeEvent::SetFormula {
-                    addr: a,
-                    old_value: ov,
-                    old_formula: of,
-                    ..
-                } if *a == addr => {
-                    if ov.is_none() {
-                        *ov = old_value;
-                    }
-                    if of.is_none() {
-                        *of = old_formula;
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-
     pub fn event_meta(&self, index: usize) -> Option<&ChangeEventMeta> {
         self.metas.get(index)
     }
@@ -347,10 +475,7 @@ impl ChangeLog {
     }
 
     pub fn clear(&mut self) {
-        self.events.clear();
-        self.metas.clear();
-        self.seqs.clear();
-        self.groups.clear();
+        self.clear_retained();
         self.compound_depth = 0;
         self.group_stack.clear();
     }

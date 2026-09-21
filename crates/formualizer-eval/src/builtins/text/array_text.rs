@@ -4,7 +4,7 @@
 //! VALUETOTEXT: Converts a value to text representation
 //! ARRAYTOTEXT: Converts an array to text representation
 
-use super::super::utils::collapse_if_scalar;
+use super::{super::utils::collapse_if_scalar, scalar_text_value};
 use crate::args::{ArgSchema, ShapeKind};
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
@@ -13,7 +13,7 @@ use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
-        CalcValue::Scalar(v) => v,
+        CalcValue::Scalar(v) | CalcValue::AnnotatedScalar(v, _) => v,
         CalcValue::Range(rv) => rv.get_cell(0, 0),
         CalcValue::Callable(_) => LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
@@ -42,9 +42,9 @@ fn coerce_text(v: &LiteralValue) -> String {
 
 /// Get delimiters from an argument (can be single value or array)
 fn get_delimiters(arg: &ArgumentHandle<'_, '_>) -> Result<Vec<String>, ExcelError> {
-    let cv = arg.value()?;
+    let cv = arg.value_for_text()?;
     match cv {
-        CalcValue::Scalar(v) => match v {
+        CalcValue::Scalar(v) | CalcValue::AnnotatedScalar(v, _) => match v {
             LiteralValue::Error(e) => Err(e),
             LiteralValue::Array(arr) => {
                 let mut delims = Vec::new();
@@ -271,7 +271,7 @@ pub struct TextSplitFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TextSplitFn {
-    func_caps!(PURE);
+    func_caps!(PURE, MAY_SPILL);
 
     fn name(&self) -> &'static str {
         "TEXTSPLIT"
@@ -293,7 +293,7 @@ impl Function for TextSplitFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Get text to split
-        let text_val = scalar_like_value(&args[0])?;
+        let text_val = scalar_text_value(&args[0])?;
         let text = match text_val {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
@@ -305,7 +305,7 @@ impl Function for TextSplitFn {
         // Get optional row delimiters
         let row_delimiters = if args.len() > 2 {
             // Check if row_delimiter argument is provided and not omitted
-            let val = scalar_like_value(&args[2])?;
+            let val = scalar_text_value(&args[2])?;
             match val {
                 LiteralValue::Empty => vec![],
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
@@ -545,7 +545,7 @@ impl Function for ValueToTextFn {
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         // Get value
-        let value = scalar_like_value(&args[0])?;
+        let value = scalar_text_value(&args[0])?;
 
         // Get format (0=concise, 1=strict)
         let format = if args.len() > 1 {
@@ -702,7 +702,7 @@ impl Function for ArrayToTextFn {
             }
             result
         } else {
-            let cv = args[0].value()?;
+            let cv = args[0].value_for_text()?;
             match cv.into_literal() {
                 LiteralValue::Array(arr) => arr,
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
@@ -741,12 +741,12 @@ impl Function for ArrayToTextFn {
 // ============================================================================
 
 pub fn register_builtins() {
-    use crate::function_registry::register_function;
+    use crate::function_registry::register_builtin;
     use std::sync::Arc;
 
-    register_function(Arc::new(TextSplitFn));
-    register_function(Arc::new(ValueToTextFn));
-    register_function(Arc::new(ArrayToTextFn));
+    register_builtin(Arc::new(TextSplitFn));
+    register_builtin(Arc::new(ValueToTextFn));
+    register_builtin(Arc::new(ArrayToTextFn));
 }
 
 // ============================================================================

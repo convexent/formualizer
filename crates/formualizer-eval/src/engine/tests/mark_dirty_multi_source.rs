@@ -11,7 +11,7 @@
 //! Work is asserted via `dirty_propagation_visits` (BFS visit counts), never
 //! wall time.
 
-use crate::engine::{DependencyGraph, Engine, EvalConfig, VertexId};
+use crate::engine::{CycleConfig, DependencyGraph, Engine, EvalConfig, VertexId};
 use crate::test_workbook::TestWorkbook;
 use formualizer_parse::parser::parse;
 
@@ -68,11 +68,35 @@ fn volatile_redirty_is_one_component_walk_not_one_per_volatile() {
     );
 }
 
-// NOTE: upstream's `iterative_scc_redirty_is_one_component_walk` test was
-// dropped here — it depends on `CycleConfig::iterate` / `EvalConfig::with_cycle`
-// (upstream's iterative-calculation feature, RFC #113), which this fork does
-// not carry at 0.5.11. Re-add it when the fork syncs the iterative-calc path.
-// (convexent/supermod#2148)
+/* ───────────── iterative-SCC redirty stays one walk (no dirty-flag lean) ─ */
+
+#[test]
+fn iterative_scc_redirty_is_one_component_walk() {
+    // 400-member ring: the per-recalc iterative redirty marks all members.
+    // With the multi-source walk this is ~400 visits, independent of any
+    // dirty-flag state left behind by other marking paths.
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig::iterate(100, 0.001)),
+    );
+    let size = 400u32;
+    set_formula(&mut engine, "Sheet1", 1, 1, &format!("=0.5*A{size}+1"));
+    for r in 2..=size {
+        set_formula(&mut engine, "Sheet1", r, 1, &format!("=A{}", r - 1));
+    }
+
+    engine.evaluate_all().unwrap();
+    let after_first = engine.graph.dirty_propagation_visits();
+    engine.evaluate_all().unwrap();
+    let delta = engine.graph.dirty_propagation_visits() - after_first;
+
+    assert!(
+        delta <= 3 * size as u64,
+        "stable-ring recalc redirty must be ~one component walk \
+         (≈{size} visits), got {delta} (quadratic was ≥ {})",
+        (size as u64) * (size as u64) / 2
+    );
+}
 
 /* ───────────── union semantics: multi-source == N single-source calls ─── */
 

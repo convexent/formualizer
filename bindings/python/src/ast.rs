@@ -5,6 +5,7 @@ use formualizer::parse::parser::{ASTNode, ASTNodeType};
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+#[cfg(not(target_os = "emscripten"))]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 type PyObject = pyo3::Py<pyo3::PyAny>;
@@ -23,8 +24,12 @@ type PyObject = pyo3::Py<pyo3::PyAny>;
 ///     for ref in ast.walk_refs():
 ///         print(ref)
 /// ```
-#[gen_stub_pyclass]
-#[pyclass(module = "formualizer", name = "ASTNode")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass)]
+#[pyclass(
+    module = "formualizer.formualizer_py",
+    name = "ASTNode",
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyASTNode {
     inner: ASTNode,
@@ -36,7 +41,7 @@ impl PyASTNode {
     }
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyASTNode {
     /// Get the pretty-printed representation of this AST
@@ -91,7 +96,7 @@ impl PyASTNode {
     }
 
     /// Convert AST to a dictionary representation
-    fn to_dict(&self, py: Python<'_>) -> PyObject {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         self.node_to_dict(py, &self.inner)
     }
 
@@ -99,6 +104,7 @@ impl PyASTNode {
     fn node_type(&self) -> String {
         match &self.inner.node_type {
             ASTNodeType::Literal(_) => "Literal".to_string(),
+            ASTNodeType::Omitted => "Omitted".to_string(),
             ASTNodeType::Reference { .. } => "Reference".to_string(),
             ASTNodeType::UnaryOp { .. } => "UnaryOp".to_string(),
             ASTNodeType::BinaryOp { .. } => "BinaryOp".to_string(),
@@ -109,10 +115,10 @@ impl PyASTNode {
     }
 
     /// Get the value for literal nodes
-    fn get_literal_value(&self, py: Python<'_>) -> Option<PyObject> {
+    fn get_literal_value(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         match &self.inner.node_type {
-            ASTNodeType::Literal(value) => Some(self.literal_value_to_py(py, value)),
-            _ => None,
+            ASTNodeType::Literal(value) => Ok(Some(self.literal_value_to_py(py, value)?)),
+            _ => Ok(None),
         }
     }
 
@@ -179,6 +185,7 @@ impl PyASTNode {
                     self.format_literal_value(value)
                 )
             }
+            ASTNodeType::Omitted => format!("{indent_str}Omitted"),
             ASTNodeType::Reference { original, .. } => {
                 format!("{indent_str}Reference({original})")
             }
@@ -293,46 +300,42 @@ impl PyASTNode {
         }
     }
 
-    fn node_to_dict(&self, py: Python<'_>, node: &ASTNode) -> PyObject {
+    fn node_to_dict(&self, py: Python<'_>, node: &ASTNode) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
-        dict.set_item("node_type", self.node_type()).unwrap();
+        dict.set_item("node_type", self.node_type())?;
 
         match &node.node_type {
             ASTNodeType::Literal(value) => {
-                dict.set_item("value", self.literal_value_to_py(py, value))
-                    .unwrap();
+                dict.set_item("value", self.literal_value_to_py(py, value)?)?;
             }
+            ASTNodeType::Omitted => {}
             ASTNodeType::Reference { original, .. } => {
-                dict.set_item("reference", original).unwrap();
+                dict.set_item("reference", original)?;
             }
             ASTNodeType::UnaryOp { op, expr } => {
-                dict.set_item("operator", op).unwrap();
-                dict.set_item("operand", PyASTNode::new((**expr).clone()).to_dict(py))
-                    .unwrap();
+                dict.set_item("operator", op)?;
+                dict.set_item("operand", PyASTNode::new((**expr).clone()).to_dict(py)?)?;
             }
             ASTNodeType::BinaryOp { op, left, right } => {
-                dict.set_item("operator", op).unwrap();
-                dict.set_item("left", PyASTNode::new((**left).clone()).to_dict(py))
-                    .unwrap();
-                dict.set_item("right", PyASTNode::new((**right).clone()).to_dict(py))
-                    .unwrap();
+                dict.set_item("operator", op)?;
+                dict.set_item("left", PyASTNode::new((**left).clone()).to_dict(py)?)?;
+                dict.set_item("right", PyASTNode::new((**right).clone()).to_dict(py)?)?;
             }
             ASTNodeType::Function { name, args } => {
-                dict.set_item("name", name).unwrap();
+                dict.set_item("name", name)?;
                 let py_args: Vec<PyObject> = args
                     .iter()
                     .map(|arg| PyASTNode::new(arg.clone()).to_dict(py))
-                    .collect();
-                dict.set_item("args", py_args).unwrap();
+                    .collect::<PyResult<Vec<_>>>()?;
+                dict.set_item("args", py_args)?;
             }
             ASTNodeType::Call { callee, args } => {
-                dict.set_item("callee", PyASTNode::new((**callee).clone()).to_dict(py))
-                    .unwrap();
+                dict.set_item("callee", PyASTNode::new((**callee).clone()).to_dict(py)?)?;
                 let py_args: Vec<PyObject> = args
                     .iter()
                     .map(|arg| PyASTNode::new(arg.clone()).to_dict(py))
-                    .collect();
-                dict.set_item("args", py_args).unwrap();
+                    .collect::<PyResult<Vec<_>>>()?;
+                dict.set_item("args", py_args)?;
             }
             ASTNodeType::Array(rows) => {
                 let py_rows: Vec<Vec<PyObject>> = rows
@@ -340,68 +343,42 @@ impl PyASTNode {
                     .map(|row| {
                         row.iter()
                             .map(|cell| PyASTNode::new(cell.clone()).to_dict(py))
-                            .collect()
+                            .collect::<PyResult<Vec<_>>>()
                     })
-                    .collect();
-                dict.set_item("rows", py_rows).unwrap();
+                    .collect::<PyResult<Vec<_>>>()?;
+                dict.set_item("rows", py_rows)?;
             }
         }
 
-        dict.into()
+        Ok(dict.into())
     }
 
     #[allow(clippy::only_used_in_recursion)]
-    fn literal_value_to_py(&self, py: Python<'_>, value: &LiteralValue) -> PyObject {
-        match value {
-            LiteralValue::Int(i) => (*i)
-                .into_py_any(py)
-                .expect("integer conversion must succeed"),
-            LiteralValue::Number(n) => (*n)
-                .into_py_any(py)
-                .expect("number conversion must succeed"),
-            LiteralValue::Text(s) => s
-                .clone()
-                .into_py_any(py)
-                .expect("string conversion must succeed"),
-            LiteralValue::Boolean(b) => (*b)
-                .into_py_any(py)
-                .expect("boolean conversion must succeed"),
-            LiteralValue::Error(e) => e
-                .to_string()
-                .into_py_any(py)
-                .expect("error conversion must succeed"),
-            LiteralValue::Date(d) => d
-                .to_string()
-                .into_py_any(py)
-                .expect("date conversion must succeed"),
-            LiteralValue::DateTime(dt) => dt
-                .to_string()
-                .into_py_any(py)
-                .expect("datetime conversion must succeed"),
-            LiteralValue::Time(t) => t
-                .to_string()
-                .into_py_any(py)
-                .expect("time conversion must succeed"),
-            LiteralValue::Duration(dur) => dur
-                .to_string()
-                .into_py_any(py)
-                .expect("duration conversion must succeed"),
+    fn literal_value_to_py(&self, py: Python<'_>, value: &LiteralValue) -> PyResult<PyObject> {
+        Ok(match value {
+            LiteralValue::Int(i) => (*i).into_py_any(py)?,
+            LiteralValue::Number(n) => (*n).into_py_any(py)?,
+            LiteralValue::Text(s) => s.clone().into_py_any(py)?,
+            LiteralValue::Boolean(b) => (*b).into_py_any(py)?,
+            LiteralValue::Error(e) => e.to_string().into_py_any(py)?,
+            LiteralValue::Date(d) => d.to_string().into_py_any(py)?,
+            LiteralValue::DateTime(dt) => dt.to_string().into_py_any(py)?,
+            LiteralValue::Time(t) => t.to_string().into_py_any(py)?,
+            LiteralValue::Duration(dur) => dur.to_string().into_py_any(py)?,
             LiteralValue::Array(arr) => {
                 let py_arr: Vec<Vec<PyObject>> = arr
                     .iter()
                     .map(|row| {
                         row.iter()
                             .map(|cell| self.literal_value_to_py(py, cell))
-                            .collect()
+                            .collect::<PyResult<Vec<_>>>()
                     })
-                    .collect();
-                py_arr
-                    .into_py_any(py)
-                    .expect("array conversion must succeed")
+                    .collect::<PyResult<Vec<_>>>()?;
+                py_arr.into_py_any(py)?
             }
             LiteralValue::Empty => py.None(),
             LiteralValue::Pending => py.None(),
-        }
+        })
     }
 }
 
@@ -417,32 +394,28 @@ impl PyASTNode {
 ///     for r in ast.walk_refs():
 ///         print(r)
 /// ```
-#[gen_stub_pyclass]
-#[pyclass(name = "RefWalker", module = "formualizer")]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass)]
+#[pyclass(name = "RefWalker", module = "formualizer.formualizer_py")]
 pub struct PyRefWalker {
     refs: Vec<ReferenceLike>,
     index: usize,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
 #[pymethods]
 impl PyRefWalker {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
         if slf.index < slf.refs.len() {
             let reference = slf.refs[slf.index].clone();
             slf.index += 1;
             let py = slf.py();
-            Some(
-                reference
-                    .into_py_any(py)
-                    .expect("ReferenceLike should convert to PyObject"),
-            )
+            Ok(Some(reference.into_py_any(py)?))
         } else {
-            None
+            Ok(None)
         }
     }
 }

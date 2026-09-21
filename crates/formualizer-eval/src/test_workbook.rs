@@ -24,13 +24,32 @@ struct Sheet {
     cells: HashMap<CellKey, V>,
 }
 
-#[derive(Default)]
 pub struct TestWorkbook {
     sheets: HashMap<String, Sheet>,
     named: HashMap<String, Vec<Vec<V>>>,
     tables: HashMap<String, Box<dyn Table>>,
     fns: HashMap<(String, String), Arc<dyn Function>>,
     aliases: HashMap<(String, String), (String, String)>,
+    planning_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
+    cancellation_token: Option<crate::engine::CancelToken>,
+    #[cfg(test)]
+    sheet_bounds_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl Default for TestWorkbook {
+    fn default() -> Self {
+        Self {
+            sheets: HashMap::new(),
+            named: HashMap::new(),
+            tables: HashMap::new(),
+            fns: HashMap::new(),
+            aliases: HashMap::new(),
+            planning_revision: Some(Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            cancellation_token: None,
+            #[cfg(test)]
+            sheet_bounds_calls: None,
+        }
+    }
 }
 
 impl TestWorkbook {
@@ -49,6 +68,36 @@ impl TestWorkbook {
             .min()
             .map(|s| s.as_str())
             .unwrap_or(FALLBACK)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planning_revision_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(
+            self.planning_revision
+                .as_ref()
+                .expect("planning revision is available"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_planning_revision(mut self) -> Self {
+        self.planning_revision = None;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cancellation_token(mut self, token: crate::engine::CancelToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_sheet_bounds_counter(
+        mut self,
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.sheet_bounds_calls = Some(counter);
+        self
     }
 
     /* ─────────────── cell helpers ─────────────── */
@@ -222,8 +271,8 @@ impl TestWorkbook {
 
 /* ─────────────────────── trait impls ─────────────────────── */
 impl EvaluationContext for TestWorkbook {
-    fn cancellation_token(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        None
+    fn cancellation_token(&self) -> Option<crate::engine::CancelToken> {
+        self.cancellation_token.clone()
     }
 
     fn resolve_range_view<'c>(
@@ -299,6 +348,10 @@ impl EvaluationContext for TestWorkbook {
     }
 
     fn sheet_bounds(&self, _sheet: &str) -> Option<(u32, u32)> {
+        #[cfg(test)]
+        if let Some(counter) = &self.sheet_bounds_calls {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Some((1_048_576, 16_384))
     }
 
@@ -378,6 +431,12 @@ impl TableResolver for TestWorkbook {
 impl SourceResolver for TestWorkbook {}
 
 impl FunctionProvider for TestWorkbook {
+    fn planning_semantic_revision(&self) -> Option<u64> {
+        self.planning_revision
+            .as_ref()
+            .map(|revision| revision.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn get_function(&self, ns: &str, name: &str) -> Option<Arc<dyn Function>> {
         let nns = ns.to_uppercase();
         let nname = name.to_uppercase();
@@ -393,6 +452,20 @@ impl FunctionProvider for TestWorkbook {
         }
         // fall back to global registry (case-insensitive with aliases)
         crate::function_registry::get(&nns, &nname)
+    }
+
+    fn get_function_for_planning(&self, ns: &str, name: &str) -> Option<Arc<dyn Function>> {
+        let nns = ns.to_uppercase();
+        let nname = name.to_uppercase();
+        if let Some(function) = self.fns.get(&(nns.clone(), nname.clone())) {
+            return Some(Arc::clone(function));
+        }
+        if let Some((target_ns, target_name)) = self.aliases.get(&(nns.clone(), nname.clone()))
+            && let Some(function) = self.fns.get(&(target_ns.clone(), target_name.clone()))
+        {
+            return Some(Arc::clone(function));
+        }
+        crate::function_registry::get_for_planning(&nns, &nname)
     }
 }
 

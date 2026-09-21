@@ -1,8 +1,10 @@
 use super::super::utils::{
     ARG_NUM_LENIENT_ONE, ARG_NUM_LENIENT_TWO, ARG_RANGE_NUM_LENIENT_ONE, coerce_num,
 };
+use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
 use crate::function::Function;
+use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
@@ -57,6 +59,9 @@ impl Function for AbsFn {
     }
     fn min_args(&self) -> usize {
         1
+    }
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract::static_scalar_all_args(arity)
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
         &ARG_NUM_LENIENT_ONE[..]
@@ -2013,7 +2018,7 @@ impl Function for SeriesSumFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let x = match args[0].value()?.into_literal() {
             LiteralValue::Error(e) => {
@@ -2035,35 +2040,23 @@ impl Function for SeriesSumFn {
         };
 
         let mut coeffs: Vec<f64> = Vec::new();
-        if let Ok(view) = args[3].range_view() {
-            view.for_each_cell(&mut |cell| {
+        match resolve_aggregate_argument(&args[3], ctx)? {
+            AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
                 match cell {
                     LiteralValue::Error(e) => return Err(e.clone()),
                     other => coeffs.push(coerce_num(other)?),
                 }
                 Ok(())
-            })?;
-        } else {
-            match args[3].value()?.into_literal() {
-                LiteralValue::Array(rows) => {
-                    for row in rows {
-                        for cell in row {
-                            match cell {
-                                LiteralValue::Error(e) => {
-                                    return Ok(crate::traits::CalcValue::Scalar(
-                                        LiteralValue::Error(e),
-                                    ));
-                                }
-                                other => coeffs.push(coerce_num(&other)?),
-                            }
-                        }
-                    }
-                }
+            })?,
+            AggregateArgument::ReferenceError(e) => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
+            AggregateArgument::Scalar(value) => match value {
                 LiteralValue::Error(e) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                 }
                 other => coeffs.push(coerce_num(&other)?),
-            }
+            },
         }
 
         let mut sum = 0.0;
@@ -2137,12 +2130,13 @@ impl Function for SumsqFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let date_system = ctx.date_system();
         let mut total = 0.0;
         for arg in args {
-            if let Ok(view) = arg.range_view() {
-                view.for_each_cell(&mut |cell| {
+            match resolve_aggregate_argument(arg, ctx)? {
+                AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
                     match cell {
                         LiteralValue::Error(e) => return Err(e.clone()),
                         LiteralValue::Number(n) => total += n * n,
@@ -2151,15 +2145,15 @@ impl Function for SumsqFn {
                             total += n * n;
                         }
                         LiteralValue::Date(d) => {
-                            let n = crate::builtins::datetime::date_to_serial(d);
+                            let n = formualizer_common::date_to_serial_for(date_system, d);
                             total += n * n;
                         }
                         LiteralValue::DateTime(dt) => {
-                            let n = crate::builtins::datetime::datetime_to_serial(dt);
+                            let n = formualizer_common::datetime_to_serial_for(date_system, dt);
                             total += n * n;
                         }
                         LiteralValue::Time(t) => {
-                            let n = crate::builtins::datetime::time_to_fraction(t);
+                            let n = formualizer_common::time_to_fraction(t);
                             total += n * n;
                         }
                         LiteralValue::Duration(d) => {
@@ -2169,10 +2163,11 @@ impl Function for SumsqFn {
                         _ => {}
                     }
                     Ok(())
-                })?;
-            } else {
-                let v = arg.value()?.into_literal();
-                match v {
+                })?,
+                AggregateArgument::ReferenceError(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                AggregateArgument::Scalar(v) => match v {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
@@ -2180,7 +2175,7 @@ impl Function for SumsqFn {
                         let n = coerce_num(&other)?;
                         total += n * n;
                     }
-                }
+                },
             }
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
@@ -3060,10 +3055,11 @@ impl Function for IsoCeilingFn {
 
 fn collect_nums_from_arg<'a, 'b>(
     arg: &'a crate::traits::ArgumentHandle<'a, 'b>,
+    ctx: &dyn FunctionContext<'b>,
 ) -> Result<Vec<f64>, ExcelError> {
     let mut out = Vec::new();
-    if let Ok(view) = arg.range_view() {
-        view.for_each_cell(&mut |cell| {
+    match resolve_aggregate_argument(arg, ctx)? {
+        AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
             match cell {
                 LiteralValue::Error(e) => return Err(e.clone()),
                 LiteralValue::Number(n) => out.push(*n),
@@ -3072,27 +3068,12 @@ fn collect_nums_from_arg<'a, 'b>(
                 _ => out.push(0.0),
             }
             Ok(())
-        })?;
-    } else {
-        match arg.value()?.into_literal() {
+        })?,
+        AggregateArgument::ReferenceError(error) => return Err(error),
+        AggregateArgument::Scalar(value) => match value {
             LiteralValue::Error(e) => return Err(e),
-            LiteralValue::Array(rows) => {
-                for row in rows {
-                    for cell in row {
-                        match cell {
-                            LiteralValue::Error(e) => return Err(e),
-                            LiteralValue::Number(n) => out.push(n),
-                            LiteralValue::Int(i) => out.push(i as f64),
-                            LiteralValue::Boolean(b) => out.push(if b { 1.0 } else { 0.0 }),
-                            _ => out.push(0.0),
-                        }
-                    }
-                }
-            }
-            other => {
-                out.push(coerce_num(&other)?);
-            }
-        }
+            other => out.push(coerce_num(&other)?),
+        },
     }
     Ok(out)
 }
@@ -3146,15 +3127,15 @@ impl Function for SumX2MY2Fn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0])?;
-        let ys = collect_nums_from_arg(&args[1])?;
+        let xs = collect_nums_from_arg(&args[0], ctx)?;
+        let ys = collect_nums_from_arg(&args[1], ctx)?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
@@ -3216,15 +3197,15 @@ impl Function for SumX2PY2Fn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0])?;
-        let ys = collect_nums_from_arg(&args[1])?;
+        let xs = collect_nums_from_arg(&args[0], ctx)?;
+        let ys = collect_nums_from_arg(&args[1], ctx)?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
@@ -3286,15 +3267,15 @@ impl Function for SumXMY2Fn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0])?;
-        let ys = collect_nums_from_arg(&args[1])?;
+        let xs = collect_nums_from_arg(&args[0], ctx)?;
+        let ys = collect_nums_from_arg(&args[1], ctx)?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
@@ -3309,42 +3290,42 @@ impl Function for SumXMY2Fn {
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(AbsFn));
-    crate::function_registry::register_function(Arc::new(SignFn));
-    crate::function_registry::register_function(Arc::new(IntFn));
-    crate::function_registry::register_function(Arc::new(TruncFn));
-    crate::function_registry::register_function(Arc::new(RoundFn));
-    crate::function_registry::register_function(Arc::new(RoundDownFn));
-    crate::function_registry::register_function(Arc::new(RoundUpFn));
-    crate::function_registry::register_function(Arc::new(ModFn));
-    crate::function_registry::register_function(Arc::new(CeilingFn));
-    crate::function_registry::register_function(Arc::new(CeilingMathFn));
-    crate::function_registry::register_function(Arc::new(CeilingPreciseFn));
-    crate::function_registry::register_function(Arc::new(IsoCeilingFn));
-    crate::function_registry::register_function(Arc::new(FloorFn));
-    crate::function_registry::register_function(Arc::new(FloorMathFn));
-    crate::function_registry::register_function(Arc::new(FloorPreciseFn));
-    crate::function_registry::register_function(Arc::new(SqrtFn));
-    crate::function_registry::register_function(Arc::new(PowerFn));
-    crate::function_registry::register_function(Arc::new(ExpFn));
-    crate::function_registry::register_function(Arc::new(LnFn));
-    crate::function_registry::register_function(Arc::new(LogFn));
-    crate::function_registry::register_function(Arc::new(Log10Fn));
-    crate::function_registry::register_function(Arc::new(QuotientFn));
-    crate::function_registry::register_function(Arc::new(EvenFn));
-    crate::function_registry::register_function(Arc::new(OddFn));
-    crate::function_registry::register_function(Arc::new(SqrtPiFn));
-    crate::function_registry::register_function(Arc::new(MultinomialFn));
-    crate::function_registry::register_function(Arc::new(SeriesSumFn));
-    crate::function_registry::register_function(Arc::new(SumsqFn));
-    crate::function_registry::register_function(Arc::new(MroundFn));
-    crate::function_registry::register_function(Arc::new(RomanFn));
-    crate::function_registry::register_function(Arc::new(ArabicFn));
-    crate::function_registry::register_function(Arc::new(BaseFn));
-    crate::function_registry::register_function(Arc::new(DecimalFn));
-    crate::function_registry::register_function(Arc::new(SumX2MY2Fn));
-    crate::function_registry::register_function(Arc::new(SumX2PY2Fn));
-    crate::function_registry::register_function(Arc::new(SumXMY2Fn));
+    crate::function_registry::register_builtin(Arc::new(AbsFn));
+    crate::function_registry::register_builtin(Arc::new(SignFn));
+    crate::function_registry::register_builtin(Arc::new(IntFn));
+    crate::function_registry::register_builtin(Arc::new(TruncFn));
+    crate::function_registry::register_builtin(Arc::new(RoundFn));
+    crate::function_registry::register_builtin(Arc::new(RoundDownFn));
+    crate::function_registry::register_builtin(Arc::new(RoundUpFn));
+    crate::function_registry::register_builtin(Arc::new(ModFn));
+    crate::function_registry::register_builtin(Arc::new(CeilingFn));
+    crate::function_registry::register_builtin(Arc::new(CeilingMathFn));
+    crate::function_registry::register_builtin(Arc::new(CeilingPreciseFn));
+    crate::function_registry::register_builtin(Arc::new(IsoCeilingFn));
+    crate::function_registry::register_builtin(Arc::new(FloorFn));
+    crate::function_registry::register_builtin(Arc::new(FloorMathFn));
+    crate::function_registry::register_builtin(Arc::new(FloorPreciseFn));
+    crate::function_registry::register_builtin(Arc::new(SqrtFn));
+    crate::function_registry::register_builtin(Arc::new(PowerFn));
+    crate::function_registry::register_builtin(Arc::new(ExpFn));
+    crate::function_registry::register_builtin(Arc::new(LnFn));
+    crate::function_registry::register_builtin(Arc::new(LogFn));
+    crate::function_registry::register_builtin(Arc::new(Log10Fn));
+    crate::function_registry::register_builtin(Arc::new(QuotientFn));
+    crate::function_registry::register_builtin(Arc::new(EvenFn));
+    crate::function_registry::register_builtin(Arc::new(OddFn));
+    crate::function_registry::register_builtin(Arc::new(SqrtPiFn));
+    crate::function_registry::register_builtin(Arc::new(MultinomialFn));
+    crate::function_registry::register_builtin(Arc::new(SeriesSumFn));
+    crate::function_registry::register_builtin(Arc::new(SumsqFn));
+    crate::function_registry::register_builtin(Arc::new(MroundFn));
+    crate::function_registry::register_builtin(Arc::new(RomanFn));
+    crate::function_registry::register_builtin(Arc::new(ArabicFn));
+    crate::function_registry::register_builtin(Arc::new(BaseFn));
+    crate::function_registry::register_builtin(Arc::new(DecimalFn));
+    crate::function_registry::register_builtin(Arc::new(SumX2MY2Fn));
+    crate::function_registry::register_builtin(Arc::new(SumX2PY2Fn));
+    crate::function_registry::register_builtin(Arc::new(SumXMY2Fn));
 }
 
 #[cfg(test)]

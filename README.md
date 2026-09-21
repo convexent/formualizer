@@ -18,9 +18,11 @@
 
 <br />
 
-**The spreadsheet engine that actually evaluates formulas.** Parse, evaluate, and mutate Excel workbooks from Rust, Python, or the browser.
+**A lightning-fast, embeddable spreadsheet runtime for Rust, Python, and JavaScript.** Parse formulas, load and edit Excel workbooks, recalculate them incrementally, and expose spreadsheet models as deterministic, typed APIs—without Excel.
 
-A permissively-licensed, production-grade spreadsheet engine with 320+ Excel-compatible functions, Apache Arrow storage, incremental dependency tracking, undo/redo, and dynamic array support. One Rust core, three language targets, MIT/Apache-2.0.
+No Excel COM automation. No LibreOffice UNO bridge. No stitching together slow Python libraries for workbook editing and partial formula evaluation.
+
+Formualizer combines broad Excel-compatible formula support with Arrow-backed storage, dependency-aware recalculation, dynamic arrays, file I/O, undo/redo, and SheetPort. One permissively licensed Rust core ships to Rust, Python, browsers, and Node.js.
 
 ---
 
@@ -28,7 +30,7 @@ A permissively-licensed, production-grade spreadsheet engine with 320+ Excel-com
 
 | | |
 |---|---|
-| **320+ Excel functions** | Math, text, lookup (XLOOKUP, VLOOKUP), date/time, statistics, financial, database, engineering |
+| **400+ Excel functions** | Math, text, lookup (XLOOKUP, VLOOKUP), date/time, statistics, financial, database, engineering |
 | **Three language targets** | Rust, Python (PyO3), and WASM (browser + Node) with consistent APIs |
 | **Arrow-powered storage** | Apache Arrow columnar backing with spill overlays for efficient large-workbook evaluation |
 | **Dependency graph** | Incremental recalculation, cycle detection, topological scheduling, optional parallel evaluation |
@@ -37,16 +39,18 @@ A permissively-licensed, production-grade spreadsheet engine with 320+ Excel-com
 | **File I/O** | Load and write XLSX (calamine, umya), CSV, JSON — all behind feature flags |
 | **SheetPort** | Treat any spreadsheet as a typed API with YAML manifests, schema validation, and batch evaluation |
 | **Deterministic mode** | Inject clock, timezone, and RNG seed for reproducible evaluation (built for AI agents) |
+| **Experimental span evaluation** | Opt-in FormulaPlane runtime for accelerating eligible large copied-formula families |
 
 ## Documentation
 
 📖 **[formualizer.dev](https://www.formualizer.dev/docs)** — full documentation, interactive tools, and API reference.
 
 - [Quickstarts](https://www.formualizer.dev/docs/quickstarts) — get running in Rust, Python, or JS/WASM in minutes
-- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 320+ built-in functions with examples
+- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 400+ built-in functions with examples
 - [Formula Parser](https://www.formualizer.dev/formula-parser) — interactive browser-based formula parser and AST inspector
 - [SheetPort Guide](https://www.formualizer.dev/docs/sheetport) — treat spreadsheets as typed, deterministic APIs
-- [Core Concepts](https://www.formualizer.dev/docs/core-concepts) — dependency graph, evaluation pipeline, coercion rules
+- [Core Concepts](https://www.formualizer.dev/docs/core-concepts) — dependency graph, FormulaPlane span evaluation, evaluation pipeline, coercion rules
+- [Large Workbook Performance](https://www.formualizer.dev/docs/guides/large-workbook-performance) — loading, sparse ingest, and opt-in span acceleration guidance
 
 ## Who is this for?
 
@@ -54,6 +58,24 @@ A permissively-licensed, production-grade spreadsheet engine with 320+ Excel-com
 - **AI / agent builders** who need programmatic spreadsheet manipulation with deterministic evaluation, auditable changelogs, and typed I/O via SheetPort.
 - **SaaS products** embedding spreadsheet logic — pricing calculators, planning tools, configurators — without shipping a full spreadsheet UI.
 - **Data engineers** extracting business logic trapped in spreadsheets into reproducible, testable pipelines.
+
+## Building an AI agent? Use agent-spreadsheet
+
+Formualizer is the **engine**. If you want an agent to *work with* workbooks — read, profile, edit, recalculate, diff, and verify them safely — use **[agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet)**, the official agent tooling layer built on this engine:
+
+```
+your agent / app
+      │
+agent-spreadsheet     CLI (`agent-spreadsheet` / `asp`) · MCP server · JS SDK
+      │
+  formualizer         parsing · dependency graph · 400+ functions · recalc
+```
+
+- **CLI** — stateless one-shot reads, safe edits, recalc, and verifiable diffs for shell-native agents and CI (`npm i -g agent-spreadsheet` or `cargo install agent-spreadsheet`)
+- **MCP server** — stateful multi-turn sessions with workbook forks, checkpoints, staged edits, and native recalculation (no LibreOffice fallback)
+- **JS SDK** — typed API for app integrations, backed by the MCP server or an embedded in-process WASM engine
+
+Unlike screenshot-driven UI automation or MCP servers that can't compute a formula, agent-spreadsheet evaluates the actual workbook with this engine — every edit is recalculated, traceable, and diffable.
 
 ## Quick start
 
@@ -80,7 +102,7 @@ let payment = wb.evaluate_cell("Sheet1", 1, 2)?;
 ```toml
 # Cargo.toml
 [dependencies]
-formualizer = "0.3"
+formualizer = "0.6"
 ```
 
 ### Python
@@ -130,6 +152,21 @@ wb.setFormula('Pricing', 1, 2, '=A1*(1-A2)');
 console.log(await wb.evaluateCell('Pricing', 1, 2)); // 85
 ```
 
+## Performance and experimental span evaluation
+
+Formualizer's default execution path is the stable dependency graph. For large read-heavy XLSX workloads, the Calamine backend provides a sparse-compatible loading path. Formualizer 0.6 also includes **experimental, opt-in** FormulaPlane span evaluation for eligible copied-formula families.
+
+Span evaluation is disabled by default:
+
+```rust
+use formualizer_workbook::{Workbook, WorkbookConfig};
+
+let cfg = WorkbookConfig::interactive().with_span_evaluation(true);
+let mut wb = Workbook::new_with_config(cfg);
+```
+
+Use it when you can validate critical workbooks against your own regression corpus. Unsupported formulas fall back to the legacy graph path; internal chains/running balances and array-literal families are not span-promoted in 0.6.
+
 ## Custom functions (workbook-local)
 
 You can register custom functions per workbook in Rust, Python, and JS/WASM.
@@ -173,7 +210,7 @@ WASM plugin path (Rust workbook API):
 
 | Library | Language | Parse | Evaluate | Write | Functions | Dep. graph | License |
 |---------|----------|-------|----------|-------|-----------|------------|---------|
-| **Formualizer** | Rust / Python / WASM | Yes | Yes | Yes | 320+ | Yes (incremental) | MIT / Apache-2.0 |
+| **Formualizer** | Rust / Python / WASM | Yes | Yes | Yes | 400+ | Yes (incremental) | MIT / Apache-2.0 |
 | HyperFormula | JavaScript | Yes | Yes | No | ~400 | Yes | **AGPL-3.0** (or commercial) |
 | calamine | Rust | No | No | No | N/A | N/A | MIT / Apache-2.0 |
 | openpyxl | Python | No | No | Yes | N/A | N/A | MIT |
@@ -184,7 +221,7 @@ WASM plugin path (Rust workbook API):
 - **calamine** is read-only — it extracts cached values from XLSX files but cannot evaluate formulas.
 - **openpyxl** reads and writes XLSX but has no formula evaluation engine.
 - **xlcalc** evaluates formulas but supports a fraction of Excel's function library and has limited dependency tracking.
-- **Formualizer** is a complete, permissively-licensed engine: parse formulas, track dependencies, evaluate with 320+ functions, mutate workbooks, undo/redo — from Rust, Python, or the browser.
+- **Formualizer** is a complete, permissively-licensed engine: parse formulas, track dependencies, evaluate with 400+ functions, mutate workbooks, undo/redo — from Rust, Python, or the browser.
 
 ## Architecture
 
@@ -242,7 +279,7 @@ Formal benchmarks are in progress.
 |--------|---------|------|
 | Rust | `cargo add formualizer` | [docs.rs](https://docs.rs/formualizer) · [guide](https://www.formualizer.dev/docs/quickstarts/rust-quickstart) |
 | Python | `pip install formualizer` | [README](bindings/python/README.md) · [guide](https://www.formualizer.dev/docs/quickstarts/python-quickstart) |
-| Python (Pyodide) | `await micropip.install("formualizer")` | [README](bindings/python/README.md#using-in-pyodide-browser--webassembly) · [guide](https://www.formualizer.dev/docs/quickstarts/pyodide-quickstart) |
+| Python (Pyodide) | `await micropip.install(wheel_url)` (compatible wheel URL) | [README](bindings/python/README.md#using-in-pyodide-browser--webassembly) · [guide](https://www.formualizer.dev/docs/quickstarts/pyodide-quickstart) |
 | WASM | `npm install formualizer` | [README](bindings/wasm/README.md) · [guide](https://www.formualizer.dev/docs/quickstarts/js-wasm-quickstart) |
 
 Both Python and WASM bindings expose the same core API surface: tokenization, parsing, workbook operations, evaluation, undo/redo, and SheetPort.

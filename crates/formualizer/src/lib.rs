@@ -2,6 +2,11 @@
 //! sensible defaults. Downstream users can depend on this crate and opt into
 //! specific layers via feature flags while keeping access to the underlying
 //! crates when deeper integration is required.
+//!
+//! Inspection DTOs are currently types-only through this facade. Until the
+//! workbook and language-binding integrations land, use `formualizer-eval`
+//! directly to call the engine inspection methods; the facade intentionally
+//! does not re-export `Engine`.
 
 #[cfg(feature = "common")]
 pub use formualizer_common as common;
@@ -26,7 +31,8 @@ pub use sheetport_spec;
 
 #[cfg(feature = "common")]
 pub use formualizer_common::{
-    ErrorContext, ExcelError, ExcelErrorExtra, ExcelErrorKind, LiteralValue, RangeAddress,
+    CellAddress, ErrorContext, ExcelError, ExcelErrorExtra, ExcelErrorKind, LiteralValue,
+    RangeAddress, RangeArea,
 };
 
 #[cfg(feature = "parse")]
@@ -50,14 +56,36 @@ pub use formualizer_workbook::{
     LoadStrategy, Workbook, WorkbookConfig, WorkbookMode, WorksheetHandle,
 };
 
-#[cfg(all(feature = "workbook", feature = "umya"))]
+#[cfg(all(feature = "workbook", any(feature = "umya", feature = "xlsx-recalc")))]
 pub use formualizer_workbook::{
     DEFAULT_ERROR_LOCATION_LIMIT, RecalculateErrorSummary, RecalculateSheetSummary,
-    RecalculateStatus, RecalculateSummary, recalculate_file, recalculate_file_with_limit,
+    RecalculateStatus, RecalculateSummary,
+};
+#[cfg(all(feature = "workbook", feature = "umya"))]
+pub use formualizer_workbook::{recalculate_file, recalculate_file_with_limit};
+
+#[cfg(all(
+    feature = "workbook",
+    feature = "xlsx-recalc",
+    not(target_arch = "wasm32")
+))]
+pub use formualizer_workbook::recalculate_xlsx_file;
+#[cfg(all(feature = "workbook", feature = "xlsx-recalc"))]
+pub use formualizer_workbook::{
+    XlsxRecalculateLimits, XlsxRecalculateOptions, XlsxRecalculateResult, recalculate_xlsx_bytes,
 };
 
 #[cfg(feature = "eval")]
-pub use formualizer_eval::engine::{DateSystem, EvalConfig};
+pub use formualizer_eval::engine::{DateSystem, EvalConfig, TemporalEgress};
+
+#[cfg(feature = "eval")]
+pub use formualizer_eval::engine::inspect::{
+    CellSnapshot, CellSnapshotReport, Dependent, DependentsOptions, DependentsReport, InspectError,
+    InspectionUnavailableReason, LinkDisposition, NameResolution, OmittedCount, Precedent,
+    PrecedentOptions, PrecedentReport, Provenance, RangePage, RangePageOptions, SemanticReference,
+    SnapshotOptions, SpillRole, Staleness, StateStamp, TraceDirection, TraceGraph, TraceLink,
+    TraceLinkKind, TraceLinkTarget, TraceNode, TraceNodeId, TraceOptions, TruncationReport,
+};
 
 #[cfg(feature = "eval")]
 pub use formualizer_eval::engine::eval::EvalPlan;

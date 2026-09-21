@@ -1,4 +1,4 @@
-use super::super::utils::ARG_ANY_ONE;
+use super::{super::utils::ARG_ANY_ONE, scalar_text_value};
 use crate::args::ArgSchema;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
@@ -7,7 +7,7 @@ use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
-        crate::traits::CalcValue::Scalar(v) => v,
+        crate::traits::CalcValue::Scalar(v) | crate::traits::CalcValue::AnnotatedScalar(v, _) => v,
         crate::traits::CalcValue::Range(rv) => rv.get_cell(0, 0),
         crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
@@ -300,7 +300,7 @@ impl Function for ReplaceFn {
 }
 
 fn to_text<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<String, ExcelError> {
-    let v = scalar_like_value(arg)?;
+    let v = scalar_text_value(arg)?;
     Ok(match v {
         LiteralValue::Text(s) => s,
         LiteralValue::Empty => String::new(),
@@ -346,9 +346,9 @@ use std::cmp::min;
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(MidFn));
-    crate::function_registry::register_function(Arc::new(SubstituteFn));
-    crate::function_registry::register_function(Arc::new(ReplaceFn));
+    crate::function_registry::register_builtin(Arc::new(MidFn));
+    crate::function_registry::register_builtin(Arc::new(SubstituteFn));
+    crate::function_registry::register_builtin(Arc::new(ReplaceFn));
 }
 
 #[cfg(test)]

@@ -1,9 +1,11 @@
+use crate::errors::workbook_error_to_js;
 use crate::utils::{js_error, js_error_with_cause};
 use formualizer::common::error::{ExcelError, ExcelErrorKind};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
 #[derive(Default)]
@@ -37,6 +39,124 @@ impl JsCallbackRegistry {
 
 thread_local! {
     static JS_CALLBACK_REGISTRY: RefCell<JsCallbackRegistry> = RefCell::new(JsCallbackRegistry::default());
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsWorkbookLoadOptions {
+    span_evaluation: Option<bool>,
+    /// Cycle detection mode: `"static"` | `"runtime"` (spec §2).
+    cycle_detection: Option<String>,
+    /// Cycle policy for live cycles: `"error"` | `"iterate"` (spec §2).
+    /// `"iterate"` implies runtime detection.
+    cycle_policy: Option<String>,
+    /// Iterative-calculation max passes per SCC per recalc (Excel default 100).
+    iterate_max_iterations: Option<u32>,
+    /// Iterative-calculation absolute convergence threshold (Excel default 0.001).
+    iterate_max_change: Option<f64>,
+    max_work_units: Option<u64>,
+    max_eval_time_ms: Option<u64>,
+}
+
+fn workbook_config_from_options(
+    options: Option<JsValue>,
+) -> Result<formualizer::workbook::WorkbookConfig, JsValue> {
+    use formualizer::eval::engine::{CycleDetection, CyclePolicy};
+
+    let parsed = match options {
+        Some(value) if !value.is_null() && !value.is_undefined() => {
+            serde_wasm_bindgen::from_value::<JsWorkbookLoadOptions>(value)
+                .map_err(|e| js_error(format!("invalid workbook load options: {e}")))?
+        }
+        _ => JsWorkbookLoadOptions::default(),
+    };
+    let mut cfg = formualizer::workbook::WorkbookConfig::interactive();
+    if let Some(enabled) = parsed.span_evaluation {
+        cfg = cfg.with_span_evaluation(enabled);
+    }
+
+    // Cycle / iterative-calculation config (RFC #113, spec §2). Build the
+    // CycleConfig from the optional fields, defaulting to the engine's current
+    // value, then validate so an invalid combo surfaces as a JS error instead
+    // of the engine's build-time panic.
+    let mut cycle = cfg.eval.cycle;
+    let mut iterating = matches!(cycle.policy, CyclePolicy::Iterate { .. });
+    let (mut max_iterations, mut max_change) = match cycle.policy {
+        CyclePolicy::Iterate {
+            max_iterations,
+            max_change,
+        } => (max_iterations, max_change),
+        CyclePolicy::Error => (
+            CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS,
+            CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE,
+        ),
+    };
+
+    if let Some(detection) = parsed.cycle_detection.as_deref() {
+        cycle.detection = match detection {
+            "static" => CycleDetection::Static,
+            "runtime" => CycleDetection::Runtime,
+            other => {
+                return Err(js_error(format!(
+                    "invalid cycleDetection: {other}. Use 'static' or 'runtime'."
+                )));
+            }
+        };
+    }
+    if let Some(policy) = parsed.cycle_policy.as_deref() {
+        match policy {
+            "error" => iterating = false,
+            "iterate" => {
+                iterating = true;
+                // Iteration requires runtime detection (spec §2): promote it
+                // unless the caller explicitly asked for static (which then
+                // fails validation below with a clear message).
+                if parsed.cycle_detection.is_none() {
+                    cycle.detection = CycleDetection::Runtime;
+                }
+            }
+            other => {
+                return Err(js_error(format!(
+                    "invalid cyclePolicy: {other}. Use 'error' or 'iterate'."
+                )));
+            }
+        }
+    }
+    if let Some(n) = parsed.iterate_max_iterations {
+        iterating = true;
+        max_iterations = n;
+        if parsed.cycle_detection.is_none() {
+            cycle.detection = CycleDetection::Runtime;
+        }
+    }
+    if let Some(d) = parsed.iterate_max_change {
+        iterating = true;
+        max_change = d;
+        if parsed.cycle_detection.is_none() {
+            cycle.detection = CycleDetection::Runtime;
+        }
+    }
+    cycle.policy = if iterating {
+        CyclePolicy::Iterate {
+            max_iterations,
+            max_change,
+        }
+    } else {
+        CyclePolicy::Error
+    };
+    cycle
+        .validate()
+        .map_err(|msg| js_error(format!("invalid cycle config: {msg}")))?;
+    cfg.eval.cycle = cycle;
+    if let Some(max_work_units) = parsed.max_work_units {
+        cfg.eval.evaluation_budgets.work.max_work_units = Some(max_work_units);
+    }
+    if let Some(max_eval_time_ms) = parsed.max_eval_time_ms {
+        cfg.eval.evaluation_budgets.deadline.max_elapsed =
+            Some(Duration::from_millis(max_eval_time_ms));
+    }
+
+    Ok(cfg)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -258,30 +378,90 @@ pub(crate) fn js_to_literal(value: &JsValue) -> formualizer::LiteralValue {
     LiteralValue::Text(format!("{value:?}"))
 }
 
-pub(crate) fn literal_to_js(v: &formualizer::LiteralValue) -> JsValue {
-    match v {
-        formualizer::LiteralValue::Empty => JsValue::NULL,
-        formualizer::LiteralValue::Boolean(b) => JsValue::from_bool(*b),
-        formualizer::LiteralValue::Int(i) => JsValue::from_f64(*i as f64),
-        formualizer::LiteralValue::Number(n) => JsValue::from_f64(*n),
-        formualizer::LiteralValue::Text(s) => JsValue::from_str(s),
-        formualizer::LiteralValue::Date(d) => JsValue::from_str(&d.to_string()),
-        formualizer::LiteralValue::DateTime(dt) => JsValue::from_str(&dt.to_string()),
-        formualizer::LiteralValue::Time(t) => JsValue::from_str(&t.to_string()),
-        formualizer::LiteralValue::Duration(dur) => JsValue::from_str(&format!("{dur:?}")),
-        formualizer::LiteralValue::Array(values) => {
+pub(crate) enum BindingValue {
+    Empty,
+    Boolean(bool),
+    Number(f64),
+    Text(String),
+    Array(Vec<Vec<BindingValue>>),
+    Date(String),
+    DateTime(String),
+    Time(String),
+    Duration(String),
+    Pending,
+    Error {
+        display: String,
+        code: String,
+        message: Option<String>,
+    },
+}
+
+pub(crate) fn binding_value(value: &formualizer::LiteralValue) -> BindingValue {
+    match value {
+        formualizer::LiteralValue::Empty => BindingValue::Empty,
+        formualizer::LiteralValue::Boolean(value) => BindingValue::Boolean(*value),
+        formualizer::LiteralValue::Int(value) => BindingValue::Number(*value as f64),
+        formualizer::LiteralValue::Number(value) => BindingValue::Number(*value),
+        formualizer::LiteralValue::Text(value) => BindingValue::Text(value.clone()),
+        formualizer::LiteralValue::Array(rows) => BindingValue::Array(
+            rows.iter()
+                .map(|row| row.iter().map(binding_value).collect())
+                .collect(),
+        ),
+        formualizer::LiteralValue::Date(value) => BindingValue::Date(value.to_string()),
+        formualizer::LiteralValue::DateTime(value) => BindingValue::DateTime(value.to_string()),
+        formualizer::LiteralValue::Time(value) => BindingValue::Time(value.to_string()),
+        formualizer::LiteralValue::Duration(value) => BindingValue::Duration(format!("{value:?}")),
+        formualizer::LiteralValue::Pending => BindingValue::Pending,
+        formualizer::LiteralValue::Error(error) => BindingValue::Error {
+            display: error.to_string(),
+            code: error.kind.to_string(),
+            message: error.message.clone(),
+        },
+    }
+}
+
+fn binding_value_to_js(value: BindingValue) -> JsValue {
+    match value {
+        BindingValue::Empty => JsValue::NULL,
+        BindingValue::Boolean(value) => JsValue::from_bool(value),
+        BindingValue::Number(value) => JsValue::from_f64(value),
+        BindingValue::Text(value)
+        | BindingValue::Date(value)
+        | BindingValue::DateTime(value)
+        | BindingValue::Time(value)
+        | BindingValue::Duration(value) => JsValue::from_str(&value),
+        BindingValue::Array(rows) => {
             let outer = js_sys::Array::new();
-            for row in values {
-                let arr = js_sys::Array::new();
+            for row in rows {
+                let array = js_sys::Array::new();
                 for cell in row {
-                    arr.push(&literal_to_js(cell));
+                    array.push(&binding_value_to_js(cell));
                 }
-                outer.push(&arr);
+                outer.push(&array);
             }
             outer.into()
         }
-        formualizer::LiteralValue::Pending => JsValue::from_str("Pending"),
-        formualizer::LiteralValue::Error(err) => JsValue::from_str(&err.to_string()),
+        BindingValue::Pending => JsValue::from_str("Pending"),
+        BindingValue::Error { display, .. } => JsValue::from_str(&display),
+    }
+}
+
+pub(crate) fn literal_to_js(value: &formualizer::LiteralValue) -> JsValue {
+    match value {
+        formualizer::LiteralValue::Date(date) => {
+            let milliseconds = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        formualizer::LiteralValue::DateTime(datetime) => {
+            let milliseconds = datetime.and_utc().timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        _ => binding_value_to_js(binding_value(value)),
     }
 }
 
@@ -289,6 +469,86 @@ fn set(obj: &js_sys::Object, key: &str, value: JsValue) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), &value)
         .map(|_| ())
         .map_err(|err| js_error_with_cause(format!("failed to set `{key}`"), err))
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const TABLE_TYPESCRIPT: &'static str = r#"
+/** Shape accepted by `Workbook.addTable`. */
+export interface TableDefinition {
+  /** Table name used by structured references, e.g. `Table1[Amount]`. */
+  name: string;
+  /** Sheet containing the table. */
+  sheet: string;
+  /** `[firstRow, firstCol, lastRow, lastCol]`, 1-based and inclusive, covering
+   *  the header row when `headerRow` is true. */
+  range: [number, number, number, number];
+  /** Column names; must match the width of `range`. */
+  headers: string[];
+  /** Whether the first row of `range` is a header row. Defaults to `true`. */
+  headerRow?: boolean;
+  /** Whether the last row of `range` is a totals row. Defaults to `false`. */
+  totalsRow?: boolean;
+}
+
+/** Shape returned by `Workbook.getTables`. */
+export interface TableMetadata {
+  name: string;
+  sheet: string;
+  range: [number, number, number, number];
+  headers: string[];
+  headerRow: boolean;
+  totalsRow: boolean;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(typescript_type = "TableDefinition")]
+    pub type TableDefinitionValue;
+
+    #[wasm_bindgen(typescript_type = "TableMetadata[]")]
+    pub type TableMetadataArray;
+}
+
+/// Reject own enumerable keys that are not in `allowed`.
+pub(crate) fn reject_unknown_keys(
+    value: &JsValue,
+    context: &str,
+    allowed: &[&str],
+) -> Result<(), JsValue> {
+    if !value.is_object() {
+        return Err(js_error(format!("{context}: expected an object")));
+    }
+    let object: &js_sys::Object = value.unchecked_ref();
+    for key in js_sys::Object::keys(object).iter() {
+        let Some(key) = key.as_string() else { continue };
+        if !allowed.contains(&key.as_str()) {
+            return Err(js_error(format!(
+                "{context}: unknown field `{key}`; expected one of {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shape accepted by `Workbook.addTable`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsTableDefinition {
+    name: String,
+    sheet: String,
+    /// `[firstRow, firstCol, lastRow, lastCol]`, 1-based and inclusive.
+    range: (u32, u32, u32, u32),
+    headers: Vec<String>,
+    #[serde(default = "js_table_header_row_default")]
+    header_row: bool,
+    #[serde(default)]
+    totals_row: bool,
+}
+
+fn js_table_header_row_default() -> bool {
+    true
 }
 
 fn parse_eval_plan_options(raw: Option<JsValue>) -> Result<JsEvalPlanOptions, JsValue> {
@@ -412,21 +672,44 @@ impl Drop for Workbook {
 
 #[wasm_bindgen]
 impl Workbook {
+    /// Construct an empty workbook, optionally with load options, e.g.
+    /// `{ cyclePolicy: "iterate", iterateMaxIterations: 50 }` to enable
+    /// iterative calculation for circular references (RFC #113, spec §2).
+    ///
+    /// `new Workbook()` (no arguments) behaves exactly as before: the
+    /// missing/undefined/null options map to the default interactive config.
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Workbook {
-        Workbook::default()
+    pub fn new(options: Option<JsValue>) -> Result<Workbook, JsValue> {
+        let cfg = workbook_config_from_options(options)?;
+        Ok(Workbook {
+            inner: Arc::new(RwLock::new(
+                formualizer::workbook::Workbook::new_with_config(cfg),
+            )),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            callback_ids: Arc::new(RwLock::new(BTreeMap::new())),
+        })
     }
 
     /// Construct from a JSON workbook string (feature: json)
     #[wasm_bindgen(js_name = "fromJson")]
     pub fn from_json(json: String) -> Result<Workbook, JsValue> {
+        Self::from_json_with_options(json, None)
+    }
+
+    /// Construct from a JSON workbook string with options, e.g.
+    /// `{ spanEvaluation: true }` to opt into experimental FormulaPlane spans.
+    #[wasm_bindgen(js_name = "fromJsonWithOptions")]
+    pub fn from_json_with_options(
+        json: String,
+        options: Option<JsValue>,
+    ) -> Result<Workbook, JsValue> {
         #[cfg(feature = "json")]
         {
             use formualizer::workbook::backends::JsonAdapter;
             use formualizer::workbook::traits::SpreadsheetReader;
             let adapter = <JsonAdapter as SpreadsheetReader>::open_bytes(json.into_bytes())
                 .map_err(|e| js_error(format!("open failed: {e}")))?;
-            let cfg = formualizer::workbook::WorkbookConfig::interactive();
+            let cfg = workbook_config_from_options(options)?;
             let wb = formualizer::workbook::Workbook::from_reader(
                 adapter,
                 formualizer::workbook::LoadStrategy::EagerAll,
@@ -449,13 +732,23 @@ impl Workbook {
     /// Construct from XLSX bytes via the Calamine reader path (feature: calamine)
     #[wasm_bindgen(js_name = "fromXlsxBytes")]
     pub fn from_xlsx_bytes(bytes: Vec<u8>) -> Result<Workbook, JsValue> {
+        Self::from_xlsx_bytes_with_options(bytes, None)
+    }
+
+    /// Construct from XLSX bytes with options, e.g. `{ spanEvaluation: true }`
+    /// to opt into experimental FormulaPlane spans.
+    #[wasm_bindgen(js_name = "fromXlsxBytesWithOptions")]
+    pub fn from_xlsx_bytes_with_options(
+        bytes: Vec<u8>,
+        options: Option<JsValue>,
+    ) -> Result<Workbook, JsValue> {
         #[cfg(feature = "calamine")]
         {
             use formualizer::workbook::backends::CalamineAdapter;
             use formualizer::workbook::traits::SpreadsheetReader;
             let adapter = <CalamineAdapter as SpreadsheetReader>::open_bytes(bytes)
                 .map_err(|e| js_error(format!("open failed: {e}")))?;
-            let cfg = formualizer::workbook::WorkbookConfig::interactive();
+            let cfg = workbook_config_from_options(options)?;
             let wb = formualizer::workbook::Workbook::from_reader(
                 adapter,
                 formualizer::workbook::LoadStrategy::EagerAll,
@@ -611,6 +904,79 @@ impl Workbook {
         Ok(out)
     }
 
+    /// Define a native table over cells that already exist.
+    ///
+    /// `definition` is `{ name, sheet, range: [firstRow, firstCol, lastRow,
+    /// lastCol], headers: string[], headerRow?: boolean, totalsRow?: boolean }`.
+    /// `range` is 1-based and inclusive, and covers the header row when
+    /// `headerRow` is true (default `true`); `totalsRow` defaults to `false`.
+    ///
+    /// Tables are metadata over existing cells, so populate the region first.
+    /// Unknown keys are rejected rather than ignored.
+    #[wasm_bindgen(js_name = "addTable")]
+    pub fn add_table(&self, definition: TableDefinitionValue) -> Result<(), JsValue> {
+        let definition: JsValue = definition.into();
+        // serde's `deny_unknown_fields` does not fire through serde_wasm_bindgen,
+        // and a silently ignored key is exactly the failure this API is meant to
+        // avoid, so the keys are checked explicitly.
+        reject_unknown_keys(
+            &definition,
+            "addTable",
+            &[
+                "name",
+                "sheet",
+                "range",
+                "headers",
+                "headerRow",
+                "totalsRow",
+            ],
+        )?;
+        let definition: JsTableDefinition = serde_wasm_bindgen::from_value(definition)
+            .map_err(|err| js_error(format!("invalid table definition: {err}")))?;
+        self.inner
+            .write()
+            .map_err(|_| js_error("failed to lock workbook for write"))?
+            .define_table(
+                &definition.name,
+                &definition.sheet,
+                definition.range,
+                definition.headers,
+                definition.header_row,
+                definition.totals_row,
+            )
+            .map_err(|e| js_error(format!("addTable failed: {e}")))
+    }
+
+    /// Metadata for every defined table, ordered by name.
+    #[wasm_bindgen(js_name = "getTables")]
+    pub fn get_tables(&self) -> Result<TableMetadataArray, JsValue> {
+        let wb = self
+            .inner
+            .read()
+            .map_err(|_| js_error("failed to lock workbook for read"))?;
+        let out = js_sys::Array::new();
+        for table in wb.tables() {
+            let obj = js_sys::Object::new();
+            set(&obj, "name", JsValue::from_str(&table.name))?;
+            set(&obj, "sheet", JsValue::from_str(&table.sheet))?;
+            let range = js_sys::Array::new();
+            range.push(&JsValue::from_f64(table.start_row as f64));
+            range.push(&JsValue::from_f64(table.start_col as f64));
+            range.push(&JsValue::from_f64(table.end_row as f64));
+            range.push(&JsValue::from_f64(table.end_col as f64));
+            set(&obj, "range", range.into())?;
+            let headers = js_sys::Array::new();
+            for header in &table.headers {
+                headers.push(&JsValue::from_str(header));
+            }
+            set(&obj, "headers", headers.into())?;
+            set(&obj, "headerRow", JsValue::from_bool(table.header_row))?;
+            set(&obj, "totalsRow", JsValue::from_bool(table.totals_row))?;
+            out.push(&obj);
+        }
+        Ok(out.unchecked_into())
+    }
+
     #[wasm_bindgen(js_name = "getNamedRanges")]
     pub fn get_named_ranges(&self, sheet: Option<String>) -> Result<js_sys::Array, JsValue> {
         let wb = self
@@ -733,6 +1099,22 @@ impl Workbook {
         })
     }
 
+    /// Choose temporal output as native JS dates (default) or numeric serials.
+    #[wasm_bindgen(js_name = "setTemporalEgress")]
+    pub fn set_temporal_egress(&self, policy: String) -> Result<(), JsValue> {
+        let policy = match policy.to_ascii_lowercase().as_str() {
+            "native" => formualizer::eval::engine::TemporalEgress::Native,
+            "serial" => formualizer::eval::engine::TemporalEgress::Serial,
+            _ => return Err(js_error("temporal egress must be 'native' or 'serial'")),
+        };
+        self.inner
+            .write()
+            .map_err(|_| js_error("failed to lock workbook for write"))?
+            .engine_mut()
+            .set_temporal_egress(policy);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = "setValue")]
     pub fn set_value(
         &self,
@@ -777,11 +1159,7 @@ impl Workbook {
             .write()
             .map_err(|_| js_error("failed to lock workbook for write"))?
             .evaluate_cell(&sheet, row, col)
-            .map_err(|e| {
-                js_error(format!(
-                    "evaluate_cell failed for {sheet}!R{row}C{col}: {e}"
-                ))
-            })?;
+            .map_err(workbook_error_to_js)?;
         Ok(literal_to_js(&v))
     }
 
@@ -793,8 +1171,10 @@ impl Workbook {
             .map_err(|_| js_error("failed to lock workbook for write"))?;
         self.cancel_flag
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        wb.evaluate_all_cancellable(self.cancel_flag.clone())
-            .map_err(|e| js_error(format!("evaluate_all failed: {e}")))?;
+        wb.evaluate_all_cancellable(formualizer::eval::engine::CancelToken::from_flag(
+            self.cancel_flag.clone(),
+        ))
+        .map_err(workbook_error_to_js)?;
         Ok(())
     }
 
@@ -827,8 +1207,11 @@ impl Workbook {
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         let results = wb
-            .evaluate_cells_cancellable(&refs, self.cancel_flag.clone())
-            .map_err(|e| js_error(format!("evaluate_cells failed: {e}")))?;
+            .evaluate_cells_cancellable(
+                &refs,
+                formualizer::eval::engine::CancelToken::from_flag(self.cancel_flag.clone()),
+            )
+            .map_err(workbook_error_to_js)?;
 
         let out = js_sys::Array::new();
         for v in results {
@@ -937,6 +1320,85 @@ impl Workbook {
             .map_err(|_| js_error("failed to lock workbook for write"))?
             .redo()
             .map_err(|e| js_error(format!("redo failed: {e}")))
+    }
+
+    /// Telemetry from runtime SCC / iterative-calculation evaluation during
+    /// the most recent evaluation request (RFC #113, spec §10).
+    ///
+    /// Mirrors the engine accessor of the same name: counters reset at the
+    /// start of every evaluation request, so this always describes the LAST
+    /// `evaluateAll()` / `evaluateCell(s)` call. All-zero when cycle
+    /// detection is `"static"` or nothing cyclic was evaluated.
+    #[wasm_bindgen(js_name = "lastCycleTelemetry")]
+    pub fn last_cycle_telemetry(&self) -> Result<JsValue, JsValue> {
+        let wb = self
+            .inner
+            .read()
+            .map_err(|_| js_error("failed to lock workbook for read"))?;
+        let t = wb.engine().last_cycle_telemetry();
+
+        let obj = js_sys::Object::new();
+        set(&obj, "staticSccs", JsValue::from_f64(t.static_sccs as f64))?;
+        set(
+            &obj,
+            "phantomSccs",
+            JsValue::from_f64(t.phantom_sccs as f64),
+        )?;
+        set(
+            &obj,
+            "liveCyclesWitnessed",
+            JsValue::from_f64(t.live_cycles_witnessed as f64),
+        )?;
+        set(
+            &obj,
+            "circCellsStamped",
+            JsValue::from_f64(t.circ_cells_stamped as f64),
+        )?;
+        set(
+            &obj,
+            "settlePassesTotal",
+            JsValue::from_f64(t.settle_passes_total as f64),
+        )?;
+        set(
+            &obj,
+            "maxPassesSingleScc",
+            JsValue::from_f64(t.max_passes_single_scc as f64),
+        )?;
+        set(
+            &obj,
+            "iteratedSccs",
+            JsValue::from_f64(t.iterated_sccs as f64),
+        )?;
+        set(
+            &obj,
+            "convergedSccs",
+            JsValue::from_f64(t.converged_sccs as f64),
+        )?;
+        set(&obj, "cappedSccs", JsValue::from_f64(t.capped_sccs as f64))?;
+        set(
+            &obj,
+            "maxAbsDeltaAtStop",
+            JsValue::from_f64(t.max_abs_delta_at_stop),
+        )?;
+        set(
+            &obj,
+            "nanConverged",
+            JsValue::from_f64(t.nan_converged as f64),
+        )?;
+        set(&obj, "reusedSccs", JsValue::from_f64(t.reused_sccs as f64))?;
+        set(
+            &obj,
+            "reusedSccMembers",
+            JsValue::from_f64(t.reused_scc_members as f64),
+        )?;
+        // u128 -> u64 saturation mirrors the Python binding; the u64 -> f64
+        // conversion is then lossless for any realistic duration.
+        set(
+            &obj,
+            "elapsedMs",
+            JsValue::from_f64(u64::try_from(t.elapsed_ms).unwrap_or(u64::MAX) as f64),
+        )?;
+        Ok(obj.into())
     }
 
     pub(crate) fn inner_arc(&self) -> Arc<RwLock<formualizer::workbook::Workbook>> {
@@ -1091,12 +1553,7 @@ impl Sheet {
             .write()
             .map_err(|_| js_error("failed to lock workbook for write"))?
             .evaluate_cell(&self.name, row, col)
-            .map_err(|e| {
-                js_error(format!(
-                    "evaluate_cell failed for {sheet}!R{row}C{col}: {e}",
-                    sheet = self.name
-                ))
-            })?;
+            .map_err(workbook_error_to_js)?;
         Ok(literal_to_js(&v))
     }
 
