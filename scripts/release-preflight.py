@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""Verify Formualizer release archives before a tag can publish them.
+
+The preflight builds crates in publish order against a temporary local Cargo
+registry, so downstream archives resolve the exact prospective upstream
+archives rather than workspace path dependencies or older crates.io releases.
+It also rejects source drift when a package version already exists on crates.io.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import tomllib
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGET = ROOT / "target"
+LOCK_PATH = TARGET / "release-preflight.lock"
+TOOL_VERSION = "0.2.12"
+TOOLCHAIN = "1.93.0"
+TOOL_ROOT = TARGET / "release-preflight-tools" / f"cargo-local-registry-{TOOL_VERSION}"
+TOOL_BIN = TOOL_ROOT / "bin" / "cargo-local-registry"
+TOOL_CARGO_HOME = TARGET / "release-preflight-cargo-home"
+USER_AGENT = "formualizer-release-preflight/1 (https://github.com/psu3d0/formualizer)"
+DIRECT_SECRET_ENV = frozenset({"CARGO_REGISTRY_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"})
+
+
+@dataclass(frozen=True)
+class Package:
+    name: str
+    manifest: str
+
+    def version(self) -> str:
+        data = tomllib.loads((ROOT / self.manifest).read_text(encoding="utf-8"))
+        return str(data["package"]["version"])
+
+    def archive(self) -> Path:
+        return TARGET / "package" / f"{self.name}-{self.version()}.crate"
+
+
+COMMON = Package("formualizer-common", "crates/formualizer-common/Cargo.toml")
+PARSE = Package("formualizer-parse", "crates/formualizer-parse/Cargo.toml")
+SPEC = Package("sheetport-spec", "crates/sheetport-spec/Cargo.toml")
+MACROS = Package("formualizer-macros", "crates/formualizer-macros/Cargo.toml")
+EVAL = Package("formualizer-eval", "crates/formualizer-eval/Cargo.toml")
+WORKBOOK = Package("formualizer-workbook", "crates/formualizer-workbook/Cargo.toml")
+SHEETPORT = Package("formualizer-sheetport", "crates/formualizer-sheetport/Cargo.toml")
+FORMUALIZER = Package("formualizer", "crates/formualizer/Cargo.toml")
+
+TRACKS: dict[str, tuple[Package, ...]] = {
+    "parse": (COMMON, PARSE),
+    "spec": (SPEC,),
+    "product": (COMMON, PARSE, SPEC, MACROS, EVAL, WORKBOOK, SHEETPORT, FORMUALIZER),
+}
+
+# Binding crates ship through C, PyPI, and npm channels rather than crates.io.
+BINDING_PACKAGE_POLICY: tuple[tuple[str, str], ...] = (
+    ("crates/formualizer-cffi/Cargo.toml", "formualizer-cffi"),
+    ("bindings/python/Cargo.toml", "formualizer-python"),
+    ("bindings/wasm/Cargo.toml", "formualizer-wasm"),
+)
+
+VALUE_FEATURE_POLICY_MANIFEST = "crates/formualizer/Cargo.toml"
+RELEASE_METADATA_KEY = "formualizer-release"
+# Fixed release policy: (name, manifest, dependency, exact target, source manifest).
+BindingFeatureProfile = tuple[str, str, str, str | None, str]
+BINDING_FEATURE_PROFILES: tuple[BindingFeatureProfile, ...] = (
+    ("cffi-native", "crates/formualizer-cffi/Cargo.toml", "formualizer-workbook", None,
+     "crates/formualizer-workbook/Cargo.toml"),
+    ("python-native", "bindings/python/Cargo.toml", "formualizer",
+     'cfg(not(target_os = "emscripten"))', VALUE_FEATURE_POLICY_MANIFEST),
+    ("python-pyodide", "bindings/python/Cargo.toml", "formualizer",
+     'cfg(target_os = "emscripten")', VALUE_FEATURE_POLICY_MANIFEST),
+    ("wasm-browser", "bindings/wasm/Cargo.toml", "formualizer", None, VALUE_FEATURE_POLICY_MANIFEST),
+)
+APPROVED_VALUE_FEATURE_OPT_OUTS = {("python-pyodide", "system-clock")}
+SEMANTIC_PACKAGES = frozenset({
+    "formualizer", "formualizer-eval", "formualizer-workbook",
+    "formualizer-sheetport",
+})
+
+
+def validate_binding_package_policy(root: Path = ROOT) -> None:
+    """Require exact identities and literal non-publishable binding manifests."""
+
+    binding_names = {name for _, name in BINDING_PACKAGE_POLICY}
+    track_names = {
+        package.name for packages in TRACKS.values() for package in packages
+    }
+    overlap = sorted(binding_names & track_names)
+    if overlap:
+        raise RuntimeError(
+            "binding package policy: crates.io release tracks include "
+            + ", ".join(overlap)
+        )
+
+    for manifest, expected_name in BINDING_PACKAGE_POLICY:
+        manifest_path = root / manifest
+        try:
+            data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeError(
+                f"binding package policy {manifest}: cannot parse manifest: {exc}"
+            ) from exc
+        package = data.get("package")
+        if not isinstance(package, dict) or package.get("name") != expected_name:
+            actual_name = package.get("name") if isinstance(package, dict) else None
+            raise RuntimeError(
+                f"binding package policy {manifest}: expected package name "
+                f"{expected_name!r}, found {actual_name!r}"
+            )
+        if package.get("publish") is not False:
+            raise RuntimeError(
+                f"binding package policy {manifest}: package {expected_name!r} "
+                "must set literal publish = false"
+            )
+
+
+def read_manifest(root: Path, relative: str) -> dict[str, Any]:
+    try:
+        return tomllib.loads((root / relative).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"binding feature policy {relative}: {exc}") from exc
+
+
+def require_policy(ok: bool, context: str, message: str) -> None:
+    if not ok:
+        raise RuntimeError(f"binding feature policy {context}: {message}")
+
+
+def policy_table(value: Any, context: str, name: str) -> dict[str, Any]:
+    require_policy(isinstance(value, dict), context, f"{name} must be a table")
+    return value
+
+
+def string_list(value: Any, context: str, name: str) -> list[str]:
+    valid = isinstance(value, list) and all(isinstance(v, str) for v in value)
+    require_policy(valid, context, f"{name} must be a string list")
+    return value
+
+
+def feature_table(data: dict[str, Any], manifest: str) -> dict[str, list[str]]:
+    raw = policy_table(data.get("features", {}), manifest, "features")
+    return {name: string_list(value, manifest, f"feature {name!r}") for name, value in raw.items()}
+
+
+def dependency_edges(data: dict[str, Any], dependency: str, manifest: str) -> dict[str | None, dict[str, Any]]:
+    locations: list[tuple[str | None, Any]] = [(None, data.get("dependencies", {}))]
+    for target, value in policy_table(data.get("target", {}), manifest, "target").items():
+        target_table = policy_table(value, manifest, f"target {target!r}")
+        locations.append((target, target_table.get("dependencies", {})))
+    result = {}
+    for target, value in locations:
+        dependencies = policy_table(value, manifest, "dependencies")
+        aliases = [
+            name
+            for name, edge in dependencies.items()
+            if name != dependency and isinstance(edge, dict)
+            and edge.get("package") == dependency
+        ]
+        require_policy(
+            not aliases, manifest,
+            f"renamed policy dependency {dependency!r} is unsupported: {aliases}",
+        )
+        if dependency in dependencies:
+            result[target] = policy_table(
+                dependencies[dependency], manifest, f"dependency {dependency!r}"
+            )
+    return result
+
+
+def reject_alternate_semantic_edges(
+    root: Path, bindings: dict[str, dict[str, Any]]
+) -> None:
+    """Reject direct semantic-crate edges outside the fixed profile inventory."""
+    workspace = policy_table(
+        read_manifest(root, "Cargo.toml").get("workspace"), "Cargo.toml", "workspace"
+    )
+    workspace_dependencies = policy_table(
+        workspace.get("dependencies"), "Cargo.toml", "workspace.dependencies"
+    )
+    expected = {
+        (manifest, dependency, target)
+        for _, manifest, dependency, target, _ in BINDING_FEATURE_PROFILES
+    }
+    for manifest, binding in bindings.items():
+        locations: list[tuple[str | None, Any]] = [
+            (None, binding.get("dependencies", {}))
+        ]
+        targets = policy_table(binding.get("target", {}), manifest, "target")
+        for target, value in targets.items():
+            target_table = policy_table(value, manifest, f"target {target!r}")
+            locations.append((target, target_table.get("dependencies", {})))
+        for target, value in locations:
+            dependencies = policy_table(value, manifest, "dependencies")
+            for alias, edge in dependencies.items():
+                declaration = edge
+                if isinstance(edge, dict) and edge.get("workspace") is True:
+                    declaration = workspace_dependencies.get(alias)
+                package = (
+                    declaration.get("package", alias)
+                    if isinstance(declaration, dict)
+                    else alias
+                )
+                if package in SEMANTIC_PACKAGES:
+                    require_policy(
+                        (manifest, alias, target) in expected, manifest,
+                        f"alternate semantic dependency {alias!r} ({package!r}) "
+                        f"at target {target!r} is unsupported",
+                    )
+
+
+def effective_edge(root: Path, profile: BindingFeatureProfile, edge: dict[str, Any]) -> dict[str, Any]:
+    name, manifest, dependency, _, _ = profile
+    inherited: dict[str, Any] = {}
+    if name == "cffi-native":
+        require_policy(edge.get("workspace") is True, manifest, "expected workspace edge")
+        require_policy(
+            "default-features" not in edge, manifest,
+            "workspace member default-features override is unsupported",
+        )
+        require_policy(set(edge) <= {"workspace", "features"}, manifest, "unsupported workspace member inheritance")
+        workspace = policy_table(read_manifest(root, "Cargo.toml").get("workspace"), "Cargo.toml", "workspace")
+        dependencies = policy_table(workspace.get("dependencies"), "Cargo.toml", "workspace.dependencies")
+        inherited = policy_table(dependencies.get(dependency), "Cargo.toml", f"workspace dependency {dependency!r}")
+        supported = {"path", "version", "package", "features", "default-features"}
+        require_policy(set(inherited) <= supported, "Cargo.toml", "unsupported workspace dependency inheritance")
+    else:
+        require_policy("workspace" not in edge, manifest, "workspace edge is unsupported")
+        supported = {"path", "version", "package", "features", "default-features", "optional"}
+        require_policy(set(edge) <= supported, manifest, "unsupported policy dependency fields")
+    non_optional = inherited.get("optional") in (None, False) and edge.get(
+        "optional"
+    ) in (None, False)
+    require_policy(
+        non_optional, manifest,
+        f"optional policy dependency {dependency!r} is unsupported",
+    )
+    inherited_features = string_list(inherited.get("features", []), manifest, "inherited dependency features")
+    explicit_features = string_list(edge.get("features", []), manifest, "dependency features")
+    default_features = inherited.get("default-features", edge.get("default-features", True))
+    require_policy(isinstance(default_features, bool), manifest, "default-features must be boolean")
+    return {
+        **inherited, **edge,
+        "features": [*inherited_features, *explicit_features],
+        "default-features": default_features,
+    }
+
+
+def local_source(root: Path, profile: BindingFeatureProfile, edge: dict[str, Any]) -> dict[str, Any]:
+    _, manifest, dependency, _, source_manifest = profile
+    declared = edge.get("path")
+    require_policy(isinstance(declared, str), manifest, "local path is required")
+    checkout = Path(os.path.abspath(root))
+    base = checkout if edge.get("workspace") is True else (checkout / manifest).parent
+    source_dir = Path(os.path.abspath(base / declared))
+    require_policy(source_dir.is_relative_to(checkout), manifest, "source leaves checkout")
+    cursor = checkout
+    for part in source_dir.relative_to(checkout).parts:
+        cursor /= part
+        require_policy(not cursor.is_symlink(), manifest, "symlinked source path")
+    require_policy(source_dir.is_dir(), manifest, "source path must be a directory")
+    expected = (checkout / source_manifest).parent.resolve()
+    require_policy(
+        source_dir.resolve() == expected, manifest, f"source is not {source_manifest}"
+    )
+    source_file = source_dir / "Cargo.toml"
+    require_policy(not source_file.is_symlink(), manifest, "symlinked source Cargo.toml")
+    require_policy(source_file.is_file(), manifest, "source Cargo.toml must be a file")
+    require_policy(
+        source_file.resolve().is_relative_to(checkout.resolve()), manifest,
+        "source Cargo.toml leaves checkout",
+    )
+    source = read_manifest(root, source_manifest)
+    package = policy_table(source.get("package"), source_manifest, "package")
+    require_policy(
+        package.get("name") == edge.get("package", dependency), manifest,
+        "dependency package identity mismatch",
+    )
+    return source
+
+
+def alias_closure(source: dict[str, Any], initial: set[str], manifest: str) -> set[str]:
+    """Expand same-package aliases; external dependency forwarding stays opaque."""
+    features = feature_table(source, manifest)
+    active: set[str] = set()
+    pending = list(initial)
+    while pending:
+        feature = pending.pop()
+        if feature in active:
+            continue
+        require_policy(feature in features, manifest, f"unknown feature {feature!r}")
+        active.add(feature)
+        for member in features[feature]:
+            if member.startswith("dep:") or "/" in member:
+                continue
+            require_policy(member in features, manifest, f"unsupported same-package feature member {member!r}")
+            pending.append(member)
+    return active
+
+
+def validate_binding_value_feature_policy(root: Path = ROOT) -> dict[str, dict[str, str]]:
+    """Validate the fixed profiles without approximating general Cargo resolution."""
+    product = read_manifest(root, VALUE_FEATURE_POLICY_MANIFEST)
+    package = policy_table(product.get("package"), VALUE_FEATURE_POLICY_MANIFEST, "package")
+    metadata = policy_table(package.get("metadata"), VALUE_FEATURE_POLICY_MANIFEST, "package.metadata")
+    policy = policy_table(metadata.get(RELEASE_METADATA_KEY), VALUE_FEATURE_POLICY_MANIFEST, RELEASE_METADATA_KEY)
+    require_policy(set(policy) == {"value-affecting-features"}, VALUE_FEATURE_POLICY_MANIFEST, "metadata schema drift")
+    value_features = policy_table(
+        policy["value-affecting-features"], VALUE_FEATURE_POLICY_MANIFEST,
+        "value-affecting-features",
+    )
+    declared_features = feature_table(product, VALUE_FEATURE_POLICY_MANIFEST)
+    require_policy(bool(value_features), VALUE_FEATURE_POLICY_MANIFEST, "empty policy")
+    for feature, rationale in value_features.items():
+        valid = feature in declared_features and isinstance(rationale, str) and bool(rationale.strip())
+        require_policy(valid, VALUE_FEATURE_POLICY_MANIFEST, f"invalid value-affecting feature {feature!r}")
+
+    manifests = {profile[1] for profile in BINDING_FEATURE_PROFILES}
+    bindings = {manifest: read_manifest(root, manifest) for manifest in manifests}
+    reject_alternate_semantic_edges(root, bindings)
+    opt_outs: dict[str, dict[str, str]] = {}
+    for manifest, binding in bindings.items():
+        binding_package = policy_table(binding.get("package"), manifest, "package")
+        binding_metadata = policy_table(binding_package.get("metadata", {}), manifest, "package.metadata")
+        binding_policy = binding_metadata.get(RELEASE_METADATA_KEY)
+        if binding_policy is None:
+            continue
+        require_policy(manifest == "bindings/python/Cargo.toml", manifest, "binding release metadata is unsupported")
+        binding_policy = policy_table(binding_policy, manifest, RELEASE_METADATA_KEY)
+        require_policy(set(binding_policy) == {"value-feature-opt-outs"}, manifest, "metadata schema drift")
+        profile_values = policy_table(binding_policy["value-feature-opt-outs"], manifest, "value-feature-opt-outs")
+        for profile, values in profile_values.items():
+            require_policy(profile not in opt_outs, manifest, f"duplicate opt-out profile {profile!r}")
+            opt_outs[profile] = policy_table(values, manifest, f"opt-outs for {profile!r}")
+
+    profile_names = {profile[0] for profile in BINDING_FEATURE_PROFILES}
+    require_policy(set(opt_outs) <= profile_names, "metadata", "unknown opt-out profile")
+    for profile, values in opt_outs.items():
+        for feature, rationale in values.items():
+            require_policy(
+                (profile, feature) in APPROVED_VALUE_FEATURE_OPT_OUTS, profile,
+                f"unapproved opt-out for {feature!r}",
+            )
+            substantive = isinstance(rationale, str) and len(rationale.strip()) >= 40 and len(rationale.split()) >= 8
+            require_policy(substantive, profile, f"opt-out for {feature!r} needs a substantive rationale")
+
+    expected_edges: dict[tuple[str, str], set[str | None]] = {}
+    for _, manifest, dependency, target, _ in BINDING_FEATURE_PROFILES:
+        expected_edges.setdefault((manifest, dependency), set()).add(target)
+    for (manifest, dependency), expected in expected_edges.items():
+        actual = set(dependency_edges(bindings[manifest], dependency, manifest))
+        require_policy(
+            actual == expected, manifest,
+            f"dependency {dependency!r} edges {actual!r}, expected {expected!r}",
+        )
+        forwarded = [
+            item
+            for values in feature_table(bindings[manifest], manifest).values()
+            for item in values
+            if item.startswith((f"{dependency}/", f"{dependency}?/"))
+        ]
+        weak = [item for item in forwarded if item.startswith(f"{dependency}?/")]
+        require_policy(not weak, manifest, f"weak forwarding is unsupported: {weak}")
+        activated: set[str] = set()
+        if forwarded:
+            source_manifest = next(
+                profile[4]
+                for profile in BINDING_FEATURE_PROFILES
+                if profile[1:3] == (manifest, dependency)
+            )
+            source = read_manifest(root, source_manifest)
+            for item in forwarded:
+                activated.update(
+                    alias_closure(source, {item.split("/", 1)[1]}, source_manifest)
+                )
+        relevant = sorted(activated & set(value_features))
+        require_policy(
+            not relevant, manifest,
+            f"binding forwarding enables value-affecting features: {relevant}",
+        )
+
+    coverage: dict[str, dict[str, str]] = {}
+    for profile in BINDING_FEATURE_PROFILES:
+        name, manifest, dependency, target, source_manifest = profile
+        context = f"{manifest} profile {name}"
+        edge = dependency_edges(bindings[manifest], dependency, manifest)[target]
+        edge = effective_edge(root, profile, edge)
+        source = local_source(root, profile, edge)
+        initial = set(edge["features"])
+        if edge["default-features"]:
+            initial.add("default")
+        active = alias_closure(source, initial, source_manifest)
+        coverage[name] = {}
+        for feature in value_features:
+            rationale = opt_outs.get(name, {}).get(feature)
+            require_policy(
+                not (feature in active and rationale), context,
+                f"stale opt-out for enabled feature {feature!r}",
+            )
+            require_policy(
+                feature in active or rationale is not None, context,
+                f"value-affecting feature {feature!r} is uncovered",
+            )
+            coverage[name][feature] = "enabled" if feature in active else f"opt-out: {rationale}"
+    return coverage
+
+
+def validate_parser_track_lockstep(
+    track: str, *, lookup: Callable[[str, str], Any] | None = None
+) -> None:
+    """The parser/SDK crates share one version, and product releases need it published.
+
+    docs/packaging-and-releases.md: ``formualizer-common`` and ``formualizer-parse``
+    ship together under one ``parse-v*`` tag. The product publish job never
+    publishes them, so a product release whose manifests pin an unpublished
+    parser-track version passes local packaging (the staging registry contains
+    the workspace archives) and then fails against the real registry.
+    """
+
+    common_version = COMMON.version()
+    parse_version = PARSE.version()
+    if common_version != parse_version:
+        raise RuntimeError(
+            f"parser track lockstep: {COMMON.name} is {common_version} but "
+            f"{PARSE.name} is {parse_version}; bump both with "
+            "scripts/bump-version.py --track parse"
+        )
+    if track != "product":
+        return
+    resolve = crates_io_version if lookup is None else lookup
+    for package in TRACKS["parse"]:
+        version = package.version()
+        if resolve(package.name, version) is None:
+            raise RuntimeError(
+                f"parser track lockstep: {package.name} {version} is not published "
+                f"on crates.io; release parse-v{version} before the product track"
+            )
+
+
+# Cargo-generated metadata varies with the packaging Cargo version or source
+# commit. Cargo.toml.orig and every shipped source/data/doc file remain in the
+# comparison, so dependency requirements and payload behavior are still covered.
+DRIFT_EXCLUDES = frozenset({".cargo_vcs_info.json", "Cargo.toml", "Cargo.lock"})
+
+
+def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+    print("+", " ".join(command), flush=True)
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def command_output(command: list[str], *, env: dict[str, str] | None = None) -> str:
+    return subprocess.check_output(command, cwd=ROOT, env=env, text=True).strip()
+
+
+def credential_free_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in list(env):
+        if key in DIRECT_SECRET_ENV or (
+            key.startswith("CARGO_REGISTRIES_") and key.endswith("_TOKEN")
+        ):
+            env.pop(key)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def assert_safe_project_path(path: Path) -> None:
+    """Refuse symlinks for persistent preflight state below the repo target."""
+
+    target = TARGET
+    if target.exists() and target.is_symlink():
+        raise RuntimeError(f"refusing symlinked target directory: {target}")
+    try:
+        relative = path.relative_to(target)
+    except ValueError as exc:
+        raise RuntimeError(f"persistent path is outside target: {path}") from exc
+    cursor = target
+    for part in relative.parts:
+        cursor /= part
+        if cursor.exists() and cursor.is_symlink():
+            raise RuntimeError(f"refusing symlinked preflight path: {cursor}")
+
+
+def reject_tree_symlinks(root: Path) -> None:
+    if not root.exists():
+        return
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in [*names, *files]:
+            candidate = directory_path / name
+            if candidate.is_symlink():
+                raise RuntimeError(
+                    f"refusing symlink in persistent preflight state: {candidate}"
+                )
+
+
+def ensure_clean(allow_dirty: bool) -> None:
+    status = command_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    if status and not allow_dirty:
+        raise RuntimeError(
+            "release preflight requires a clean checkout; commit/revert changes or pass "
+            "--allow-dirty for development-only validation\n" + status
+        )
+
+
+@contextlib.contextmanager
+def exclusive_lock() -> Iterator[None]:
+    assert_safe_project_path(LOCK_PATH)
+    TARGET.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        print("Waiting for exclusive release-preflight lock...", flush=True)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        print("Acquired release-preflight lock.", flush=True)
+        yield
+
+
+def ensure_local_registry_tool() -> Path:
+    assert_safe_project_path(TOOL_BIN)
+    assert_safe_project_path(TOOL_CARGO_HOME)
+    reject_tree_symlinks(TOOL_ROOT)
+    reject_tree_symlinks(TOOL_CARGO_HOME)
+    if TOOL_BIN.exists():
+        actual = command_output([str(TOOL_BIN), "--version"])
+        if actual == f"cargo-local-registry {TOOL_VERSION}":
+            return TOOL_BIN
+        raise RuntimeError(f"unexpected tool at {TOOL_BIN}: {actual}")
+
+    TOOL_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    TOOL_CARGO_HOME.mkdir(parents=True, exist_ok=True)
+    install_root = Path(
+        tempfile.mkdtemp(prefix="cargo-local-registry-install-", dir=TOOL_ROOT.parent)
+    )
+    try:
+        env = credential_free_environment()
+        env["CARGO_HOME"] = str(TOOL_CARGO_HOME)
+        run(
+            [
+                "cargo",
+                f"+{TOOLCHAIN}",
+                "install",
+                "cargo-local-registry",
+                "--version",
+                TOOL_VERSION,
+                "--locked",
+                "--root",
+                str(install_root),
+            ],
+            env=env,
+        )
+        candidate = install_root / "bin" / "cargo-local-registry"
+        actual = command_output([str(candidate), "--version"])
+        if actual != f"cargo-local-registry {TOOL_VERSION}":
+            raise RuntimeError(f"installed unexpected cargo-local-registry: {actual}")
+        if TOOL_ROOT.exists():
+            raise RuntimeError(f"tool destination appeared concurrently: {TOOL_ROOT}")
+        install_root.rename(TOOL_ROOT)
+    finally:
+        if install_root.exists():
+            shutil.rmtree(install_root)
+    return TOOL_BIN
+
+
+def registry_index_path(registry: Path, name: str) -> Path:
+    name = name.lower()
+    if len(name) == 1:
+        relative = Path("1") / name
+    elif len(name) == 2:
+        relative = Path("2") / name
+    elif len(name) == 3:
+        relative = Path("3") / name[0] / name
+    else:
+        relative = Path(name[:2]) / name[2:4] / name
+    return registry / "index" / relative
+
+
+def read_archive_file(archive: Path, relative: str) -> bytes:
+    root = f"{archive.name.removesuffix('.crate')}"
+    member_name = f"{root}/{relative}"
+    with tarfile.open(archive, "r:gz") as tf:
+        try:
+            member = tf.getmember(member_name)
+        except KeyError as exc:
+            raise RuntimeError(f"archive is missing {member_name}") from exc
+        fileobj = tf.extractfile(member)
+        if fileobj is None:
+            raise RuntimeError(f"archive member is not a file: {member_name}")
+        return fileobj.read()
+
+
+def dependency_records(
+    table: dict[str, Any], kind: str, target: str | None
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for alias, raw in sorted(table.items()):
+        data = raw if isinstance(raw, dict) else {"version": raw}
+        item: dict[str, Any] = {
+            "name": alias,
+            "req": str(data.get("version", "*")),
+            "features": list(data.get("features", [])),
+            "optional": bool(data.get("optional", False)),
+            "default_features": bool(data.get("default-features", True)),
+            "target": target,
+            "kind": kind,
+        }
+        if "package" in data:
+            item["package"] = str(data["package"])
+        if "registry" in data:
+            item["registry"] = str(data["registry"])
+        records.append(item)
+    return records
+
+
+def index_record_from_archive(archive: Path) -> dict[str, Any]:
+    manifest = tomllib.loads(read_archive_file(archive, "Cargo.toml").decode("utf-8"))
+    package = manifest["package"]
+    dependencies: list[dict[str, Any]] = []
+    dependencies.extend(
+        dependency_records(manifest.get("dependencies", {}), "normal", None)
+    )
+    dependencies.extend(
+        dependency_records(manifest.get("dev-dependencies", {}), "dev", None)
+    )
+    dependencies.extend(
+        dependency_records(manifest.get("build-dependencies", {}), "build", None)
+    )
+    for target, tables in sorted(manifest.get("target", {}).items()):
+        dependencies.extend(
+            dependency_records(tables.get("dependencies", {}), "normal", target)
+        )
+        dependencies.extend(
+            dependency_records(tables.get("dev-dependencies", {}), "dev", target)
+        )
+        dependencies.extend(
+            dependency_records(tables.get("build-dependencies", {}), "build", target)
+        )
+
+    ordinary_features: dict[str, list[str]] = {}
+    namespaced_features: dict[str, list[str]] = {}
+    for feature, values in sorted(manifest.get("features", {}).items()):
+        values = list(values)
+        if any(value.startswith("dep:") or "?/" in value for value in values):
+            namespaced_features[feature] = values
+        else:
+            ordinary_features[feature] = values
+
+    record: dict[str, Any] = {
+        "name": str(package["name"]),
+        "vers": str(package["version"]),
+        "deps": dependencies,
+        "cksum": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "features": ordinary_features,
+        "yanked": False,
+    }
+    if namespaced_features:
+        record["features2"] = namespaced_features
+        record["v"] = 2
+    if package.get("links"):
+        record["links"] = str(package["links"])
+    if package.get("rust-version"):
+        record["rust_version"] = str(package["rust-version"])
+    return record
+
+
+def registry_has_version(registry: Path, name: str, version: str) -> bool:
+    index_path = registry_index_path(registry, name)
+    if not index_path.exists():
+        return False
+    return any(
+        json.loads(line).get("vers") == version
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+        if line
+    )
+
+
+def add_archive_to_registry(registry: Path, archive: Path) -> dict[str, Any]:
+    record = index_record_from_archive(archive)
+    destination = registry / archive.name
+    shutil.copyfile(archive, destination)
+    index_path = registry_index_path(registry, record["name"])
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[dict[str, Any]] = []
+    if index_path.exists():
+        existing = [
+            json.loads(line) for line in index_path.read_text().splitlines() if line
+        ]
+    existing = [item for item in existing if item.get("vers") != record["vers"]]
+    existing.append(record)
+    existing.sort(key=lambda item: item["vers"])
+    index_path.write_text(
+        "".join(
+            json.dumps(item, separators=(",", ":"), sort_keys=True) + "\n"
+            for item in existing
+        ),
+        encoding="utf-8",
+    )
+    print(f"Staged {record['name']} {record['vers']} ({record['cksum']})", flush=True)
+    return record
+
+
+def archive_payload(archive: Path) -> dict[str, str]:
+    """Return stable shipped-file hashes and reject unsafe/ambiguous members."""
+
+    expected_root = archive.name.removesuffix(".crate")
+    payload: dict[str, str] = {}
+    with tarfile.open(archive, "r:gz") as tf:
+        for member in tf.getmembers():
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise RuntimeError(f"unsafe archive path: {member.name}")
+            if not path.parts or path.parts[0] != expected_root:
+                raise RuntimeError(f"unexpected archive root: {member.name}")
+            if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                raise RuntimeError(f"unsafe archive member type: {member.name}")
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise RuntimeError(f"unsupported archive member type: {member.name}")
+            relative = PurePosixPath(*path.parts[1:]).as_posix()
+            if relative in DRIFT_EXCLUDES:
+                continue
+            if relative in payload:
+                raise RuntimeError(f"duplicate archive member: {relative}")
+            fileobj = tf.extractfile(member)
+            if fileobj is None:
+                raise RuntimeError(f"could not read archive member: {member.name}")
+            payload[relative] = hashlib.sha256(fileobj.read()).hexdigest()
+    return payload
+
+
+def crates_io_version(name: str, version: str) -> dict[str, Any] | None:
+    url = f"https://crates.io/api/v1/crates/{name}/{version}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)["version"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def download_registry_archive(
+    name: str, version: str, destination: Path, expected: str
+) -> None:
+    url = f"https://crates.io/api/v1/crates/{name}/{version}/download"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with (
+        urllib.request.urlopen(request, timeout=60) as response,
+        destination.open("wb") as output,
+    ):
+        shutil.copyfileobj(response, output)
+    actual = hashlib.sha256(destination.read_bytes()).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"registry checksum mismatch for {name} {version}: expected {expected}, got {actual}"
+        )
+
+
+def check_same_version_drift(
+    package: Package, local_archive: Path, downloads: Path
+) -> str:
+    version = package.version()
+    metadata = crates_io_version(package.name, version)
+    if metadata is None:
+        print(f"No crates.io collision for {package.name} {version}.", flush=True)
+        return "new"
+
+    registry_archive = downloads / f"{package.name}-{version}.crate"
+    download_registry_archive(
+        package.name, version, registry_archive, str(metadata["checksum"])
+    )
+    local_payload = archive_payload(local_archive)
+    registry_payload = archive_payload(registry_archive)
+    if local_payload != registry_payload:
+        local_names = set(local_payload)
+        registry_names = set(registry_payload)
+        added = sorted(local_names - registry_names)
+        removed = sorted(registry_names - local_names)
+        changed = sorted(
+            name
+            for name in local_names & registry_names
+            if local_payload[name] != registry_payload[name]
+        )
+        details = [
+            f"same-version source drift for {package.name} {version}",
+            f"  added: {added[:20]}",
+            f"  removed: {removed[:20]}",
+            f"  changed: {changed[:20]}",
+            "bump the package version or restore the published payload before release",
+        ]
+        raise RuntimeError("\n".join(details))
+    print(f"Published payload matches {package.name} {version}.", flush=True)
+    return "matching"
+
+
+def staging_environment(cargo_home: Path, registry: Path) -> dict[str, str]:
+    cargo_home.mkdir(parents=True)
+    config = f"""[source.crates-io]\nreplace-with = "formualizer-preflight"\n\n[source.formualizer-preflight]\nlocal-registry = {json.dumps(str(registry))}\n\n[net]\ngit-fetch-with-cli = true\n"""
+    (cargo_home / "config.toml").write_text(config, encoding="utf-8")
+    env = credential_free_environment()
+    env["CARGO_HOME"] = str(cargo_home)
+    return env
+
+
+def package_one(
+    package: Package, env: dict[str, str] | None, *, allow_dirty: bool
+) -> Path:
+    archive = package.archive()
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if archive.exists():
+        archive.unlink()
+    command = ["cargo", "package", "-p", package.name, "--locked"]
+    if allow_dirty:
+        command.append("--allow-dirty")
+    run(command, env=env)
+    if not archive.is_file():
+        raise RuntimeError(f"cargo package did not produce {archive}")
+    archive_payload(archive)
+    record = index_record_from_archive(archive)
+    if record["name"] != package.name or record["vers"] != package.version():
+        raise RuntimeError(f"archive identity mismatch for {package.name}: {record}")
+    return archive
+
+
+def seed_patched_registry_dependencies(
+    tool: Path,
+    registry: Path,
+    env: dict[str, str],
+    packages: tuple[Package, ...],
+) -> None:
+    """Add crates whose registry lock entry was replaced by a git/path patch."""
+
+    metadata = json.loads(
+        command_output(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            env=credential_free_environment(),
+        )
+    )
+    lock = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
+    locked: dict[str, set[str]] = {}
+    for package in lock.get("package", []):
+        locked.setdefault(str(package["name"]), set()).add(str(package["version"]))
+
+    requirements: dict[str, set[str]] = {}
+    package_names = {package.name for package in packages}
+    for metadata_package in metadata["packages"]:
+        if metadata_package["name"] not in package_names:
+            continue
+        for dependency in metadata_package["dependencies"]:
+            source = dependency.get("source") or ""
+            if not source.startswith("registry+"):
+                continue
+            requirements.setdefault(str(dependency["name"]), set()).add(
+                str(dependency["req"])
+            )
+
+    for name, reqs in sorted(requirements.items()):
+        candidates = locked.get(name, set())
+        exact = {req[1:] for req in reqs if req.startswith("=")}
+        versions = sorted(candidates & exact if exact else candidates)
+        for version in versions:
+            if registry_has_version(registry, name, version):
+                continue
+            print(
+                f"Seeding registry fallback for patched dependency {name} {version}.",
+                flush=True,
+            )
+            run(
+                [str(tool), "add", name, "--version", version, str(registry)],
+                env=env,
+            )
+
+
+def prepare_local_registry(
+    temp_root: Path, packages: tuple[Package, ...]
+) -> tuple[Path, dict[str, str]]:
+    tool = ensure_local_registry_tool()
+    registry = temp_root / "registry"
+    cargo_home = temp_root / "cargo-home"
+    registry.mkdir()
+    env = credential_free_environment()
+    env["CARGO_HOME"] = str(TOOL_CARGO_HOME)
+    run([str(tool), "sync", str(ROOT / "Cargo.lock"), str(registry)], env=env)
+    seed_patched_registry_dependencies(tool, registry, env, packages)
+    return registry, staging_environment(cargo_home, registry)
+
+
+def preflight(track: str, allow_dirty: bool) -> None:
+    validate_binding_package_policy()
+    if track == "product":
+        coverage = validate_binding_value_feature_policy()
+        print(json.dumps({"binding_value_feature_policy": coverage}, indent=2))
+    validate_parser_track_lockstep(track)
+    ensure_clean(allow_dirty)
+    packages = TRACKS[track]
+    with (
+        exclusive_lock(),
+        tempfile.TemporaryDirectory(
+            prefix=f"formualizer-{track}-preflight-"
+        ) as temp_name,
+    ):
+        temp_root = Path(temp_name)
+        downloads = temp_root / "downloads"
+        downloads.mkdir()
+        registry: Path | None = None
+        package_env = credential_free_environment()
+        if len(packages) > 1:
+            registry, package_env = prepare_local_registry(temp_root, packages)
+
+        results: list[dict[str, str]] = []
+        for package in packages:
+            archive = package_one(package, package_env, allow_dirty=allow_dirty)
+            collision = check_same_version_drift(package, archive, downloads)
+            if registry is not None:
+                add_archive_to_registry(registry, archive)
+            results.append(
+                {
+                    "name": package.name,
+                    "version": package.version(),
+                    "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                    "registry_collision": collision,
+                }
+            )
+
+        print(json.dumps({"track": track, "packages": results}, indent=2), flush=True)
+        print(f"Release preflight passed for {track}.", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--track", required=True, choices=sorted(TRACKS))
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="permit uncommitted source for development validation; never use for a release tag",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        preflight(args.track, args.allow_dirty)
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        subprocess.CalledProcessError,
+        tarfile.TarError,
+    ) as exc:
+        print(f"release preflight failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

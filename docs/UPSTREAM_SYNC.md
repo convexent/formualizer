@@ -5,7 +5,7 @@ This document records the divergence audit and the policy for keeping the fork
 in sync. It is referenced by the supermod ExecPlan for issue
 `convexent/supermod#2148`.
 
-## Audit — divergence as of 2026-06-18
+## Audit — divergence as of 2026-06-18 (historical; see the 2026-09-21 sync below)
 
 Measured against `upstream/main` and `origin/main` (fetch both first):
 
@@ -72,6 +72,48 @@ build-artifact cleanup, and the fork's own version-bump release commits.
   PR #20's interim wall-clock guard was evaluated and dropped as strictly
   dominated (timing-sensitive 5s bound, ~44s setup per run, weaker signal), so
   nothing from PR #20 is carried — the fix and its tests all come from upstream.
+
+## Sync — 2026-09-21 (`sync/2026-09-21`, fork 0.5.12 → upstream 0.9.3)
+
+Merged `upstream/main` @ `362becff` (728 upstream-only commits; fork had 12).
+Every fork-only engine commit now exists upstream (verified by matching each
+fork commit to its upstream counterpart and diffing the patches — differences
+were rustfmt/clippy style only):
+
+    5009dd4 drain staged sheets        → upstream c54500ee (#106)
+    39f8bdc date-fn coercion           → upstream eac698b2 (#107)
+    81401cc EDATE/EOMONTH off-by-one    → upstream 5ae1613b
+    5501d95 / abd1dc1 named pass-through → upstream 0d601a1d / 7d87e8e1 (#108)
+    67bd5ef mark_dirty_many port        → upstream original (#139)
+
+All fork test modules (`cross_sheet_named_range_first_cell`,
+`date_function_duration_cells`, `demand_subgraph_named_range`,
+`dn_range_xlsx_subgraph`, `edate_eomonth_engine`, `mark_dirty_multi_source`)
+exist upstream, identical or as supersets, so conflicts in those files were
+resolved to upstream.
+
+**Remaining fork-local carries** (the whole `git diff upstream/main` after the
+merge):
+
+- `crates/formualizer-workbook/src/backends/umya_impl.rs` — the
+  `set_formula_result_*` cached-value write (fork 3392ea8). Upstream moved the
+  umya backend into `umya_impl.rs` (shared via `include!` by the umya 2.3 and
+  umya 3.1 backends, #448) and still uses `set_value_*` + `set_formula_obj`,
+  so the fix was re-ported there. **Note:** at the pinned umya revs
+  (PSU3D0/umya-spreadsheet `4b64d65` for 2.3.2, crates.io 3.1.0) the two paths
+  are behaviourally equivalent: both leave the same `CellValue` state and
+  serialize identical XML, including for loaded files with stale `t="str"`
+  caches. The originally reported openpyxl `str` symptom could not be
+  reproduced against either path during this sync. The port is kept because it
+  uses umya's purpose-built API and is behaviour-neutral. It is guarded by
+  `formula_cached_values_are_saved_as_typed_values`, which asserts the saved
+  sheet XML (upstream's `formula_cache_batch` tests accept string caches). If
+  the next sync wants to minimise divergence, dropping this carry is safe as
+  long as that test stays green.
+- `.gitignore` — local wheel/`dist*` and `repro-*.py` ignores (fork 965e5cd).
+- This file.
+
+Version files were taken from upstream (`0.9.3`, parser track `3.1.2`).
 
 ## Sync policy
 

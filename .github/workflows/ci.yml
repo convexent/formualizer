@@ -16,6 +16,7 @@ concurrency:
 jobs:
   test-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       matrix:
         python-version: ["3.12"]
@@ -58,7 +59,9 @@ jobs:
       working-directory: bindings/python
       run: |
         cargo run --bin stub_gen
-        git diff --exit-code -- formualizer/__init__.pyi
+        git diff --exit-code -- \
+          formualizer/__init__.pyi \
+          formualizer/formualizer_py.pyi
 
     - name: Build Python extension
       working-directory: bindings/python
@@ -78,6 +81,7 @@ jobs:
       run: |
         source .venv/bin/activate
         mypy formualizer
+        python -m mypy.stubtest formualizer --allowlist stubtest_allowlist.txt
 
     - name: Run Python tests with coverage
       working-directory: bindings/python
@@ -94,7 +98,11 @@ jobs:
         if-no-files-found: error
 
   test-rust:
+    # Keep Python and WASM binding crates out of the core Rust pass. They are
+    # covered by test-python and the WASM workflow, and pulling them in here
+    # needlessly compiles PyO3/wasm-bindgen twice.
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
     - uses: actions/checkout@v4
@@ -120,10 +128,20 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run Rust clippy
-      run: cargo clippy --workspace --exclude formualizer-bench-core --all-targets --all-features -- -D warnings
+      run: >-
+        cargo clippy --workspace
+        --exclude formualizer-bench-core
+        --exclude formualizer-python
+        --exclude formualizer-wasm
+        --all-targets --all-features -- -D warnings
 
     - name: Run Rust tests
-      run: cargo test --workspace --exclude formualizer-bench-core --all-features
+      run: >-
+        cargo test --workspace
+        --exclude formualizer-bench-core
+        --exclude formualizer-python
+        --exclude formualizer-wasm
+        --all-features
 
     - name: Run CFFI smoke test
       shell: bash
@@ -139,8 +157,52 @@ jobs:
           -o target/cffi_smoke
         target/cffi_smoke
 
+  public-api:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+    - name: Set up pinned installer Rust
+      uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      with:
+        toolchain: 1.93.0
+
+    - name: Set up pinned rustdoc nightly
+      uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      with:
+        toolchain: nightly-2026-02-16
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Cache public API tooling and build output
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          target/public-api-tools/
+          target/public-api-cargo-home/
+          target/public-api/
+        key: ${{ runner.os }}-public-api-0.52.0-nightly-2026-02-16-${{ hashFiles('**/Cargo.lock', 'scripts/public-api.sh') }}
+        restore-keys: |
+          ${{ runner.os }}-public-api-0.52.0-nightly-2026-02-16-
+
+    - name: Test release preflight helpers
+      run: python3 -m unittest scripts/tests/test_release_preflight.py
+
+    - name: Verify public API tools
+      run: scripts/public-api.sh setup
+
+    - name: Check public Rust API snapshots
+      run: scripts/public-api.sh check
+
+    - name: Test concurrent snapshot updates
+      run: scripts/tests/public-api-concurrency.sh
+
   build-wheels:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
         os: [ubuntu-latest]
@@ -154,6 +216,8 @@ jobs:
     - name: Build wheels
       uses: PyO3/maturin-action@v1
       with:
+        # Avoid maturin-action's broken automatic range resolution on Node 24.
+        maturin-version: v1.11.5
         working-directory: bindings/python
         # Build a single abi3 wheel (not one per Python interpreter)
         # In `act` (local CI), avoid nested manylinux Docker to keep things working.
@@ -170,6 +234,7 @@ jobs:
 
   build-pyodide-wheel:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
@@ -234,6 +299,7 @@ jobs:
     needs: [test-python, test-rust]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 

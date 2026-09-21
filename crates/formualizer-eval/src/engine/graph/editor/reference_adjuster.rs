@@ -1,8 +1,69 @@
 use crate::reference::{CellRef, Coord};
-use formualizer_parse::parser::{ASTNode, ASTNodeType};
+use crate::{SheetId, engine::sheet_registry::SheetRegistry};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
+
+/// How absolute (`$`-anchored) references respond to structural shifts.
+///
+/// Policy decision pinned on issue #168: absolute references TRACK structural
+/// inserts/deletes — the `$` pins copy/fill relocation only, it does not pin
+/// the reference against rows/columns physically moving. A delete that
+/// removes the referenced row/column yields `#REF!` exactly like a relative
+/// reference.
+///
+/// `Pin` preserves the legacy behavior (absolute refs never move under
+/// structural ops) and exists solely for named-range definition adjustment,
+/// which historically pinned absolute anchors; flipping named ranges to
+/// `Track` is a separate policy decision (see the #168 discussion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbsShiftPolicy {
+    /// Absolute references shift with structural inserts/deletes
+    /// (Excel-correct; the default for formula reference adjustment).
+    Track,
+    /// Legacy behavior: absolute references never move under structural ops.
+    Pin,
+}
+
+impl AbsShiftPolicy {
+    #[inline]
+    fn pins(self) -> bool {
+        matches!(self, Self::Pin)
+    }
+}
 
 /// Centralized reference adjustment logic for structural changes
 pub struct ReferenceAdjuster;
+
+/// Sheet binding context for references in the AST being adjusted.
+///
+/// This lets structural adjustment distinguish unqualified references on the
+/// formula's sheet from qualified references to another sheet.
+pub(crate) struct ReferenceContext<'a> {
+    formula_sheet_id: SheetId,
+    sheet_registry: &'a SheetRegistry,
+}
+
+impl<'a> ReferenceContext<'a> {
+    pub(crate) fn new(formula_sheet_id: SheetId, sheet_registry: &'a SheetRegistry) -> Self {
+        Self {
+            formula_sheet_id,
+            sheet_registry,
+        }
+    }
+
+    fn reference_sheet_id(&self, sheet: Option<&str>) -> Option<SheetId> {
+        match sheet {
+            Some(name) => self.sheet_registry.get_id(name),
+            None => Some(self.formula_sheet_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReferenceAdjustment {
+    Reference(ReferenceType),
+    Invalidated,
+}
 
 #[derive(Debug, Clone)]
 pub enum ShiftOperation {
@@ -33,59 +94,205 @@ impl ReferenceAdjuster {
         Self
     }
 
-    /// Adjust an AST for a shift operation, preserving source tokens
+    /// Adjust an AST for a shift operation.
+    /// Absolute references track structural shifts.
+    ///
+    /// This compatibility API retains the historical context-free behavior and
+    /// assumes every cell/range reference binds to the operation's sheet.
     pub fn adjust_ast(&self, ast: &ASTNode, op: &ShiftOperation) -> ASTNode {
-        match &ast.node_type {
-            ASTNodeType::Reference {
-                original,
-                reference,
-            } => {
-                let adjusted = self.adjust_reference(reference, op);
-                ASTNode {
-                    node_type: ASTNodeType::Reference {
-                        original: original.clone(),
+        self.adjust_ast_with_policy(ast, op, AbsShiftPolicy::Track)
+    }
+
+    /// Adjust an AST under an explicit absolute-reference policy.
+    pub(crate) fn adjust_ast_with_policy(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+    ) -> ASTNode {
+        self.adjust_ast_if_changed_inner(ast, op, policy, None)
+            .unwrap_or_else(|| ast.clone())
+    }
+
+    /// Return an adjusted AST only when at least one reference changed.
+    pub fn adjust_ast_if_changed(&self, ast: &ASTNode, op: &ShiftOperation) -> Option<ASTNode> {
+        self.adjust_ast_if_changed_with_policy(ast, op, AbsShiftPolicy::Track)
+    }
+
+    /// Adjust an AST only when references change under an explicit policy.
+    pub(crate) fn adjust_ast_if_changed_with_policy(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+    ) -> Option<ASTNode> {
+        self.adjust_ast_if_changed_inner(ast, op, policy, None)
+    }
+
+    pub(crate) fn adjust_ast_in_context(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        context: &ReferenceContext<'_>,
+    ) -> ASTNode {
+        self.adjust_ast_with_policy_in_context(ast, op, AbsShiftPolicy::Track, context)
+    }
+
+    pub(crate) fn adjust_ast_with_policy_in_context(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+        context: &ReferenceContext<'_>,
+    ) -> ASTNode {
+        self.adjust_ast_if_changed_inner(ast, op, policy, Some(context))
+            .unwrap_or_else(|| ast.clone())
+    }
+
+    pub(crate) fn adjust_ast_if_changed_in_context(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        context: &ReferenceContext<'_>,
+    ) -> Option<ASTNode> {
+        self.adjust_ast_if_changed_with_policy_in_context(ast, op, AbsShiftPolicy::Track, context)
+    }
+
+    pub(crate) fn adjust_ast_if_changed_with_policy_in_context(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+        context: &ReferenceContext<'_>,
+    ) -> Option<ASTNode> {
+        self.adjust_ast_if_changed_inner(ast, op, policy, Some(context))
+    }
+
+    fn adjust_ast_if_changed_inner(
+        &self,
+        ast: &ASTNode,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+        context: Option<&ReferenceContext<'_>>,
+    ) -> Option<ASTNode> {
+        let changed_node_type = match &ast.node_type {
+            ASTNodeType::Reference { reference, .. } => {
+                match self.adjust_reference(reference, op, policy, context) {
+                    ReferenceAdjustment::Reference(adjusted) if adjusted == *reference => {
+                        return None;
+                    }
+                    ReferenceAdjustment::Reference(adjusted) => ASTNodeType::Reference {
+                        original: adjusted.normalise(),
                         reference: adjusted,
                     },
-                    source_token: ast.source_token.clone(),
-                    contains_volatile: ast.contains_volatile,
+                    ReferenceAdjustment::Invalidated => ASTNodeType::Literal(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Ref),
+                    )),
                 }
             }
             ASTNodeType::BinaryOp {
                 op: bin_op,
                 left,
                 right,
-            } => ASTNode {
-                node_type: ASTNodeType::BinaryOp {
+            } => {
+                let adjusted_left = self.adjust_ast_if_changed_inner(left, op, policy, context);
+                let adjusted_right = self.adjust_ast_if_changed_inner(right, op, policy, context);
+                if adjusted_left.is_none() && adjusted_right.is_none() {
+                    return None;
+                }
+                ASTNodeType::BinaryOp {
                     op: bin_op.clone(),
-                    left: Box::new(self.adjust_ast(left, op)),
-                    right: Box::new(self.adjust_ast(right, op)),
-                },
-                source_token: ast.source_token.clone(),
-                contains_volatile: ast.contains_volatile,
+                    left: Box::new(adjusted_left.unwrap_or_else(|| (**left).clone())),
+                    right: Box::new(adjusted_right.unwrap_or_else(|| (**right).clone())),
+                }
+            }
+            ASTNodeType::UnaryOp { op: un_op, expr } => ASTNodeType::UnaryOp {
+                op: un_op.clone(),
+                expr: Box::new(self.adjust_ast_if_changed_inner(expr, op, policy, context)?),
             },
-            ASTNodeType::UnaryOp { op: un_op, expr } => ASTNode {
-                node_type: ASTNodeType::UnaryOp {
-                    op: un_op.clone(),
-                    expr: Box::new(self.adjust_ast(expr, op)),
-                },
-                source_token: ast.source_token.clone(),
-                contains_volatile: ast.contains_volatile,
-            },
-            ASTNodeType::Function { name, args } => ASTNode {
-                node_type: ASTNodeType::Function {
+            ASTNodeType::Function { name, args } => {
+                let (args, changed) = self.adjust_children(args, op, policy, context);
+                if !changed {
+                    return None;
+                }
+                ASTNodeType::Function {
                     name: name.clone(),
-                    args: args.iter().map(|arg| self.adjust_ast(arg, op)).collect(),
-                },
-                source_token: ast.source_token.clone(),
-                contains_volatile: ast.contains_volatile,
-            },
-            _ => ast.clone(),
-        }
+                    args,
+                }
+            }
+            ASTNodeType::Call { callee, args } => {
+                let adjusted_callee = self.adjust_ast_if_changed_inner(callee, op, policy, context);
+                let (args, args_changed) = self.adjust_children(args, op, policy, context);
+                if adjusted_callee.is_none() && !args_changed {
+                    return None;
+                }
+                ASTNodeType::Call {
+                    callee: Box::new(adjusted_callee.unwrap_or_else(|| (**callee).clone())),
+                    args,
+                }
+            }
+            ASTNodeType::Array(rows) => {
+                let mut changed = false;
+                let rows = rows
+                    .iter()
+                    .map(|row| {
+                        let (row, row_changed) = self.adjust_children(row, op, policy, context);
+                        changed |= row_changed;
+                        row
+                    })
+                    .collect();
+                if !changed {
+                    return None;
+                }
+                ASTNodeType::Array(rows)
+            }
+            _ => return None,
+        };
+
+        Some(ASTNode {
+            node_type: changed_node_type,
+            source_token: None,
+            contains_volatile: ast.contains_volatile,
+        })
     }
 
-    /// Adjust a cell reference for a shift operation
-    /// Returns None if the cell is deleted
+    fn adjust_children(
+        &self,
+        children: &[ASTNode],
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+        context: Option<&ReferenceContext<'_>>,
+    ) -> (Vec<ASTNode>, bool) {
+        let mut changed = false;
+        let children = children
+            .iter()
+            .map(|child| {
+                if let Some(adjusted) = self.adjust_ast_if_changed_inner(child, op, policy, context)
+                {
+                    changed = true;
+                    adjusted
+                } else {
+                    child.clone()
+                }
+            })
+            .collect();
+        (children, changed)
+    }
+
+    /// Adjust a cell reference for a shift operation.
+    /// Returns None if the cell is deleted.
+    /// Absolute references track structural shifts.
     pub fn adjust_cell_ref(&self, cell_ref: &CellRef, op: &ShiftOperation) -> Option<CellRef> {
+        self.adjust_cell_ref_with_policy(cell_ref, op, AbsShiftPolicy::Track)
+    }
+
+    /// Adjust a cell reference under an explicit absolute-reference policy.
+    pub(crate) fn adjust_cell_ref_with_policy(
+        &self,
+        cell_ref: &CellRef,
+        op: &ShiftOperation,
+        policy: AbsShiftPolicy,
+    ) -> Option<CellRef> {
         let coord = cell_ref.coord;
         let adjusted_coord = match op {
             ShiftOperation::InsertRows {
@@ -93,8 +300,9 @@ impl ReferenceAdjuster {
                 before,
                 count,
             } if cell_ref.sheet_id == *sheet_id => {
-                if coord.row_abs() || coord.row() < *before {
-                    // Absolute references or cells before insert point don't move
+                if (policy.pins() && coord.row_abs()) || coord.row() < *before {
+                    // Cells before the insert point don't move (nor do
+                    // absolute references under the legacy Pin policy).
                     coord
                 } else {
                     // Shift down
@@ -111,8 +319,8 @@ impl ReferenceAdjuster {
                 start,
                 count,
             } if cell_ref.sheet_id == *sheet_id => {
-                if coord.row_abs() {
-                    // Absolute references don't adjust
+                if policy.pins() && coord.row_abs() {
+                    // Legacy Pin policy: absolute references don't adjust
                     coord
                 } else if coord.row() >= *start && coord.row() < start + count {
                     // Cell deleted
@@ -135,8 +343,9 @@ impl ReferenceAdjuster {
                 before,
                 count,
             } if cell_ref.sheet_id == *sheet_id => {
-                if coord.col_abs() || coord.col() < *before {
-                    // Absolute references or cells before insert point don't move
+                if (policy.pins() && coord.col_abs()) || coord.col() < *before {
+                    // Cells before the insert point don't move (nor do
+                    // absolute references under the legacy Pin policy).
                     coord
                 } else {
                     // Shift right
@@ -153,8 +362,8 @@ impl ReferenceAdjuster {
                 start,
                 count,
             } if cell_ref.sheet_id == *sheet_id => {
-                if coord.col_abs() {
-                    // Absolute references don't adjust
+                if policy.pins() && coord.col_abs() {
+                    // Legacy Pin policy: absolute references don't adjust
                     coord
                 } else if coord.col() >= *start && coord.col() < start + count {
                     // Cell deleted
@@ -181,10 +390,27 @@ impl ReferenceAdjuster {
     /// Adjust a reference type (cell or range) for a shift operation
     fn adjust_reference(
         &self,
-        reference: &formualizer_parse::parser::ReferenceType,
+        reference: &ReferenceType,
         op: &ShiftOperation,
-    ) -> formualizer_parse::parser::ReferenceType {
-        use formualizer_parse::parser::ReferenceType;
+        policy: AbsShiftPolicy,
+        context: Option<&ReferenceContext<'_>>,
+    ) -> ReferenceAdjustment {
+        let op_sheet_id = match op {
+            ShiftOperation::InsertRows { sheet_id, .. }
+            | ShiftOperation::DeleteRows { sheet_id, .. }
+            | ShiftOperation::InsertColumns { sheet_id, .. }
+            | ShiftOperation::DeleteColumns { sheet_id, .. } => *sheet_id,
+        };
+        match reference {
+            ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. } => {
+                if context.is_some_and(|context| {
+                    context.reference_sheet_id(sheet.as_deref()) != Some(op_sheet_id)
+                }) {
+                    return ReferenceAdjustment::Reference(reference.clone());
+                }
+            }
+            _ => return ReferenceAdjustment::Reference(reference.clone()),
+        }
 
         let shared = reference.to_sheet_ref_lossy();
 
@@ -198,32 +424,20 @@ impl ReferenceAdjuster {
                 },
                 Some(crate::reference::SharedRef::Cell(cell)),
             ) => {
-                let sheet_id = match op {
-                    ShiftOperation::InsertRows { sheet_id, .. }
-                    | ShiftOperation::DeleteRows { sheet_id, .. }
-                    | ShiftOperation::InsertColumns { sheet_id, .. }
-                    | ShiftOperation::DeleteColumns { sheet_id, .. } => *sheet_id,
-                };
                 let temp_ref = CellRef::new(
-                    sheet_id,
+                    op_sheet_id,
                     Coord::new(cell.coord.row(), cell.coord.col(), *row_abs, *col_abs),
                 );
 
-                match self.adjust_cell_ref(&temp_ref, op) {
-                    None => ReferenceType::Cell {
-                        sheet: Some("#REF".to_string()),
-                        row: 0,
-                        col: 0,
-                        row_abs: *row_abs,
-                        col_abs: *col_abs,
-                    },
-                    Some(adjusted) => ReferenceType::Cell {
+                match self.adjust_cell_ref_with_policy(&temp_ref, op, policy) {
+                    None => ReferenceAdjustment::Invalidated,
+                    Some(adjusted) => ReferenceAdjustment::Reference(ReferenceType::Cell {
                         sheet: sheet.clone(),
                         row: adjusted.coord.row() + 1,
                         col: adjusted.coord.col() + 1,
                         row_abs: *row_abs,
                         col_abs: *col_abs,
-                    },
+                    }),
                 }
             }
             (
@@ -237,19 +451,13 @@ impl ReferenceAdjuster {
                 },
                 Some(crate::reference::SharedRef::Range(range)),
             ) => {
-                let is_unbounded_column = range.start_row.is_none() && range.end_row.is_none();
-                let is_unbounded_row = range.start_col.is_none() && range.end_col.is_none();
-                if is_unbounded_column || is_unbounded_row {
-                    return reference.clone();
-                }
-
                 let sr = range.start_row;
                 let sc = range.start_col;
                 let er = range.end_row;
                 let ec = range.end_col;
 
                 let adjust_insert = |b: formualizer_common::AxisBound, before: u32, count: u32| {
-                    if b.abs {
+                    if policy.pins() && b.abs {
                         b.index
                     } else if b.index >= before {
                         b.index + count
@@ -259,7 +467,7 @@ impl ReferenceAdjuster {
                 };
 
                 let adjust_delete = |idx: u32, abs: bool, start: u32, count: u32| {
-                    if abs {
+                    if policy.pins() && abs {
                         idx
                     } else if idx >= start + count {
                         idx - count
@@ -277,7 +485,7 @@ impl ReferenceAdjuster {
                     ),
                     ShiftOperation::DeleteRows { start, count, .. } => match (sr, er) {
                         (Some(range_start), Some(range_end))
-                            if !range_start.abs && !range_end.abs =>
+                            if !policy.pins() || (!range_start.abs && !range_end.abs) =>
                         {
                             let range_start = range_start.index;
                             let range_end = range_end.index;
@@ -294,17 +502,7 @@ impl ReferenceAdjuster {
                                 };
                                 (Some(adj_start), Some(adj_end))
                             } else if range_start >= *start && range_end < start + count {
-                                return ReferenceType::Range {
-                                    sheet: Some("#REF".to_string()),
-                                    start_row: Some(0),
-                                    start_col: Some(0),
-                                    end_row: Some(0),
-                                    end_col: Some(0),
-                                    start_row_abs: *start_row_abs,
-                                    start_col_abs: *start_col_abs,
-                                    end_row_abs: *end_row_abs,
-                                    end_col_abs: *end_col_abs,
-                                };
+                                return ReferenceAdjustment::Invalidated;
                             } else {
                                 let adj_start = if range_start < *start {
                                     range_start
@@ -341,7 +539,7 @@ impl ReferenceAdjuster {
                     ),
                     ShiftOperation::DeleteColumns { start, count, .. } => match (sc, ec) {
                         (Some(range_start), Some(range_end))
-                            if !range_start.abs && !range_end.abs =>
+                            if !policy.pins() || (!range_start.abs && !range_end.abs) =>
                         {
                             let range_start = range_start.index;
                             let range_end = range_end.index;
@@ -358,17 +556,7 @@ impl ReferenceAdjuster {
                                 };
                                 (Some(adj_start), Some(adj_end))
                             } else if range_start >= *start && range_end < start + count {
-                                return ReferenceType::Range {
-                                    sheet: Some("#REF".to_string()),
-                                    start_row: Some(0),
-                                    start_col: Some(0),
-                                    end_row: Some(0),
-                                    end_col: Some(0),
-                                    start_row_abs: *start_row_abs,
-                                    start_col_abs: *start_col_abs,
-                                    end_row_abs: *end_row_abs,
-                                    end_col_abs: *end_col_abs,
-                                };
+                                return ReferenceAdjustment::Invalidated;
                             } else {
                                 let adj_start = if range_start < *start {
                                     range_start
@@ -398,7 +586,7 @@ impl ReferenceAdjuster {
                     _ => (sc.map(|b| b.index), ec.map(|b| b.index)),
                 };
 
-                ReferenceType::Range {
+                ReferenceAdjustment::Reference(ReferenceType::Range {
                     sheet: sheet.clone(),
                     start_row: adj_sr0.map(|i| i + 1),
                     start_col: adj_sc0.map(|i| i + 1),
@@ -408,9 +596,9 @@ impl ReferenceAdjuster {
                     start_col_abs: *start_col_abs,
                     end_row_abs: *end_row_abs,
                     end_col_abs: *end_col_abs,
-                }
+                })
             }
-            _ => reference.clone(),
+            _ => ReferenceAdjustment::Reference(reference.clone()),
         }
     }
 }
@@ -846,11 +1034,89 @@ impl MoveReferenceAdjuster {
 mod tests {
     use super::*;
     use formualizer_parse::parser::parse;
+    use std::sync::OnceLock;
+
+    fn context(sheet_id: SheetId) -> ReferenceContext<'static> {
+        static REGISTRY: OnceLock<SheetRegistry> = OnceLock::new();
+        let registry = REGISTRY.get_or_init(|| {
+            let mut registry = SheetRegistry::new();
+            registry.id_for("Sheet1");
+            registry.id_for("Other");
+            registry.id_for("#REF");
+            registry
+        });
+        ReferenceContext::new(sheet_id, registry)
+    }
 
     fn format_formula(ast: &ASTNode) -> String {
         // TODO: Use the actual formualizer_parse::parser::to_string when available
         // For now, a simple representation
         format!("{ast:?}")
+    }
+
+    #[test]
+    fn context_free_adjuster_compatibility_api_remains_available() {
+        let adjuster = ReferenceAdjuster::new();
+        let ast = parse("=A1").unwrap();
+        let op = ShiftOperation::InsertRows {
+            sheet_id: 0,
+            before: 0,
+            count: 1,
+        };
+
+        let _ = adjuster.adjust_ast(&ast, &op);
+        let _ = adjuster.adjust_ast_with_policy(&ast, &op, AbsShiftPolicy::Track);
+        let _ = adjuster.adjust_ast_if_changed(&ast, &op);
+        let _ = adjuster.adjust_ast_if_changed_with_policy(&ast, &op, AbsShiftPolicy::Track);
+    }
+
+    #[test]
+    fn adjust_ast_if_changed_returns_none_for_unaffected_column_insert() {
+        let adjuster = ReferenceAdjuster::new();
+        let ast = parse("=A1+1").unwrap();
+
+        let adjusted = adjuster.adjust_ast_if_changed_in_context(
+            &ast,
+            &ShiftOperation::InsertColumns {
+                sheet_id: 0,
+                before: 3,
+                count: 1,
+            },
+            &context(0),
+        );
+
+        assert!(adjusted.is_none());
+    }
+
+    #[test]
+    fn adjust_ast_if_changed_returns_adjusted_for_insert_before_a() {
+        let adjuster = ReferenceAdjuster::new();
+        let ast = parse("=A1+1").unwrap();
+
+        let adjusted = adjuster
+            .adjust_ast_if_changed_in_context(
+                &ast,
+                &ShiftOperation::InsertColumns {
+                    sheet_id: 0,
+                    before: 0,
+                    count: 1,
+                },
+                &context(0),
+            )
+            .expect("A1 reference should shift");
+
+        if let ASTNodeType::BinaryOp { left, .. } = &adjusted.node_type
+            && let ASTNodeType::Reference {
+                reference: formualizer_parse::parser::ReferenceType::Cell { row, col, .. },
+                ..
+            } = &left.node_type
+        {
+            assert_eq!(*row, 1);
+            assert_eq!(*col, 2);
+            return;
+        }
+
+        panic!("expected adjusted A1 reference to become B1");
     }
 
     #[test]
@@ -861,13 +1127,14 @@ mod tests {
         let ast = parse("=A5+B10").unwrap();
 
         // Insert 2 rows before row 7
-        let adjusted = adjuster.adjust_ast(
+        let adjusted = adjuster.adjust_ast_in_context(
             &ast,
             &ShiftOperation::InsertRows {
                 sheet_id: 0,
                 before: 7,
                 count: 2,
             },
+            &context(0),
         );
 
         // A5 unchanged (before insert point), B10 -> B12
@@ -900,38 +1167,40 @@ mod tests {
         let ast = parse("=C1+F1").unwrap();
 
         // Delete columns B and C (columns 2 and 3)
-        let adjusted = adjuster.adjust_ast(
+        let adjusted = adjuster.adjust_ast_in_context(
             &ast,
             &ShiftOperation::DeleteColumns {
                 sheet_id: 0,
                 start: 2, // Column B
                 count: 2,
             },
+            &context(0),
         );
 
-        // C1 -> #REF! (deleted), F1 -> D1 (shifted left by 2)
-        if let ASTNodeType::BinaryOp { left, right, .. } = &adjusted.node_type {
-            if let ASTNodeType::Reference {
-                reference:
-                    formualizer_parse::parser::ReferenceType::Cell {
-                        sheet, row, col, ..
-                    },
-                ..
-            } = &left.node_type
-            {
-                assert_eq!(sheet.as_deref(), Some("#REF"));
-                assert_eq!(*row, 0);
-                assert_eq!(*col, 0);
+        // C1 -> #REF! (deleted), F1 -> D1 (shifted left by 2).
+        let ASTNodeType::BinaryOp { left, right, .. } = &adjusted.node_type else {
+            panic!("expected adjusted binary expression, got {adjusted:?}");
+        };
+        match &left.node_type {
+            ASTNodeType::Literal(LiteralValue::Error(error)) => {
+                assert_eq!(error.kind, ExcelErrorKind::Ref);
+                assert!(left.source_token.is_none());
             }
-            if let ASTNodeType::Reference {
-                reference: formualizer_parse::parser::ReferenceType::Cell { row, col, .. },
-                ..
-            } = &right.node_type
-            {
+            other => panic!("expected deleted C1 to become a #REF! literal, got {other:?}"),
+        }
+        match &right.node_type {
+            ASTNodeType::Reference {
+                original,
+                reference: ReferenceType::Cell { row, col, .. },
+            } => {
+                assert_eq!(original, "D1");
                 assert_eq!(*row, 1); // Row unchanged
                 assert_eq!(*col, 4); // F1 (col 6) -> D1 (col 4)
+                assert!(right.source_token.is_none());
             }
+            other => panic!("expected surviving F1 reference to shift to D1, got {other:?}"),
         }
+        assert!(adjusted.source_token.is_none());
     }
 
     #[test]
@@ -942,13 +1211,14 @@ mod tests {
         let ast = parse("=SUM(A1:A10)").unwrap();
 
         // Insert 3 rows before row 5
-        let adjusted = adjuster.adjust_ast(
+        let adjusted = adjuster.adjust_ast_in_context(
             &ast,
             &ShiftOperation::InsertRows {
                 sheet_id: 0,
                 before: 5,
                 count: 3,
             },
+            &context(0),
         );
 
         // Range should expand: A1:A10 -> A1:A13
@@ -996,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_absolute_reference_preservation() {
+    fn test_absolute_row_tracks_row_insert() {
         let adjuster = ReferenceAdjuster::new();
 
         // Test with absolute row references ($5)
@@ -1005,27 +1275,32 @@ mod tests {
             Coord::new(5, 2, true, false), // Row 5 absolute, col 2 relative
         );
 
-        // Insert rows before the absolute reference
-        let result = adjuster.adjust_cell_ref(
-            &cell_abs_row,
-            &ShiftOperation::InsertRows {
-                sheet_id: 0,
-                before: 3,
-                count: 2,
-            },
-        );
+        let op = ShiftOperation::InsertRows {
+            sheet_id: 0,
+            before: 3,
+            count: 2,
+        };
 
-        // Absolute row should not change
+        // Issue #168 policy: absolute references TRACK structural shifts —
+        // the `$` pins copy/fill relocation only.
+        let result = adjuster.adjust_cell_ref(&cell_abs_row, &op);
         assert!(result.is_some());
         let adjusted = result.unwrap();
-        assert_eq!(adjusted.coord.row(), 5); // Row stays at 5
+        assert_eq!(adjusted.coord.row(), 7); // Row 5 -> 7 (shifted)
         assert_eq!(adjusted.coord.col(), 2); // Column unchanged
-        assert!(adjusted.coord.row_abs());
+        assert!(adjusted.coord.row_abs()); // Anchor flag preserved
         assert!(!adjusted.coord.col_abs());
+
+        // Legacy Pin policy (named-range definitions) keeps the old behavior.
+        let pinned = adjuster
+            .adjust_cell_ref_with_policy(&cell_abs_row, &op, AbsShiftPolicy::Pin)
+            .unwrap();
+        assert_eq!(pinned.coord.row(), 5);
+        assert!(pinned.coord.row_abs());
     }
 
     #[test]
-    fn test_absolute_column_preservation() {
+    fn test_absolute_column_tracks_column_delete() {
         let adjuster = ReferenceAdjuster::new();
 
         // Test with absolute column references ($B)
@@ -1034,23 +1309,45 @@ mod tests {
             Coord::new(5, 2, false, true), // Row 5 relative, col 2 absolute
         );
 
-        // Delete columns before the absolute reference
-        let result = adjuster.adjust_cell_ref(
-            &cell_abs_col,
-            &ShiftOperation::DeleteColumns {
-                sheet_id: 0,
-                start: 1,
-                count: 1,
-            },
-        );
+        let op = ShiftOperation::DeleteColumns {
+            sheet_id: 0,
+            start: 1,
+            count: 1,
+        };
 
-        // Absolute column should not change
+        // Issue #168 policy: the absolute column shifts left with the delete.
+        let result = adjuster.adjust_cell_ref(&cell_abs_col, &op);
         assert!(result.is_some());
         let adjusted = result.unwrap();
         assert_eq!(adjusted.coord.row(), 5); // Row unchanged
-        assert_eq!(adjusted.coord.col(), 2); // Column stays at 2 despite deletion
+        assert_eq!(adjusted.coord.col(), 1); // Column 2 -> 1 (shifted left)
         assert!(!adjusted.coord.row_abs());
-        assert!(adjusted.coord.col_abs());
+        assert!(adjusted.coord.col_abs()); // Anchor flag preserved
+
+        // Legacy Pin policy keeps the old behavior.
+        let pinned = adjuster
+            .adjust_cell_ref_with_policy(&cell_abs_col, &op, AbsShiftPolicy::Pin)
+            .unwrap();
+        assert_eq!(pinned.coord.col(), 2);
+        assert!(pinned.coord.col_abs());
+    }
+
+    #[test]
+    fn test_absolute_reference_deleted_becomes_ref_error() {
+        let adjuster = ReferenceAdjuster::new();
+
+        // $F$1 with the delete removing row 0 (the target row): the
+        // reference is gone, exactly like a relative reference (issue #168).
+        let fully_abs = CellRef::new(0, Coord::new(0, 5, true, true));
+        let result = adjuster.adjust_cell_ref(
+            &fully_abs,
+            &ShiftOperation::DeleteRows {
+                sheet_id: 0,
+                start: 0,
+                count: 1,
+            },
+        );
+        assert!(result.is_none(), "deleted absolute target must be #REF!");
     }
 
     #[test]
@@ -1099,42 +1396,52 @@ mod tests {
     }
 
     #[test]
-    fn test_fully_absolute_reference() {
+    fn test_fully_absolute_reference_tracks_structural_ops() {
         let adjuster = ReferenceAdjuster::new();
 
-        // Test $A$1 - fully absolute
+        // Test $B$2 - fully absolute (0-based row 1, col 1)
         let fully_abs = CellRef::new(
             0,
             Coord::new(1, 1, true, true), // Both row and col absolute
         );
 
-        // Try various operations - nothing should change
+        // Issue #168 policy: absolute references track structural shifts.
 
-        // Insert rows
-        let result1 = adjuster.adjust_cell_ref(
-            &fully_abs,
-            &ShiftOperation::InsertRows {
-                sheet_id: 0,
-                before: 1,
-                count: 5,
-            },
-        );
-        assert!(result1.is_some());
-        assert_eq!(result1.unwrap().coord.row(), 1);
-        assert_eq!(result1.unwrap().coord.col(), 1);
+        // Insert rows at/above the target: the target row moves down.
+        let insert = ShiftOperation::InsertRows {
+            sheet_id: 0,
+            before: 1,
+            count: 5,
+        };
+        let result1 = adjuster.adjust_cell_ref(&fully_abs, &insert).unwrap();
+        assert_eq!(result1.coord.row(), 6); // Row 1 -> 6 (shifted)
+        assert_eq!(result1.coord.col(), 1);
+        assert!(result1.coord.row_abs());
+        assert!(result1.coord.col_abs());
 
-        // Delete columns
-        let result2 = adjuster.adjust_cell_ref(
-            &fully_abs,
-            &ShiftOperation::DeleteColumns {
-                sheet_id: 0,
-                start: 0,
-                count: 1,
-            },
-        );
-        assert!(result2.is_some());
-        assert_eq!(result2.unwrap().coord.row(), 1);
-        assert_eq!(result2.unwrap().coord.col(), 1);
+        // Delete a column before the target: the target column moves left.
+        let delete = ShiftOperation::DeleteColumns {
+            sheet_id: 0,
+            start: 0,
+            count: 1,
+        };
+        let result2 = adjuster.adjust_cell_ref(&fully_abs, &delete).unwrap();
+        assert_eq!(result2.coord.row(), 1);
+        assert_eq!(result2.coord.col(), 0); // Col 1 -> 0 (shifted left)
+        assert!(result2.coord.row_abs());
+        assert!(result2.coord.col_abs());
+
+        // Legacy Pin policy (named ranges): nothing moves.
+        let pinned1 = adjuster
+            .adjust_cell_ref_with_policy(&fully_abs, &insert, AbsShiftPolicy::Pin)
+            .unwrap();
+        assert_eq!(pinned1.coord.row(), 1);
+        assert_eq!(pinned1.coord.col(), 1);
+        let pinned2 = adjuster
+            .adjust_cell_ref_with_policy(&fully_abs, &delete, AbsShiftPolicy::Pin)
+            .unwrap();
+        assert_eq!(pinned2.coord.row(), 1);
+        assert_eq!(pinned2.coord.col(), 1);
     }
 
     #[test]
@@ -1182,13 +1489,14 @@ mod tests {
         let ast = parse("=SUM(B2:D10)").unwrap();
 
         // Insert rows in the middle of the range
-        let adjusted = adjuster.adjust_ast(
+        let adjusted = adjuster.adjust_ast_in_context(
             &ast,
             &ShiftOperation::InsertRows {
                 sheet_id: 0,
                 before: 5,
                 count: 3,
             },
+            &context(0),
         );
 
         // Range should expand: B2:D10 -> B2:D13
@@ -1220,13 +1528,14 @@ mod tests {
         let ast = parse("=SUM(A5:A20)").unwrap();
 
         // Delete rows in the middle of the range
-        let adjusted = adjuster.adjust_ast(
+        let adjusted = adjuster.adjust_ast_in_context(
             &ast,
             &ShiftOperation::DeleteRows {
                 sheet_id: 0,
                 start: 10,
                 count: 5,
             },
+            &context(0),
         );
 
         // Range should contract: A5:A20 -> A5:A15
@@ -1241,6 +1550,205 @@ mod tests {
         {
             assert_eq!(*start_row, Some(5)); // Start unchanged
             assert_eq!(*end_row, Some(15)); // End contracted from 20 to 15
+        }
+    }
+
+    #[test]
+    fn fully_deleted_range_becomes_ref_error_literal() {
+        let ast = parse("=SUM(A2:A4)").unwrap();
+        let adjusted = ReferenceAdjuster::new().adjust_ast_in_context(
+            &ast,
+            &ShiftOperation::DeleteRows {
+                sheet_id: 0,
+                start: 1,
+                count: 3,
+            },
+            &context(0),
+        );
+
+        let ASTNodeType::Function { args, .. } = &adjusted.node_type else {
+            panic!("expected SUM function, got {adjusted:?}");
+        };
+        match &args[0].node_type {
+            ASTNodeType::Literal(LiteralValue::Error(error)) => {
+                assert_eq!(error.kind, ExcelErrorKind::Ref)
+            }
+            other => panic!("expected deleted range to become #REF!, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structural_adjustment_respects_formula_and_qualified_sheets() {
+        let adjuster = ReferenceAdjuster::new();
+        let op = ShiftOperation::DeleteRows {
+            sheet_id: 0,
+            start: 0,
+            count: 1,
+        };
+
+        // An unqualified reference belongs to the formula's own sheet.
+        assert!(
+            adjuster
+                .adjust_ast_if_changed_in_context(&parse("=A1").unwrap(), &op, &context(1))
+                .is_none()
+        );
+
+        // Explicit references change only when their named sheet is edited.
+        assert!(
+            adjuster
+                .adjust_ast_if_changed_in_context(&parse("=Other!A1").unwrap(), &op, &context(0))
+                .is_none()
+        );
+        let matching = adjuster
+            .adjust_ast_if_changed_in_context(&parse("=Sheet1!A1").unwrap(), &op, &context(1))
+            .expect("qualified reference to edited sheet must change");
+        assert!(matches!(
+            matching.node_type,
+            ASTNodeType::Literal(LiteralValue::Error(ref error))
+                if error.kind == ExcelErrorKind::Ref
+        ));
+
+        // `#REF` remains a legitimate quoted worksheet name, never a magic marker.
+        let real_ref_sheet = parse("='#REF'!A1").unwrap();
+        assert!(
+            adjuster
+                .adjust_ast_if_changed_in_context(&real_ref_sheet, &op, &context(0))
+                .is_none()
+        );
+        let shifted = adjuster
+            .adjust_ast_if_changed_in_context(
+                &real_ref_sheet,
+                &ShiftOperation::InsertRows {
+                    sheet_id: 2,
+                    before: 0,
+                    count: 1,
+                },
+                &context(0),
+            )
+            .expect("a real #REF sheet reference should shift normally");
+        match shifted.node_type {
+            ASTNodeType::Reference {
+                original,
+                reference:
+                    ReferenceType::Cell {
+                        sheet, row, col, ..
+                    },
+            } => {
+                assert_eq!(original, "'#REF'!A2");
+                assert_eq!(sheet.as_deref(), Some("#REF"));
+                assert_eq!((row, col), (2, 1));
+            }
+            other => panic!("expected a shifted ordinary sheet reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_axis_ranges_adjust_only_on_their_bounded_axis() {
+        let adjuster = ReferenceAdjuster::new();
+        let whole_col = parse("=SUM(A:A)").unwrap();
+        assert!(
+            adjuster
+                .adjust_ast_if_changed_in_context(
+                    &whole_col,
+                    &ShiftOperation::DeleteRows {
+                        sheet_id: 0,
+                        start: 0,
+                        count: 1,
+                    },
+                    &context(0),
+                )
+                .is_none()
+        );
+        let deleted_col = adjuster.adjust_ast_in_context(
+            &whole_col,
+            &ShiftOperation::DeleteColumns {
+                sheet_id: 0,
+                start: 0,
+                count: 1,
+            },
+            &context(0),
+        );
+        let ASTNodeType::Function { args, .. } = &deleted_col.node_type else {
+            panic!("expected SUM function");
+        };
+        assert!(matches!(
+            args[0].node_type,
+            ASTNodeType::Literal(LiteralValue::Error(ref error))
+                if error.kind == ExcelErrorKind::Ref
+        ));
+
+        let whole_row = parse("=SUM(1:1)").unwrap();
+        assert!(
+            adjuster
+                .adjust_ast_if_changed_in_context(
+                    &whole_row,
+                    &ShiftOperation::DeleteColumns {
+                        sheet_id: 0,
+                        start: 0,
+                        count: 1,
+                    },
+                    &context(0),
+                )
+                .is_none()
+        );
+        let deleted_row = adjuster.adjust_ast_in_context(
+            &whole_row,
+            &ShiftOperation::DeleteRows {
+                sheet_id: 0,
+                start: 0,
+                count: 1,
+            },
+            &context(0),
+        );
+        let ASTNodeType::Function { args, .. } = &deleted_row.node_type else {
+            panic!("expected SUM function");
+        };
+        assert!(matches!(
+            args[0].node_type,
+            ASTNodeType::Literal(LiteralValue::Error(ref error))
+                if error.kind == ExcelErrorKind::Ref
+        ));
+    }
+
+    #[test]
+    fn call_and_array_children_receive_literal_rewrites() {
+        let adjuster = ReferenceAdjuster::new();
+        let op = ShiftOperation::DeleteColumns {
+            sheet_id: 0,
+            start: 0,
+            count: 1,
+        };
+
+        let call =
+            adjuster.adjust_ast_in_context(&parse("=LAMBDA(x,x)(A1)").unwrap(), &op, &context(0));
+        let ASTNodeType::Call { args, .. } = &call.node_type else {
+            panic!("expected immediate call, got {call:?}");
+        };
+        assert!(matches!(
+            args[0].node_type,
+            ASTNodeType::Literal(LiteralValue::Error(ref error))
+                if error.kind == ExcelErrorKind::Ref
+        ));
+        assert!(call.source_token.is_none());
+
+        let array = adjuster.adjust_ast_in_context(&parse("={A1,B1}").unwrap(), &op, &context(0));
+        let ASTNodeType::Array(rows) = &array.node_type else {
+            panic!("expected array, got {array:?}");
+        };
+        assert!(matches!(
+            rows[0][0].node_type,
+            ASTNodeType::Literal(LiteralValue::Error(ref error))
+                if error.kind == ExcelErrorKind::Ref
+        ));
+        match &rows[0][1].node_type {
+            ASTNodeType::Reference {
+                original,
+                reference: ReferenceType::Cell { row, col, .. },
+            } => {
+                assert_eq!(original, "A1");
+                assert_eq!((*row, *col), (1, 1));
+            }
+            other => panic!("expected B1 to shift to A1, got {other:?}"),
         }
     }
 }

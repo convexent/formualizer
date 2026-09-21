@@ -218,6 +218,12 @@ impl Manifest {
             }
 
             if let Selector::Layout(layout) = &port.location {
+                if layout.layout.header_row == 0 || layout.layout.header_row > 1_048_576 {
+                    issues.push(ManifestIssue::new(
+                        format!("ports[{}].location.layout.header_row", idx),
+                        "header_row must be within the Excel row bounds".to_string(),
+                    ));
+                }
                 if matches!(layout.layout.terminate, LayoutTermination::UntilMarker)
                     && layout
                         .layout

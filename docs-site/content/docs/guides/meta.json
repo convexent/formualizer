@@ -3,6 +3,9 @@
   "pages": [
     "index",
     "workbook-edits-and-batching",
+    "large-workbook-performance",
+    "circular-references-and-cycle-detection",
+    "iterative-calculation",
     "custom-functions-rust-python-js",
     "wasm-plugins-inspect-attach-bind",
     "let-lambda-and-callables",

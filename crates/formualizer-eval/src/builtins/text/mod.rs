@@ -4,7 +4,21 @@
 //! CHAR, CODE, REPT, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, DOLLAR, FIXED
 //! TEXTSPLIT, VALUETOTEXT, ARRAYTOTEXT (array text functions)
 
+use crate::traits::{ArgumentHandle, CalcValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+
+fn scalar_text_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
+    Ok(match arg.value_for_text()? {
+        CalcValue::Scalar(value) | CalcValue::AnnotatedScalar(value, _) => value,
+        CalcValue::Range(view) => view.get_cell(0, 0),
+        CalcValue::Callable(_) => LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+        ),
+    })
+}
+
 mod array_text; // TEXTSPLIT, VALUETOTEXT, ARRAYTOTEXT
+mod byte; // FINDB, LEFTB, LENB, MIDB, REPLACEB, RIGHTB, SEARCHB
 mod char_code_rept; // CHAR, CODE, REPT
 mod extended; // CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, DOLLAR, FIXED
 mod find_search_exact; // FIND, SEARCH, EXACT
@@ -16,17 +30,17 @@ mod value_text; // VALUE, TEXT
 #[cfg(test)]
 mod text_tests; // Comprehensive test suite
 
-pub use array_text::*;
-pub use char_code_rept::*;
-pub use extended::*;
 pub use find_search_exact::*;
 pub use len_left_right::*;
 pub use mid_sub_replace::*;
+#[cfg(test)]
 pub use trim_case_concat::*;
+#[cfg(test)]
 pub use value_text::*;
 
 pub fn register_builtins() {
     array_text::register_builtins();
+    byte::register_builtins();
     char_code_rept::register_builtins();
     extended::register_builtins();
     len_left_right::register_builtins();

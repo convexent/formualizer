@@ -7,11 +7,59 @@ use crate::{
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::engine::arena::ast::SheetKey;
 use crate::engine::arena::{AstNodeData, AstNodeId, CompactRefType, DataStore};
 use crate::engine::sheet_registry::SheetRegistry;
+use crate::engine::used_extent::{
+    ExtentPolicy, OpenRangeBounds, resolve_used_extent_with_fallback,
+};
+use crate::formula_plane::template_canonical::LiteralSlotId;
+
+pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
+    context: &C,
+    current_sheet: &str,
+    reference: &ReferenceType,
+) -> Option<(u32, u32)> {
+    match reference {
+        ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => {
+            let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
+            let extent = resolve_used_extent_with_fallback(
+                OpenRangeBounds {
+                    start_row: *start_row,
+                    start_column: *start_col,
+                    end_row: *end_row,
+                    end_column: *end_col,
+                },
+                ExtentPolicy::EvaluationCompat {
+                    fallback_row: None,
+                    fallback_column: None,
+                },
+                || context.sheet_bounds(sheet_name).map(|bounds| bounds.0),
+                || context.sheet_bounds(sheet_name).map(|bounds| bounds.1),
+                |first, last| context.used_rows_for_columns(sheet_name, first, last),
+                |first, last| context.used_cols_for_rows(sheet_name, first, last),
+            );
+            let Some(extent) = extent else {
+                return Some((0, 0));
+            };
+            Some((
+                extent.end_row - extent.start_row + 1,
+                extent.end_column - extent.start_column + 1,
+            ))
+        }
+        ReferenceType::Cell { .. } => Some((1, 1)),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 pub enum LocalBinding {
@@ -65,11 +113,21 @@ impl LocalEnv {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct InterpreterParameterBindings<'a> {
+    pub(crate) literal_slots_by_node: &'a FxHashMap<AstNodeId, LiteralSlotId>,
+    pub(crate) literal_values: &'a [LiteralValue],
+}
+
 pub struct Interpreter<'a> {
     pub context: &'a dyn EvaluationContext,
     current_sheet: &'a str,
     current_cell: Option<crate::CellRef>,
     local_env: LocalEnv,
+    reference_row_delta: i64,
+    reference_col_delta: i64,
+    disable_ast_planner: bool,
+    parameter_bindings: Option<InterpreterParameterBindings<'a>>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -79,6 +137,10 @@ impl<'a> Interpreter<'a> {
             current_sheet,
             current_cell: None,
             local_env: LocalEnv::default(),
+            reference_row_delta: 0,
+            reference_col_delta: 0,
+            disable_ast_planner: false,
+            parameter_bindings: None,
         }
     }
 
@@ -92,6 +154,10 @@ impl<'a> Interpreter<'a> {
             current_sheet,
             current_cell: Some(cell),
             local_env: LocalEnv::default(),
+            reference_row_delta: 0,
+            reference_col_delta: 0,
+            disable_ast_planner: false,
+            parameter_bindings: None,
         }
     }
 
@@ -103,13 +169,61 @@ impl<'a> Interpreter<'a> {
         &self.local_env
     }
 
+    pub(crate) fn with_current_cell(&self, cell: crate::CellRef) -> Self {
+        Self {
+            context: self.context,
+            current_sheet: self.current_sheet,
+            current_cell: Some(cell),
+            local_env: self.local_env.clone(),
+            reference_row_delta: self.reference_row_delta,
+            reference_col_delta: self.reference_col_delta,
+            disable_ast_planner: self.disable_ast_planner,
+            parameter_bindings: self.parameter_bindings,
+        }
+    }
+
     pub fn with_local_env(&self, env: LocalEnv) -> Self {
         Self {
             context: self.context,
             current_sheet: self.current_sheet,
             current_cell: self.current_cell,
             local_env: env,
+            reference_row_delta: self.reference_row_delta,
+            reference_col_delta: self.reference_col_delta,
+            disable_ast_planner: self.disable_ast_planner,
+            parameter_bindings: self.parameter_bindings,
         }
+    }
+
+    pub(crate) fn with_parameter_bindings(
+        &self,
+        bindings: InterpreterParameterBindings<'a>,
+    ) -> Self {
+        Self {
+            context: self.context,
+            current_sheet: self.current_sheet,
+            current_cell: self.current_cell,
+            local_env: self.local_env.clone(),
+            reference_row_delta: self.reference_row_delta,
+            reference_col_delta: self.reference_col_delta,
+            disable_ast_planner: self.disable_ast_planner,
+            parameter_bindings: Some(bindings),
+        }
+    }
+
+    fn effective_reference<'r>(
+        &self,
+        reference: &'r ReferenceType,
+    ) -> Result<Cow<'r, ReferenceType>, ExcelError> {
+        if self.reference_row_delta == 0 && self.reference_col_delta == 0 {
+            return Ok(Cow::Borrowed(reference));
+        }
+
+        Ok(Cow::Owned(relocate_reference_for_offset(
+            reference,
+            self.reference_row_delta,
+            self.reference_col_delta,
+        )?))
     }
 
     fn resolve_local_reference(
@@ -157,7 +271,9 @@ impl<'a> Interpreter<'a> {
     /// `FnCaps::RETURNS_REFERENCE` and override `eval_reference`.
     pub fn evaluate_ast_as_reference(&self, node: &ASTNode) -> Result<ReferenceType, ExcelError> {
         match &node.node_type {
-            ASTNodeType::Reference { reference, .. } => Ok(reference.clone()),
+            ASTNodeType::Reference { reference, .. } => {
+                self.reference_for_current_offset(reference)
+            }
             ASTNodeType::Function { name, args } => {
                 if let Some(fun) = self.context.get_function("", name) {
                     // Build handles; allow function to decide reference semantics
@@ -188,9 +304,32 @@ impl<'a> Interpreter<'a> {
             | ASTNodeType::UnaryOp { .. }
             | ASTNodeType::BinaryOp { .. }
             | ASTNodeType::Call { .. }
-            | ASTNodeType::Literal(_) => Err(ExcelError::new(ExcelErrorKind::Ref)
+            | ASTNodeType::Literal(_)
+            | ASTNodeType::Omitted => Err(ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("Expression cannot be used as a reference")),
         }
+    }
+
+    pub(crate) fn try_evaluate_ast_as_reference(
+        &self,
+        node: &ASTNode,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let ASTNodeType::Function { name, args } = &node.node_type else {
+            return Some(self.evaluate_ast_as_reference(node));
+        };
+        let fun = match self.context.get_function("", name) {
+            Some(fun) => fun,
+            None => {
+                return Some(Err(ExcelError::new(ExcelErrorKind::Name)
+                    .with_message(format!("Unknown function: {name}"))));
+            }
+        };
+        let handles: Vec<ArgumentHandle> = args
+            .iter()
+            .map(|arg| ArgumentHandle::new(arg, self))
+            .collect();
+        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+        fun.eval_reference(&handles, &fctx)
     }
 
     pub(crate) fn evaluate_arena_ast_as_reference(
@@ -205,7 +344,9 @@ impl<'a> Interpreter<'a> {
 
         match node {
             AstNodeData::Reference { ref_type, .. } => {
-                Ok(data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry))
+                let reference =
+                    data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+                self.reference_for_current_offset(&reference)
             }
             AstNodeData::Function { name_id, .. } => {
                 let name = data_store.resolve_ast_string(*name_id);
@@ -255,9 +396,186 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    pub(crate) fn try_evaluate_arena_ast_as_reference(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let node = match data_store.get_node(node_id) {
+            Some(node) => node,
+            None => {
+                return Some(Err(
+                    ExcelError::new(ExcelErrorKind::Value).with_message("Missing AST node")
+                ));
+            }
+        };
+        let AstNodeData::Function { name_id, .. } = node else {
+            return Some(self.evaluate_arena_ast_as_reference(node_id, data_store, sheet_registry));
+        };
+        let name = data_store.resolve_ast_string(*name_id);
+        let fun = match self.context.get_function("", name) {
+            Some(fun) => fun,
+            None => {
+                return Some(Err(ExcelError::new(ExcelErrorKind::Name)
+                    .with_message(format!("Unknown function: {name}"))));
+            }
+        };
+        let args = match data_store.get_args(node_id) {
+            Some(args) => args,
+            None => {
+                return Some(Err(
+                    ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
+                ));
+            }
+        };
+        let handles: Vec<ArgumentHandle> = args
+            .iter()
+            .copied()
+            .map(|arg_id| ArgumentHandle::new_arena(arg_id, self, data_store, sheet_registry))
+            .collect();
+        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+        fun.eval_reference(&handles, &fctx)
+    }
+
     /* ===================  public  =================== */
     pub fn evaluate_ast(&self, node: &ASTNode) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         self.evaluate_ast_uncached(node)
+    }
+
+    pub(crate) fn evaluate_ast_with_offset(
+        &self,
+        node: &ASTNode,
+        row_delta: i64,
+        col_delta: i64,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let offset = Self {
+            context: self.context,
+            current_sheet: self.current_sheet,
+            current_cell: self.current_cell,
+            local_env: self.local_env.clone(),
+            reference_row_delta: row_delta,
+            reference_col_delta: col_delta,
+            disable_ast_planner: true,
+            parameter_bindings: self.parameter_bindings,
+        };
+        offset.evaluate_ast_uncached(node)
+    }
+
+    pub(crate) fn reference_for_current_offset(
+        &self,
+        reference: &ReferenceType,
+    ) -> Result<ReferenceType, ExcelError> {
+        self.effective_reference(reference)
+            .map(|reference| reference.into_owned())
+    }
+
+    pub(crate) fn evaluate_arena_ast_with_offset(
+        &self,
+        node_id: AstNodeId,
+        row_delta: i64,
+        col_delta: i64,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let offset = Self {
+            context: self.context,
+            current_sheet: self.current_sheet,
+            current_cell: self.current_cell,
+            local_env: self.local_env.clone(),
+            reference_row_delta: row_delta,
+            reference_col_delta: col_delta,
+            disable_ast_planner: true,
+            parameter_bindings: self.parameter_bindings,
+        };
+        offset.evaluate_arena_ast(node_id, data_store, sheet_registry)
+    }
+
+    fn annotate_cell_value(
+        &self,
+        sheet: Option<&str>,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) -> crate::traits::CalcValue<'a> {
+        match self
+            .context
+            .resolve_cell_format(sheet, row, col, self.current_sheet)
+        {
+            Some(format) => crate::traits::CalcValue::AnnotatedScalar(value, format),
+            None => crate::traits::CalcValue::Scalar(value),
+        }
+    }
+
+    fn binary_format(
+        &self,
+        op: char,
+        left: Option<crate::format::FormatId>,
+        right: Option<crate::format::FormatId>,
+    ) -> Option<crate::format::FormatId> {
+        use formualizer_common::numfmt::FormatClass;
+        let class =
+            |id: Option<crate::format::FormatId>| id.and_then(|id| self.context.format_class(id));
+        let left = class(left);
+        let right = class(right);
+        let is_plain = |class: &Option<FormatClass>| {
+            matches!(
+                class,
+                None | Some(FormatClass::General | FormatClass::Number { .. })
+            )
+        };
+        // This table is intentionally closed. LibreOffice measurement establishes
+        // Date+Time and Date+Percent; unlisted pairs (including Date+Date,
+        // Duration+Date, Date+Currency, DateTime+Time, and Date+Text) drop the
+        // annotation rather than guessing a display class.
+        match (op, left.as_ref(), right.as_ref()) {
+            ('+', Some(FormatClass::Date), Some(FormatClass::Time))
+            | ('+', Some(FormatClass::Time), Some(FormatClass::Date)) => {
+                Some(crate::format::FormatId::DATETIME)
+            }
+            ('+', Some(FormatClass::Date), Some(FormatClass::Percent { .. }))
+            | ('+', Some(FormatClass::Percent { .. }), Some(FormatClass::Date)) => {
+                Some(crate::format::FormatId::DATE)
+            }
+            ('+' | '-', Some(FormatClass::Date), r) if is_plain(&r.cloned()) => {
+                Some(crate::format::FormatId::DATE)
+            }
+            ('+', l, Some(FormatClass::Date)) if is_plain(&l.cloned()) => {
+                Some(crate::format::FormatId::DATE)
+            }
+            ('+' | '-', Some(FormatClass::Time), r) if is_plain(&r.cloned()) => {
+                Some(crate::format::FormatId::TIME)
+            }
+            ('+', l, Some(FormatClass::Time)) if is_plain(&l.cloned()) => {
+                Some(crate::format::FormatId::TIME)
+            }
+            ('+' | '-', Some(FormatClass::DateTime), r) if is_plain(&r.cloned()) => {
+                Some(crate::format::FormatId::DATETIME)
+            }
+            ('+', l, Some(FormatClass::DateTime)) if is_plain(&l.cloned()) => {
+                Some(crate::format::FormatId::DATETIME)
+            }
+            ('+' | '-', Some(FormatClass::Duration), r) if is_plain(&r.cloned()) => {
+                Some(crate::format::FormatId::DURATION)
+            }
+            ('+', l, Some(FormatClass::Duration)) if is_plain(&l.cloned()) => {
+                Some(crate::format::FormatId::DURATION)
+            }
+            _ => None,
+        }
+    }
+
+    fn annotate_numeric_result(
+        &self,
+        value: LiteralValue,
+        format: Option<crate::format::FormatId>,
+    ) -> crate::traits::CalcValue<'a> {
+        match (value, format) {
+            (value @ LiteralValue::Number(_), Some(format)) => {
+                crate::traits::CalcValue::AnnotatedScalar(value, format)
+            }
+            (value, _) => crate::traits::CalcValue::Scalar(value),
+        }
     }
 
     pub(crate) fn evaluate_arena_ast(
@@ -271,13 +589,27 @@ impl<'a> Interpreter<'a> {
         })?;
 
         match node {
-            AstNodeData::Literal(vref) => Ok(crate::traits::CalcValue::Scalar(
-                data_store.retrieve_value(*vref),
-            )),
+            AstNodeData::Literal(vref) => {
+                if let Some(bindings) = self.parameter_bindings
+                    && let Some(slot_id) = bindings.literal_slots_by_node.get(&node_id)
+                    && let Some(value) = bindings.literal_values.get(slot_id.0 as usize)
+                {
+                    return Ok(crate::traits::CalcValue::Scalar(value.clone()));
+                }
+                Ok(crate::traits::CalcValue::Scalar(
+                    data_store.retrieve_value(*vref),
+                ))
+            }
+            AstNodeData::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
             AstNodeData::Reference { ref_type, .. } => {
-                if let CompactRefType::Cell {
-                    sheet, row, col, ..
-                } = ref_type
+                if self.local_env.is_empty()
+                    && let CompactRefType::Cell {
+                        sheet,
+                        row,
+                        col,
+                        row_abs,
+                        col_abs,
+                    } = ref_type
                     && *row > 0
                     && *col > 0
                 {
@@ -288,16 +620,19 @@ impl<'a> Interpreter<'a> {
                         }
                         None => None,
                     };
+                    let row = shift_axis_for_offset(*row, self.reference_row_delta, *row_abs)?;
+                    let col = shift_axis_for_offset(*col, self.reference_col_delta, *col_abs)?;
                     let value = self.context.resolve_cell_reference_value(
                         sheet_name,
-                        *row,
-                        *col,
+                        row,
+                        col,
                         self.current_sheet,
                     )?;
-                    Ok(crate::traits::CalcValue::Scalar(value))
+                    Ok(self.annotate_cell_value(sheet_name, row, col, value))
                 } else {
                     let reference =
                         data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+                    let reference = self.effective_reference(&reference)?;
                     if let Some(local) = self.resolve_local_reference(&reference) {
                         return Ok(local);
                     }
@@ -358,12 +693,12 @@ impl<'a> Interpreter<'a> {
                     };
                 }
 
-                let left = self
-                    .evaluate_arena_ast(*left_id, data_store, sheet_registry)?
-                    .into_literal();
-                let right = self
-                    .evaluate_arena_ast(*right_id, data_store, sheet_registry)?
-                    .into_literal();
+                let left_calc = self.evaluate_arena_ast(*left_id, data_store, sheet_registry)?;
+                let left_format = left_calc.format_id();
+                let left = left_calc.into_literal();
+                let right_calc = self.evaluate_arena_ast(*right_id, data_store, sheet_registry)?;
+                let right_format = right_calc.format_id();
+                let right = right_calc.into_literal();
 
                 if matches!(op, "=" | "<>" | ">" | "<" | ">=" | "<=") {
                     return self
@@ -372,12 +707,18 @@ impl<'a> Interpreter<'a> {
                 }
 
                 match op {
-                    "+" => self
-                        .add_sub_date_aware('+', left, right)
-                        .map(crate::traits::CalcValue::Scalar),
-                    "-" => self
-                        .add_sub_date_aware('-', left, right)
-                        .map(crate::traits::CalcValue::Scalar),
+                    "+" => self.numeric_binary(left, right, |a, b| a + b).map(|value| {
+                        self.annotate_numeric_result(
+                            value,
+                            self.binary_format('+', left_format, right_format),
+                        )
+                    }),
+                    "-" => self.numeric_binary(left, right, |a, b| a - b).map(|value| {
+                        self.annotate_numeric_result(
+                            value,
+                            self.binary_format('-', left_format, right_format),
+                        )
+                    }),
                     "*" => self
                         .numeric_binary(left, right, |a, b| a * b)
                         .map(crate::traits::CalcValue::Scalar),
@@ -473,103 +814,16 @@ impl<'a> Interpreter<'a> {
         &self,
         node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if self.disable_ast_planner {
+            return self.eval_tree_uncached(node);
+        }
+
         // Plan-aware evaluation: build a plan for this node and execute accordingly.
         // Provide the planner with a lightweight range-dimension probe and function lookup
         // so it can select chunked reduction and arg-parallel strategies where appropriate.
         let current_sheet = self.current_sheet.to_string();
-        let range_probe = |reference: &ReferenceType| -> Option<(u32, u32)> {
-            // Mirror Engine::resolve_range_storage bound normalization without materialising
-            use formualizer_parse::parser::ReferenceType as RT;
-            match reference {
-                RT::Range {
-                    sheet,
-                    start_row,
-                    start_col,
-                    end_row,
-                    end_col,
-                    ..
-                } => {
-                    let sheet_name = sheet.as_deref().unwrap_or(&current_sheet);
-                    // Start with provided values, fill None from used-region or sheet bounds.
-                    let mut sr = *start_row;
-                    let mut sc = *start_col;
-                    let mut er = *end_row;
-                    let mut ec = *end_col;
-
-                    // Column-only: rows are None on both ends
-                    if sr.is_none() && er.is_none() {
-                        // Full-column reference: anchor at row 1 for alignment across columns
-                        let scv = sc.unwrap_or(1);
-                        let ecv = ec.unwrap_or(scv);
-                        sr = Some(1);
-                        if let Some((_, max_r)) =
-                            self.context.used_rows_for_columns(sheet_name, scv, ecv)
-                        {
-                            er = Some(max_r);
-                        } else if let Some((max_rows, _)) = self.context.sheet_bounds(sheet_name) {
-                            er = Some(max_rows);
-                        }
-                    }
-
-                    // Row-only: cols are None on both ends
-                    if sc.is_none() && ec.is_none() {
-                        // Full-row reference: anchor at column 1 for alignment across rows
-                        let srv = sr.unwrap_or(1);
-                        let erv = er.unwrap_or(srv);
-                        sc = Some(1);
-                        if let Some((_, max_c)) =
-                            self.context.used_cols_for_rows(sheet_name, srv, erv)
-                        {
-                            ec = Some(max_c);
-                        } else if let Some((_, max_cols)) = self.context.sheet_bounds(sheet_name) {
-                            ec = Some(max_cols);
-                        }
-                    }
-
-                    // Partially bounded (e.g., A1:A or A:A10)
-                    if sr.is_some() && er.is_none() {
-                        let scv = sc.unwrap_or(1);
-                        let ecv = ec.unwrap_or(scv);
-                        if let Some((_, max_r)) =
-                            self.context.used_rows_for_columns(sheet_name, scv, ecv)
-                        {
-                            er = Some(max_r);
-                        } else if let Some((max_rows, _)) = self.context.sheet_bounds(sheet_name) {
-                            er = Some(max_rows);
-                        }
-                    }
-                    if er.is_some() && sr.is_none() {
-                        // Open start: anchor at row 1
-                        sr = Some(1);
-                    }
-                    if sc.is_some() && ec.is_none() {
-                        let srv = sr.unwrap_or(1);
-                        let erv = er.unwrap_or(srv);
-                        if let Some((_, max_c)) =
-                            self.context.used_cols_for_rows(sheet_name, srv, erv)
-                        {
-                            ec = Some(max_c);
-                        } else if let Some((_, max_cols)) = self.context.sheet_bounds(sheet_name) {
-                            ec = Some(max_cols);
-                        }
-                    }
-                    if ec.is_some() && sc.is_none() {
-                        // Open start: anchor at column 1
-                        sc = Some(1);
-                    }
-
-                    let sr = sr.unwrap_or(1);
-                    let sc = sc.unwrap_or(1);
-                    let er = er.unwrap_or(sr.saturating_sub(1));
-                    let ec = ec.unwrap_or(sc.saturating_sub(1));
-                    if er < sr || ec < sc {
-                        return Some((0, 0));
-                    }
-                    Some((er.saturating_sub(sr) + 1, ec.saturating_sub(sc) + 1))
-                }
-                RT::Cell { .. } => Some((1, 1)),
-                _ => None,
-            }
+        let range_probe = |reference: &ReferenceType| {
+            probe_range_dimensions(self.context, &current_sheet, reference)
         };
         let fn_lookup = |ns: &str, name: &str| self.context.get_function(ns, name);
 
@@ -580,6 +834,25 @@ impl<'a> Interpreter<'a> {
         self.eval_with_plan(node, &plan.root)
     }
 
+    fn eval_tree_uncached(
+        &self,
+        node: &ASTNode,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        match &node.node_type {
+            ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
+            ASTNodeType::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
+            ASTNodeType::Reference { reference, .. } => self.eval_ast_reference_to_calc(reference),
+            ASTNodeType::UnaryOp { op, expr } => self
+                .eval_unary(op, expr)
+                .map(crate::traits::CalcValue::Scalar),
+            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right),
+            ASTNodeType::Function { name, args } => self.eval_function_to_calc(name, args),
+            ASTNodeType::Call { .. } => Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("Immediate-invocation calls are not yet supported")),
+            ASTNodeType::Array(rows) => self.eval_array_literal_to_calc(rows),
+        }
+    }
+
     fn eval_with_plan(
         &self,
         node: &ASTNode,
@@ -587,22 +860,15 @@ impl<'a> Interpreter<'a> {
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         match &node.node_type {
             ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
-            ASTNodeType::Reference { reference, .. } => {
-                if let Some(local) = self.resolve_local_reference(reference) {
-                    Ok(local)
-                } else {
-                    self.eval_reference_to_calc(reference)
-                }
-            }
+            ASTNodeType::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
+            ASTNodeType::Reference { reference, .. } => self.eval_ast_reference_to_calc(reference),
             ASTNodeType::UnaryOp { op, expr } => {
                 // For now, reuse existing unary implementation (which recurses).
                 // In a later phase, we can map plan_node.children[0].
                 self.eval_unary(op, expr)
                     .map(crate::traits::CalcValue::Scalar)
             }
-            ASTNodeType::BinaryOp { op, left, right } => self
-                .eval_binary(op, left, right)
-                .map(crate::traits::CalcValue::Scalar),
+            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right),
             ASTNodeType::Function { name, args } => {
                 let strategy = plan_node.strategy;
                 if let Some(fun) = self.context.get_function("", name) {
@@ -625,9 +891,11 @@ impl<'a> Interpreter<'a> {
                         for arg in args {
                             match &arg.node_type {
                                 ASTNodeType::Reference { reference, .. } => {
-                                    let _ = self
-                                        .context
-                                        .resolve_range_view(reference, self.current_sheet);
+                                    if let Ok(reference) = self.effective_reference(reference) {
+                                        let _ = self
+                                            .context
+                                            .resolve_range_view(&reference, self.current_sheet);
+                                    }
                                 }
                                 _ => {
                                     let _ = self.evaluate_ast(arg);
@@ -649,24 +917,63 @@ impl<'a> Interpreter<'a> {
     }
 
     /* ===================  reference  =================== */
+    fn eval_ast_reference_to_calc(
+        &self,
+        reference: &ReferenceType,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if !self.local_env.is_empty() {
+            let reference = self.effective_reference(reference)?;
+            if let Some(local) = self.resolve_local_reference(&reference) {
+                return Ok(local);
+            }
+            return self.eval_reference_to_calc(&reference);
+        }
+
+        if let ReferenceType::Cell {
+            sheet,
+            row,
+            col,
+            row_abs,
+            col_abs,
+        } = reference
+        {
+            let row = shift_axis_for_offset(*row, self.reference_row_delta, *row_abs)?;
+            let col = shift_axis_for_offset(*col, self.reference_col_delta, *col_abs)?;
+            let value = self.context.resolve_cell_reference_value(
+                sheet.as_deref(),
+                row,
+                col,
+                self.current_sheet,
+            )?;
+            return Ok(self.annotate_cell_value(sheet.as_deref(), row, col, value));
+        }
+
+        let reference = self.effective_reference(reference)?;
+        self.eval_reference_to_calc(&reference)
+    }
+
     fn eval_reference_to_calc(
         &self,
         reference: &ReferenceType,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if let ReferenceType::Cell {
+            sheet, row, col, ..
+        } = reference
+        {
+            let value = self.context.resolve_cell_reference_value(
+                sheet.as_deref(),
+                *row,
+                *col,
+                self.current_sheet,
+            )?;
+            return Ok(self.annotate_cell_value(sheet.as_deref(), *row, *col, value));
+        }
+
         let view = self
             .context
             .resolve_range_view(reference, self.current_sheet)?
             .with_cancel_token(self.context.cancellation_token());
-
-        match reference {
-            ReferenceType::Cell { .. } => {
-                // For a single cell reference, just return the value.
-                Ok(crate::traits::CalcValue::Scalar(
-                    view.as_1x1().unwrap_or(LiteralValue::Empty),
-                ))
-            }
-            _ => Ok(crate::traits::CalcValue::Range(view)),
-        }
+        Ok(crate::traits::CalcValue::Range(view))
     }
 
     fn eval_reference(&self, reference: &ReferenceType) -> Result<LiteralValue, ExcelError> {
@@ -678,7 +985,8 @@ impl<'a> Interpreter<'a> {
     fn eval_unary(&self, op: &str, expr: &ASTNode) -> Result<LiteralValue, ExcelError> {
         if op == "@" {
             if let ASTNodeType::Reference { reference, .. } = &expr.node_type {
-                return Ok(self.implicit_intersection_from_reference(reference));
+                let reference = self.effective_reference(reference)?;
+                return Ok(self.implicit_intersection_from_reference(&reference));
             }
 
             let cv = self.evaluate_ast(expr)?;
@@ -716,7 +1024,8 @@ impl<'a> Interpreter<'a> {
         };
 
         match cv {
-            crate::traits::CalcValue::Scalar(v) => match v {
+            crate::traits::CalcValue::Scalar(v)
+            | crate::traits::CalcValue::AnnotatedScalar(v, _) => match v {
                 LiteralValue::Array(arr) => {
                     if arr.is_empty() || arr.first().map(|r| r.is_empty()).unwrap_or(true) {
                         return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
@@ -879,7 +1188,11 @@ impl<'a> Interpreter<'a> {
     where
         F: Fn(f64) -> f64,
     {
-        match crate::coercion::to_number_lenient_with_locale(&v, &self.context.locale()) {
+        match crate::coercion::to_arithmetic_number_with_locale(
+            &v,
+            &self.context.locale(),
+            self.context.date_system(),
+        ) {
             Ok(n) => match crate::coercion::sanitize_numeric(f(n)) {
                 Ok(n2) => Ok(LiteralValue::Number(n2)),
                 Err(e) => Ok(LiteralValue::Error(e)),
@@ -892,39 +1205,57 @@ impl<'a> Interpreter<'a> {
     fn eval_binary(
         &self,
         op: &str,
-        left: &ASTNode,
-        right: &ASTNode,
-    ) -> Result<LiteralValue, ExcelError> {
-        // Comparisons use dedicated path.
+        left_node: &ASTNode,
+        right_node: &ASTNode,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let left_calc = self.evaluate_ast(left_node)?;
+        let left_format = left_calc.format_id();
+        let left = left_calc.into_literal();
+        let right_calc = self.evaluate_ast(right_node)?;
+        let right_format = right_calc.format_id();
+        let right = right_calc.into_literal();
         if matches!(op, "=" | "<>" | ">" | "<" | ">=" | "<=") {
-            let l = self.evaluate_ast(left)?.into_literal();
-            let r = self.evaluate_ast(right)?.into_literal();
-            return self.compare(op, l, r);
+            return self
+                .compare(op, left, right)
+                .map(crate::traits::CalcValue::Scalar);
         }
-
-        let l_val = self.evaluate_ast(left)?.into_literal();
-        let r_val = self.evaluate_ast(right)?.into_literal();
-
         match op {
-            "+" => self.add_sub_date_aware('+', l_val, r_val),
-            "-" => self.add_sub_date_aware('-', l_val, r_val),
-            "*" => self.numeric_binary(l_val, r_val, |a, b| a * b),
-            "/" => self.divide(l_val, r_val),
-            "^" => self.power(l_val, r_val),
-            "&" => Ok(LiteralValue::Text(format!(
-                "{}{}",
-                crate::coercion::to_text_invariant(&l_val),
-                crate::coercion::to_text_invariant(&r_val)
+            "+" => self.numeric_binary(left, right, |a, b| a + b).map(|value| {
+                self.annotate_numeric_result(
+                    value,
+                    self.binary_format('+', left_format, right_format),
+                )
+            }),
+            "-" => self.numeric_binary(left, right, |a, b| a - b).map(|value| {
+                self.annotate_numeric_result(
+                    value,
+                    self.binary_format('-', left_format, right_format),
+                )
+            }),
+            "*" => self
+                .numeric_binary(left, right, |a, b| a * b)
+                .map(crate::traits::CalcValue::Scalar),
+            "/" => self
+                .divide(left, right)
+                .map(crate::traits::CalcValue::Scalar),
+            "^" => self
+                .power(left, right)
+                .map(crate::traits::CalcValue::Scalar),
+            "&" => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
+                format!(
+                    "{}{}",
+                    crate::coercion::to_text_invariant(&left),
+                    crate::coercion::to_text_invariant(&right)
+                ),
             ))),
             ":" => {
-                // Compute a combined reference; in value context return #REF! for now.
-                let lref = self.evaluate_ast_as_reference(left)?;
-                let rref = self.evaluate_ast_as_reference(right)?;
-                match crate::reference::combine_references(&lref, &rref) {
-                    Ok(_r) => Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
+                let left_ref = self.evaluate_ast_as_reference(left_node)?;
+                let right_ref = self.evaluate_ast_as_reference(right_node)?;
+                match crate::reference::combine_references(&left_ref, &right_ref) {
+                    Ok(_) => Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
                         "Reference produced by ':' cannot be used directly as a value",
                     )),
-                    Err(e) => Ok(LiteralValue::Error(e)),
+                    Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
                 }
             }
             _ => {
@@ -932,88 +1263,6 @@ impl<'a> Interpreter<'a> {
                     .with_message(format!("Binary op '{op}'")))
             }
         }
-    }
-
-    fn add_sub_date_aware(
-        &self,
-        op: char,
-        left: LiteralValue,
-        right: LiteralValue,
-    ) -> Result<LiteralValue, ExcelError> {
-        debug_assert!(op == '+' || op == '-');
-
-        self.broadcast_apply(left, right, |l, r| {
-            use LiteralValue::*;
-
-            let date_system = self.context.date_system();
-
-            let date_like_serial = |v: &LiteralValue| -> Option<f64> {
-                match v {
-                    Date(d) => Some(crate::builtins::datetime::date_to_serial_for(
-                        date_system,
-                        d,
-                    )),
-                    DateTime(dt) => Some(crate::builtins::datetime::datetime_to_serial_for(
-                        date_system,
-                        dt,
-                    )),
-                    _ => None,
-                }
-            };
-
-            let to_num = |v: &LiteralValue| -> Result<f64, ExcelError> {
-                crate::coercion::to_number_lenient_with_locale(v, &self.context.locale())
-            };
-
-            let serial_to_literal = |serial: f64| -> LiteralValue {
-                match crate::coercion::sanitize_numeric(serial) {
-                    Ok(serial) => {
-                        match crate::builtins::datetime::serial_to_datetime_for(date_system, serial)
-                        {
-                            Ok(dt) => {
-                                if dt.time() == chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap() {
-                                    Date(dt.date())
-                                } else {
-                                    DateTime(dt)
-                                }
-                            }
-                            Err(e) => Error(e),
-                        }
-                    }
-                    Err(e) => Error(e),
-                }
-            };
-
-            // Date +/- number => date (propagate temporal tag)
-            if let Some(ls) = date_like_serial(&l) {
-                match op {
-                    '+' => {
-                        let rn = to_num(&r)?;
-                        return Ok(serial_to_literal(ls + rn));
-                    }
-                    '-' => {
-                        // Date - Date => numeric day delta (Excel-compatible)
-                        if let Some(rs) = date_like_serial(&r) {
-                            return Ok(Number(ls - rs));
-                        }
-                        let rn = to_num(&r)?;
-                        return Ok(serial_to_literal(ls - rn));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
-            // Number + Date => date (commutative)
-            if op == '+'
-                && let Some(rs) = date_like_serial(&r)
-            {
-                let ln = to_num(&l)?;
-                return Ok(serial_to_literal(ln + rs));
-            }
-
-            // Fallback: regular numeric operation
-            self.numeric_binary(l, r, |a, b| if op == '+' { a + b } else { a - b })
-        })
     }
 
     /* ===================  function calls  =================== */
@@ -1080,7 +1329,6 @@ impl<'a> Interpreter<'a> {
             .map(|cv| cv.into_literal())
     }
 
-    /* ===================  helpers  =================== */
     fn numeric_binary<F>(
         &self,
         left: LiteralValue,
@@ -1091,8 +1339,16 @@ impl<'a> Interpreter<'a> {
         F: Fn(f64, f64) -> f64 + Copy,
     {
         self.broadcast_apply(left, right, |l, r| {
-            let a = crate::coercion::to_number_lenient_with_locale(&l, &self.context.locale());
-            let b = crate::coercion::to_number_lenient_with_locale(&r, &self.context.locale());
+            let a = crate::coercion::to_arithmetic_number_with_locale(
+                &l,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
+            let b = crate::coercion::to_arithmetic_number_with_locale(
+                &r,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
             match (a, b) {
                 (Ok(a), Ok(b)) => match crate::coercion::sanitize_numeric(f(a, b)) {
                     Ok(n2) => Ok(LiteralValue::Number(n2)),
@@ -1105,8 +1361,16 @@ impl<'a> Interpreter<'a> {
 
     fn divide(&self, left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
         self.broadcast_apply(left, right, |l, r| {
-            let ln = crate::coercion::to_number_lenient_with_locale(&l, &self.context.locale());
-            let rn = crate::coercion::to_number_lenient_with_locale(&r, &self.context.locale());
+            let ln = crate::coercion::to_arithmetic_number_with_locale(
+                &l,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
+            let rn = crate::coercion::to_arithmetic_number_with_locale(
+                &r,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
             let (a, b) = match (ln, rn) {
                 (Ok(a), Ok(b)) => (a, b),
                 (Err(e), _) | (_, Err(e)) => return Ok(LiteralValue::Error(e)),
@@ -1125,8 +1389,16 @@ impl<'a> Interpreter<'a> {
 
     fn power(&self, left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
         self.broadcast_apply(left, right, |l, r| {
-            let ln = crate::coercion::to_number_lenient_with_locale(&l, &self.context.locale());
-            let rn = crate::coercion::to_number_lenient_with_locale(&r, &self.context.locale());
+            let ln = crate::coercion::to_arithmetic_number_with_locale(
+                &l,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
+            let rn = crate::coercion::to_arithmetic_number_with_locale(
+                &r,
+                &self.context.locale(),
+                self.context.date_system(),
+            );
             let (a, b) = match (ln, rn) {
                 (Ok(a), Ok(b)) => (a, b),
                 (Err(e), _) | (_, Err(e)) => return Ok(LiteralValue::Error(e)),
@@ -1364,5 +1636,126 @@ impl<'a> Interpreter<'a> {
                 _ => unreachable!(),
             },
         )
+    }
+}
+
+fn relocate_reference_for_offset(
+    reference: &ReferenceType,
+    row_delta: i64,
+    col_delta: i64,
+) -> Result<ReferenceType, ExcelError> {
+    match reference {
+        ReferenceType::Cell {
+            sheet,
+            row,
+            col,
+            row_abs,
+            col_abs,
+        } => Ok(ReferenceType::Cell {
+            sheet: sheet.clone(),
+            row: shift_axis_for_offset(*row, row_delta, *row_abs)?,
+            col: shift_axis_for_offset(*col, col_delta, *col_abs)?,
+            row_abs: *row_abs,
+            col_abs: *col_abs,
+        }),
+        ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            start_row_abs,
+            start_col_abs,
+            end_row_abs,
+            end_col_abs,
+        } => Ok(ReferenceType::Range {
+            sheet: sheet.clone(),
+            start_row: shift_optional_axis_for_offset(*start_row, row_delta, *start_row_abs)?,
+            start_col: shift_optional_axis_for_offset(*start_col, col_delta, *start_col_abs)?,
+            end_row: shift_optional_axis_for_offset(*end_row, row_delta, *end_row_abs)?,
+            end_col: shift_optional_axis_for_offset(*end_col, col_delta, *end_col_abs)?,
+            start_row_abs: *start_row_abs,
+            start_col_abs: *start_col_abs,
+            end_row_abs: *end_row_abs,
+            end_col_abs: *end_col_abs,
+        }),
+        // Defined names are placement-invariant: a relocated copy of the
+        // formula references the same name, resolved at evaluation time.
+        ReferenceType::NamedRange(name) => Ok(ReferenceType::NamedRange(name.clone())),
+        ReferenceType::Table(_)
+        | ReferenceType::Cell3D { .. }
+        | ReferenceType::Range3D { .. }
+        | ReferenceType::External(_) => Err(unsupported_reference_relocation_error()),
+    }
+}
+
+fn shift_optional_axis_for_offset(
+    value: Option<u32>,
+    delta: i64,
+    is_absolute: bool,
+) -> Result<Option<u32>, ExcelError> {
+    value
+        .map(|value| shift_axis_for_offset(value, delta, is_absolute))
+        .transpose()
+}
+
+fn shift_axis_for_offset(value: u32, delta: i64, is_absolute: bool) -> Result<u32, ExcelError> {
+    if is_absolute {
+        return Ok(value);
+    }
+    let shifted = i64::from(value) + delta;
+    if shifted < 1 || shifted > i64::from(u32::MAX) {
+        return Err(unsupported_reference_relocation_error());
+    }
+    Ok(shifted as u32)
+}
+
+fn unsupported_reference_relocation_error() -> ExcelError {
+    ExcelError::new(ExcelErrorKind::Ref)
+        .with_message("Unsupported reference relocation for FormulaPlane span evaluation")
+}
+
+#[cfg(test)]
+mod format_algebra_tests {
+    use super::*;
+    use crate::engine::{EvalConfig, eval::Engine};
+    use crate::format::FormatId;
+    use crate::test_workbook::TestWorkbook;
+
+    #[test]
+    fn temporal_binary_format_algebra_pins_positive_and_negative_cases() {
+        let engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        let interpreter = Interpreter::new(&engine, "Sheet1");
+
+        assert_eq!(
+            interpreter.binary_format('+', Some(FormatId::DATE), Some(FormatId::TIME)),
+            Some(FormatId::DATETIME)
+        );
+        assert_eq!(
+            interpreter.binary_format('+', Some(FormatId::DATE), Some(FormatId(9))),
+            Some(FormatId::DATE),
+            "Date + Percent follows the measured temporal-wins rule"
+        );
+        assert_eq!(
+            interpreter.binary_format('-', Some(FormatId::DATE), Some(FormatId::DATE)),
+            None,
+            "Date - Date is an unformatted duration in days"
+        );
+        assert_eq!(
+            interpreter.binary_format('+', Some(FormatId::DATE), Some(FormatId(49))),
+            None,
+            "Date + Text must not acquire a temporal annotation"
+        );
+        for (left, right) in [
+            (FormatId::DATE, FormatId::DATE),
+            (FormatId::DURATION, FormatId::DATE),
+            (FormatId::DATE, FormatId(5)),
+            (FormatId::DATETIME, FormatId::TIME),
+        ] {
+            assert_eq!(
+                interpreter.binary_format('+', Some(left), Some(right)),
+                None
+            );
+        }
     }
 }

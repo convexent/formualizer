@@ -1,6 +1,7 @@
 [package]
 name = "formualizer-wasm"
-version = "0.5.12"
+version = "0.9.3"
+publish = false
 edition = "2024"
 authors = ["Formualizer Contributors"]
 homepage = "https://github.com/PSU3D0/formualizer"
@@ -22,7 +23,7 @@ js-sys = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
 console_error_panic_hook = { version = "0.1", optional = true }
-formualizer = { path = "../../crates/formualizer", default-features = false, features = ["wasm-js"] }
+formualizer = { path = "../../crates/formualizer", default-features = false, features = ["wasm-js", "sheetport"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 
@@ -34,10 +35,12 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 
 [features]
-default = ["console_panic", "json", "calamine"]
+default = ["console_panic", "json", "calamine", "xlsx-recalc"]
+# Cache-only XLSX recalculation uses the shared Rust implementation.
+xlsx-recalc = ["formualizer/xlsx-recalc"]
 console_panic = ["console_error_panic_hook"]
 # Expose local feature toggles and forward them to the workbook dependency
 json = ["formualizer/json"]

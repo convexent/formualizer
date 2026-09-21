@@ -271,7 +271,8 @@ pub fn validate_and_prepare<'a, 'b>(
                                 Cow::Owned(tl)
                             }
                             crate::traits::CalcValue::Range(rv) => Cow::Owned(rv.get_cell(0, 0)),
-                            crate::traits::CalcValue::Scalar(s) => Cow::Owned(s),
+                            crate::traits::CalcValue::Scalar(s)
+                            | crate::traits::CalcValue::AnnotatedScalar(s, _) => Cow::Owned(s),
                             crate::traits::CalcValue::Callable(_) => {
                                 Cow::Owned(LiteralValue::Error(
                                     ExcelError::new(ExcelErrorKind::Calc)
@@ -337,21 +338,22 @@ pub fn validate_and_prepare<'a, 'b>(
                     Err(e) => items.push(PreparedArg::Value(Cow::Owned(LiteralValue::Error(e)))),
                 }
             }
-            ShapeKind::Range | ShapeKind::Array => {
-                match arg.range_view() {
-                    Ok(r) => items.push(PreparedArg::Range(r)),
-                    Err(_e) => {
-                        // Excel-compatible: functions that accept ranges typically also accept scalars.
-                        // Fall back to treating the argument as a scalar value, even in strict mode.
-                        match arg.value() {
-                            Ok(v) => items.push(PreparedArg::Value(Cow::Owned(v.into_literal()))),
-                            Err(e2) => {
-                                items.push(PreparedArg::Value(Cow::Owned(LiteralValue::Error(e2))))
-                            }
-                        }
-                    }
+            ShapeKind::Range | ShapeKind::Array => match arg.resolve_once() {
+                Ok(crate::traits::ResolvedArgument::Range(range))
+                | Ok(crate::traits::ResolvedArgument::Value(crate::traits::CalcValue::Range(
+                    range,
+                ))) => items.push(PreparedArg::Range(range)),
+                Ok(crate::traits::ResolvedArgument::Value(value)) => {
+                    // Excel-compatible: range-accepting functions also accept scalars.
+                    items.push(PreparedArg::Value(Cow::Owned(value.into_literal())))
                 }
-            }
+                Ok(crate::traits::ResolvedArgument::ReferenceError(error)) => {
+                    items.push(PreparedArg::Value(Cow::Owned(LiteralValue::Error(error))))
+                }
+                Err(error) => {
+                    items.push(PreparedArg::Value(Cow::Owned(LiteralValue::Error(error))))
+                }
+            },
         }
     }
 

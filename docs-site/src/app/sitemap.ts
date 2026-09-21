@@ -2,6 +2,9 @@ import type { MetadataRoute } from 'next';
 import { source } from '@/lib/source';
 import { siteUrl } from '@/lib/env';
 
+// Required for `output: 'export'` — emit sitemap.xml as a static file at build.
+export const dynamic = 'force-static';
+
 export default function sitemap(): MetadataRoute.Sitemap {
   const base = siteUrl.replace(/\/$/, '');
 
@@ -21,13 +24,27 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: 'weekly',
       priority: 0.9,
     },
+    {
+      url: `${base}/evaluate-excel-formulas-python`,
+      changeFrequency: 'weekly',
+      priority: 0.9,
+    },
+    {
+      url: `${base}/spreadsheet-engine-for-ai-agents`,
+      changeFrequency: 'weekly',
+      priority: 0.9,
+    },
   ];
 
-  const docsRoutes: MetadataRoute.Sitemap = source.getPages().map((page) => ({
-    url: `${base}${page.url}`,
-    changeFrequency: 'weekly',
-    priority: page.url.includes('/reference/functions/') ? 0.75 : 0.8,
-  }));
+  const docsRoutes: MetadataRoute.Sitemap = source
+    .getPages()
+    // /docs is already in staticRoutes; the docs root page would duplicate it
+    .filter((page) => page.url !== '/docs')
+    .map((page) => ({
+      url: `${base}${page.url}`,
+      changeFrequency: 'weekly',
+      priority: page.url.includes('/reference/functions/') ? 0.75 : 0.8,
+    }));
 
   return [...staticRoutes, ...docsRoutes];
 }

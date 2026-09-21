@@ -1,9 +1,8 @@
 //! TODAY and NOW volatile functions
 
-use super::serial::{date_to_serial_for, datetime_to_serial_for};
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, LiteralValue, date_to_serial_for, datetime_to_serial_for};
 use formualizer_macros::func_caps;
 
 /// Returns the current date as a volatile serial value.
@@ -49,6 +48,13 @@ pub struct TodayFn;
 /// Caps: VOLATILE
 /// [formualizer-docgen:schema:end]
 impl Function for TodayFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::DATE)
+    }
+
     func_caps!(VOLATILE);
 
     fn name(&self) -> &'static str {
@@ -115,6 +121,13 @@ pub struct NowFn;
 /// Caps: VOLATILE
 /// [formualizer-docgen:schema:end]
 impl Function for NowFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::DATETIME)
+    }
+
     func_caps!(VOLATILE);
 
     fn name(&self) -> &'static str {
@@ -140,8 +153,8 @@ impl Function for NowFn {
 
 pub fn register_builtins() {
     use std::sync::Arc;
-    crate::function_registry::register_function(Arc::new(TodayFn));
-    crate::function_registry::register_function(Arc::new(NowFn));
+    crate::function_registry::register_builtin(Arc::new(TodayFn));
+    crate::function_registry::register_builtin(Arc::new(NowFn));
 }
 
 #[cfg(test)]

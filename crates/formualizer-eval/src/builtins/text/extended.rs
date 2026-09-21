@@ -1,6 +1,9 @@
 //! Extended text functions: CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, TEXTSPLIT, DOLLAR, FIXED
 
-use super::super::utils::{ARG_ANY_ONE, coerce_num};
+use super::{
+    super::utils::{ARG_ANY_ONE, coerce_num},
+    scalar_text_value,
+};
 use crate::args::{ArgSchema, ShapeKind};
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
@@ -9,7 +12,7 @@ use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
-        CalcValue::Scalar(v) => v,
+        CalcValue::Scalar(v) | CalcValue::AnnotatedScalar(v, _) => v,
         CalcValue::Range(rv) => rv.get_cell(0, 0),
         CalcValue::Callable(_) => LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
@@ -99,7 +102,7 @@ impl Function for CleanFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let v = scalar_like_value(&args[0])?;
+        let v = scalar_text_value(&args[0])?;
         let text = match v {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
@@ -261,7 +264,7 @@ impl Function for UnicodeFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let v = scalar_like_value(&args[0])?;
+        let v = scalar_text_value(&args[0])?;
         let text = match v {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
@@ -378,13 +381,13 @@ impl Function for TextBeforeFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let v1 = scalar_like_value(&args[0])?;
+        let v1 = scalar_text_value(&args[0])?;
         let text = match v1 {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
         };
 
-        let v2 = scalar_like_value(&args[1])?;
+        let v2 = scalar_text_value(&args[1])?;
         let delimiter = match v2 {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
@@ -509,13 +512,13 @@ impl Function for TextAfterFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let v1 = scalar_like_value(&args[0])?;
+        let v1 = scalar_text_value(&args[0])?;
         let text = match v1 {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
         };
 
-        let v2 = scalar_like_value(&args[1])?;
+        let v2 = scalar_text_value(&args[1])?;
         let delimiter = match v2 {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),
@@ -919,16 +922,16 @@ impl Function for FixedFn {
 // ============================================================================
 
 pub fn register_builtins() {
-    use crate::function_registry::register_function;
+    use crate::function_registry::register_builtin;
     use std::sync::Arc;
 
-    register_function(Arc::new(CleanFn));
-    register_function(Arc::new(UnicharFn));
-    register_function(Arc::new(UnicodeFn));
-    register_function(Arc::new(TextBeforeFn));
-    register_function(Arc::new(TextAfterFn));
-    register_function(Arc::new(DollarFn));
-    register_function(Arc::new(FixedFn));
+    register_builtin(Arc::new(CleanFn));
+    register_builtin(Arc::new(UnicharFn));
+    register_builtin(Arc::new(UnicodeFn));
+    register_builtin(Arc::new(TextBeforeFn));
+    register_builtin(Arc::new(TextAfterFn));
+    register_builtin(Arc::new(DollarFn));
+    register_builtin(Arc::new(FixedFn));
 }
 
 #[cfg(test)]

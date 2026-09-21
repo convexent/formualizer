@@ -218,7 +218,7 @@ fn apply_forward_change_event(
                 *sheet_id,
                 kind.unwrap_or(crate::engine::vertex::VertexKind::Cell),
             );
-            editor.add_vertex(meta);
+            editor.try_add_vertex(meta)?;
         }
         ChangeEvent::RemoveVertex {
             coord, sheet_id, ..
@@ -291,7 +291,7 @@ fn apply_forward_change_event(
         }
         ChangeEvent::CompoundStart { .. }
         | ChangeEvent::CompoundEnd { .. }
-        | ChangeEvent::StagedFormulaStateChanged { .. } => {}
+        | ChangeEvent::StagedFormulaCellChanged { .. } => {}
     }
     Ok(())
 }

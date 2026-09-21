@@ -45,28 +45,44 @@ fn is_valid_excel_name(name: &str) -> bool {
 }
 
 /// Helper function to adjust a named definition during structural operations.
+///
+/// Named definitions track structural edits regardless of `$` anchors, matching
+/// formula references. Absolute markers affect copy/fill, not structural shifts.
 fn adjust_named_definition(
     definition: &mut NamedDefinition,
     adjuster: &crate::engine::graph::editor::reference_adjuster::ReferenceAdjuster,
     operation: &crate::engine::graph::editor::reference_adjuster::ShiftOperation,
+    context: &crate::engine::graph::editor::reference_adjuster::ReferenceContext<'_>,
 ) -> Result<(), ExcelError> {
+    use crate::engine::graph::editor::reference_adjuster::AbsShiftPolicy;
+    let mut invalidated = false;
     match definition {
         NamedDefinition::Cell(cell_ref) => {
-            if let Some(adjusted) = adjuster.adjust_cell_ref(cell_ref, operation) {
+            if let Some(adjusted) =
+                adjuster.adjust_cell_ref_with_policy(cell_ref, operation, AbsShiftPolicy::Track)
+            {
                 *cell_ref = adjusted;
             } else {
-                return Err(ExcelError::new(ExcelErrorKind::Ref));
+                invalidated = true;
             }
         }
         NamedDefinition::Range(range_ref) => {
-            let adjusted_start = adjuster.adjust_cell_ref(&range_ref.start, operation);
-            let adjusted_end = adjuster.adjust_cell_ref(&range_ref.end, operation);
+            let adjusted_start = adjuster.adjust_cell_ref_with_policy(
+                &range_ref.start,
+                operation,
+                AbsShiftPolicy::Track,
+            );
+            let adjusted_end = adjuster.adjust_cell_ref_with_policy(
+                &range_ref.end,
+                operation,
+                AbsShiftPolicy::Track,
+            );
 
             if let (Some(start), Some(end)) = (adjusted_start, adjusted_end) {
                 range_ref.start = start;
                 range_ref.end = end;
             } else {
-                return Err(ExcelError::new(ExcelErrorKind::Ref));
+                invalidated = true;
             }
         }
         NamedDefinition::Literal(_) => {
@@ -77,19 +93,36 @@ fn adjust_named_definition(
             dependencies,
             range_deps,
         } => {
-            let adjusted_ast = adjuster.adjust_ast(ast, operation);
+            let adjusted_ast = adjuster.adjust_ast_with_policy_in_context(
+                ast,
+                operation,
+                AbsShiftPolicy::Track,
+                context,
+            );
             *ast = adjusted_ast;
 
             dependencies.clear();
             range_deps.clear();
         }
     }
+    if invalidated {
+        *definition = NamedDefinition::Formula {
+            ast: formualizer_parse::parser::ASTNode::new(
+                formualizer_parse::parser::ASTNodeType::Literal(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Ref),
+                )),
+                None,
+            ),
+            dependencies: Vec::new(),
+            range_deps: Vec::new(),
+        };
+    }
     Ok(())
 }
 
 impl DependencyGraph {
     #[inline]
-    fn name_lookup_key(&self, name: &str) -> String {
+    pub(crate) fn name_lookup_key(&self, name: &str) -> String {
         if self.config.case_sensitive_names {
             name.to_string()
         } else {
@@ -108,45 +141,60 @@ impl DependencyGraph {
         }
     }
 
-    fn next_name_coord(&mut self) -> AbsCoord {
-        let seq = self.name_vertex_seq;
-        self.name_vertex_seq = self.name_vertex_seq.wrapping_add(1);
-        let row = (seq / 16_384).min(0x000F_FFFF);
-        let col = seq % 16_384;
-        AbsCoord::new(row, col)
+    /// Allocate the next address in the symbol space.
+    ///
+    /// Symbols are identified by name and have no position. They used to be handed
+    /// fabricated grid coordinates on a real sheet, which let grid operations reach them
+    /// (#302, #304); a `SymbolAddr` is not a position and cannot be reached that way.
+    pub(super) fn next_symbol_addr(&mut self) -> VertexAddr {
+        let seq = self.symbol_vertex_seq;
+        self.symbol_vertex_seq = self.symbol_vertex_seq.wrapping_add(1);
+        VertexAddr::symbol(SymbolAddr::new(seq))
+    }
+
+    /// Allocate a vertex in the symbol address space.
+    ///
+    /// `scope_sheet_id` is recorded as lookup metadata only: it says which scope the symbol
+    /// answers queries for, never where it lives. Symbol vertices are absent from
+    /// `cell_to_vertex` and from every sheet index by construction, because they have no
+    /// grid address to key them by.
+    pub(super) fn allocate_symbol_vertex(
+        &mut self,
+        kind: VertexKind,
+        scope_sheet_id: SheetId,
+    ) -> VertexId {
+        let addr = self.next_symbol_addr();
+        let vertex_id = self.store.allocate(addr, scope_sheet_id, 0x01);
+        self.store.set_kind(vertex_id, kind);
+        self.edges.add_vertex(addr, vertex_id.0);
+        vertex_id
     }
 
     pub(super) fn allocate_name_vertex(&mut self, scope: NameScope) -> VertexId {
-        let coord = self.next_name_coord();
-        let sheet_id = match scope {
+        // Scope is lookup metadata, not an address: a workbook-scoped name is not a
+        // resident of the default sheet.
+        let scope_sheet_id = match scope {
             NameScope::Sheet(id) => id,
             NameScope::Workbook => self.default_sheet_id,
         };
-        let vertex_id = self.store.allocate(coord, sheet_id, 0x01);
-        self.store.set_kind(vertex_id, VertexKind::NamedScalar);
-        self.store.set_dirty(vertex_id, true);
-        self.edges.add_vertex(coord, vertex_id.0);
-        self.dirty_vertices.insert(vertex_id);
+        let vertex_id = self.allocate_symbol_vertex(VertexKind::NamedScalar, scope_sheet_id);
+        self.mark_vertex_dirty(vertex_id);
         vertex_id
     }
 
     // Named Range Methods
 
-    /// Define a new named range
-    pub fn define_name(
-        &mut self,
+    pub(crate) fn validate_define_name(
+        &self,
         name: &str,
-        definition: NamedDefinition,
         scope: NameScope,
     ) -> Result<(), ExcelError> {
-        // Validate name
         if !is_valid_excel_name(name) {
             return Err(
                 ExcelError::new(ExcelErrorKind::Name).with_message(format!("Invalid name: {name}"))
             );
         }
 
-        // Check for duplicates / collisions (respect case-sensitivity config)
         let lookup_key = self.name_lookup_key(name);
         match scope {
             NameScope::Workbook => {
@@ -157,9 +205,7 @@ impl DependencyGraph {
                 }
             }
             NameScope::Sheet(sheet_id) => {
-                if let Some(existing) = self
-                    .sheet_named_ranges_lookup
-                    .get(&(sheet_id, lookup_key.clone()))
+                if let Some(existing) = self.sheet_named_ranges_lookup.get(&(sheet_id, lookup_key))
                 {
                     return Err(ExcelError::new(ExcelErrorKind::Name).with_message(format!(
                         "Name collision under normalization in sheet: '{name}' conflicts with '{existing}'"
@@ -167,6 +213,30 @@ impl DependencyGraph {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_existing_name(
+        &self,
+        name: &str,
+        scope: NameScope,
+    ) -> Result<(), ExcelError> {
+        self.canonical_name_in_scope(scope, name)
+            .map(|_| ())
+            .ok_or_else(|| {
+                ExcelError::new(ExcelErrorKind::Name)
+                    .with_message(format!("Name not found: {name}"))
+            })
+    }
+
+    /// Define a new named range
+    pub fn define_name(
+        &mut self,
+        name: &str,
+        definition: NamedDefinition,
+        scope: NameScope,
+    ) -> Result<(), ExcelError> {
+        self.validate_define_name(name, scope)?;
 
         let mut final_definition = definition;
         // Extract dependencies if formula
@@ -201,8 +271,9 @@ impl DependencyGraph {
             self.store.set_kind(vertex_id, VertexKind::NamedScalar);
         }
 
+        // Formula dependencies are re-extracted here to share registration with update/reindex paths.
         let referenced_names =
-            self.rebuild_name_dependencies(vertex_id, &named_range.definition, scope);
+            self.rebuild_name_dependencies(vertex_id, &named_range.definition, scope)?;
         if !referenced_names.is_empty() {
             self.attach_vertex_to_names(vertex_id, &referenced_names);
         }
@@ -225,6 +296,7 @@ impl DependencyGraph {
 
         self.name_vertex_lookup.insert(vertex_id, (scope, key));
         self.resolve_pending_name_references(scope, name);
+        self.bump_symbol_revision();
 
         Ok(())
     }
@@ -241,28 +313,68 @@ impl DependencyGraph {
         self.sheet_named_ranges.iter()
     }
 
-    pub fn resolve_name_entry(&self, name: &str, current_sheet: SheetId) -> Option<&NamedRange> {
-        if self.config.case_sensitive_names {
-            self.sheet_named_ranges
-                .get(&(current_sheet, name.to_string()))
-                .or_else(|| self.named_ranges.get(name))
-        } else {
-            let key = self.name_lookup_key(name);
-            self.sheet_named_ranges_lookup
-                .get(&(current_sheet, key.clone()))
-                .and_then(|canon| self.sheet_named_ranges.get(&(current_sheet, canon.clone())))
-                .or_else(|| {
-                    self.named_ranges_lookup
-                        .get(&key)
-                        .and_then(|canon| self.named_ranges.get(canon))
-                })
+    /// Resolve a name in an explicit [`NameScope`].
+    ///
+    /// [`NameScope::Sheet`] looks in that sheet's names first and falls back to
+    /// workbook scope, matching Excel's shadowing rules. [`NameScope::Workbook`]
+    /// looks in workbook-scoped names **only**: a sheet-scoped name is invisible
+    /// to a workbook-scope query even when it is scoped to the default sheet.
+    ///
+    /// This is the single owned derivation for name scoping. A caller with no
+    /// sheet context asks for [`NameScope::Workbook`], never for the default
+    /// sheet's scope - substituting the default sheet for missing context is
+    /// what leaked references onto unrelated sheets in issue #110.
+    pub fn resolve_name_entry_in_scope(&self, name: &str, scope: NameScope) -> Option<&NamedRange> {
+        let workbook_entry = || {
+            if self.config.case_sensitive_names {
+                self.named_ranges.get(name)
+            } else {
+                self.named_ranges_lookup
+                    .get(&self.name_lookup_key(name))
+                    .and_then(|canon| self.named_ranges.get(canon))
+            }
+        };
+
+        match scope {
+            NameScope::Workbook => workbook_entry(),
+            NameScope::Sheet(current_sheet) => {
+                if self.config.case_sensitive_names {
+                    self.sheet_named_ranges
+                        .get(&(current_sheet, name.to_string()))
+                        .or_else(workbook_entry)
+                } else {
+                    let key = self.name_lookup_key(name);
+                    self.sheet_named_ranges_lookup
+                        .get(&(current_sheet, key))
+                        .and_then(|canon| {
+                            self.sheet_named_ranges.get(&(current_sheet, canon.clone()))
+                        })
+                        .or_else(workbook_entry)
+                }
+            }
         }
+    }
+
+    /// Resolve a name as seen from `current_sheet`: sheet scope shadows
+    /// workbook scope. Equivalent to [`Self::resolve_name_entry_in_scope`] with
+    /// [`NameScope::Sheet`].
+    pub fn resolve_name_entry(&self, name: &str, current_sheet: SheetId) -> Option<&NamedRange> {
+        self.resolve_name_entry_in_scope(name, NameScope::Sheet(current_sheet))
     }
 
     /// Resolve a named range to its definition
     pub fn resolve_name(&self, name: &str, current_sheet: SheetId) -> Option<&NamedDefinition> {
         self.resolve_name_entry(name, current_sheet)
             .map(|nr| &nr.definition)
+    }
+
+    /// The folded lookup key (see [`Self::name_lookup_key`]) of the name
+    /// represented by `vertex`, if it is a name vertex. Used by SCC tasks for
+    /// deterministic member ordering and live name-read matching (RFC #112).
+    pub(crate) fn name_key_for_vertex(&self, vertex: VertexId) -> Option<String> {
+        self.name_vertex_lookup
+            .get(&vertex)
+            .map(|(_, name)| self.name_lookup_key(name))
     }
 
     pub fn named_range_by_vertex(&self, vertex: VertexId) -> Option<&NamedRange> {
@@ -301,10 +413,12 @@ impl DependencyGraph {
         };
 
         if let Some(dependents) = dependents_to_dirty {
-            // Mark all dependents as dirty
-            for vertex_id in dependents {
-                self.mark_vertex_dirty(vertex_id);
-            }
+            // Dirty every dependent WITH propagation (#365). A dependent may
+            // itself be a formula-backed name vertex; everything downstream of
+            // it has to recompute against the new binding. A non-propagating
+            // mark stops after one hop and leaves cells that read the
+            // dependent name serving stale values.
+            self.mark_dirty_many(&dependents);
 
             // Now update the definition
             let named_range = match scope {
@@ -315,7 +429,6 @@ impl DependencyGraph {
             let mut update_data: Option<(VertexId, NameScope, NamedDefinition, bool)> = None;
             if let Some(named_range) = named_range {
                 named_range.definition = new_definition;
-                named_range.dependents.clear();
                 let is_range = matches!(named_range.definition, NamedDefinition::Range(_));
                 update_data = Some((
                     named_range.vertex,
@@ -333,16 +446,18 @@ impl DependencyGraph {
                 } else {
                     self.store.set_kind(vertex, VertexKind::NamedScalar);
                 }
-                self.store.set_dirty(vertex, true);
-                self.dirty_vertices.insert(vertex);
 
                 let referenced_names =
-                    self.rebuild_name_dependencies(vertex, &definition_snapshot, scope_value);
+                    self.rebuild_name_dependencies(vertex, &definition_snapshot, scope_value)?;
                 if !referenced_names.is_empty() {
                     self.attach_vertex_to_names(vertex, &referenced_names);
                 }
+                // Propagate from the rebound name vertex itself, after its
+                // edges are current, so the transitive closure is reached.
+                self.mark_dirty_many(&[vertex]);
             }
 
+            self.bump_symbol_revision();
             Ok(())
         } else {
             Err(ExcelError::new(ExcelErrorKind::Name)
@@ -382,8 +497,30 @@ impl DependencyGraph {
                     affected.insert(*vertex_id);
                 }
             }
+            let formulas_to_rebuild = affected
+                .iter()
+                .filter(|&&vertex_id| self.get_cell_ref_for_vertex(vertex_id).is_some())
+                .filter_map(|&vertex_id| self.get_formula(vertex_id).map(|ast| (vertex_id, ast)))
+                .collect::<Vec<_>>();
+            // Symbol (name) vertices are excluded from `formulas_to_rebuild`
+            // by the cell-ref filter above, but a formula-backed name that
+            // referenced the deleted name needs the same treatment (#365):
+            // its dependency edges must be re-extracted so it re-resolves to
+            // #NAME? now and can be healed by a later define.
+            let names_to_rebuild = affected
+                .iter()
+                .filter(|&&vertex_id| vertex_id != named_range.vertex)
+                .filter_map(|&vertex_id| {
+                    self.named_range_by_vertex(vertex_id)
+                        .map(|nr| (vertex_id, nr.definition.clone(), nr.scope))
+                })
+                .collect::<Vec<_>>();
+            let dirty_sources = affected
+                .iter()
+                .copied()
+                .filter(|&vertex_id| vertex_id != named_range.vertex)
+                .collect::<Vec<_>>();
             for vertex_id in affected {
-                self.mark_vertex_dirty(vertex_id);
                 if let Some(names) = self.vertex_to_names.get_mut(&vertex_id) {
                     names.retain(|vid| *vid != named_range.vertex);
                     if names.is_empty() {
@@ -392,6 +529,25 @@ impl DependencyGraph {
                 }
             }
             self.mark_named_vertex_deleted(&named_range);
+            // Re-extract cell-formula dependencies after the registry entry is gone. This
+            // preserves fallback-to-workbook resolution for a deleted sheet name and records
+            // an unresolved pending-name link otherwise, allowing a later define to heal the
+            // formula without requiring re-ingest.
+            for (vertex_id, ast) in formulas_to_rebuild {
+                self.rebuild_formula_dependencies(vertex_id, &ast);
+            }
+            for (vertex_id, definition, name_scope) in names_to_rebuild {
+                let referenced_names =
+                    self.rebuild_name_dependencies(vertex_id, &definition, name_scope)?;
+                if !referenced_names.is_empty() {
+                    self.attach_vertex_to_names(vertex_id, &referenced_names);
+                }
+            }
+            // Dirty the affected set WITH propagation, once every dependency
+            // edge above is current, so cells reading a formula-backed
+            // dependent name recompute instead of serving a cached value.
+            self.mark_dirty_many(&dirty_sources);
+            self.bump_symbol_revision();
             Ok(())
         } else {
             Err(ExcelError::new(ExcelErrorKind::Name)
@@ -574,7 +730,19 @@ impl DependencyGraph {
         vertex: VertexId,
         definition: &NamedDefinition,
         scope: NameScope,
-    ) -> Vec<VertexId> {
+    ) -> Result<Vec<VertexId>, ExcelError> {
+        let formula_dependencies = if let NamedDefinition::Formula { ast, .. } = definition {
+            let current_sheet_id = match scope {
+                NameScope::Sheet(id) => id,
+                NameScope::Workbook => self.default_sheet_id,
+            };
+            let (dependencies, range_dependencies, _, _, _pending_names) =
+                self.extract_dependencies_with_pending_names(ast, current_sheet_id)?;
+            Some((dependencies, range_dependencies))
+        } else {
+            None
+        };
+
         self.remove_dependent_edges(vertex);
         self.unregister_name_cell_dependencies(vertex);
 
@@ -643,13 +811,13 @@ impl DependencyGraph {
             NamedDefinition::Literal(_) => {
                 // No dependencies.
             }
-            NamedDefinition::Formula {
-                dependencies: formula_deps,
-                range_deps,
-                ..
-            } => {
-                dependencies.extend(formula_deps.iter().copied());
-                range_dependencies.extend(range_deps.iter().cloned());
+            NamedDefinition::Formula { .. } => {
+                let Some((formula_deps, range_deps)) = formula_dependencies else {
+                    return Err(ExcelError::new(ExcelErrorKind::Error)
+                        .with_message("Internal error: formula dependencies were not extracted"));
+                };
+                dependencies.extend(formula_deps);
+                range_dependencies.extend(range_deps);
             }
         }
 
@@ -666,7 +834,7 @@ impl DependencyGraph {
             self.add_range_dependent_edges(vertex, &range_dependencies, sheet_id);
         }
 
-        dependencies
+        Ok(dependencies
             .iter()
             .filter(|vid| {
                 matches!(
@@ -675,7 +843,7 @@ impl DependencyGraph {
                 )
             })
             .copied()
-            .collect()
+            .collect())
     }
 
     pub fn adjust_named_ranges(
@@ -684,14 +852,82 @@ impl DependencyGraph {
     ) -> Result<(), ExcelError> {
         let adjuster = crate::engine::graph::editor::reference_adjuster::ReferenceAdjuster::new();
 
-        // Adjust workbook-scoped names
-        for named_range in self.named_ranges.values_mut() {
-            adjust_named_definition(&mut named_range.definition, &adjuster, operation)?;
+        let changed = !self.named_ranges.is_empty() || !self.sheet_named_ranges.is_empty();
+        // Workbook-scoped formulas bind unqualified references to the default sheet.
+        let workbook_context =
+            crate::engine::graph::editor::reference_adjuster::ReferenceContext::new(
+                self.default_sheet_id,
+                &self.sheet_reg,
+            );
+        // Adjust cloned definitions first so a future fallible definition kind
+        // cannot leave the name table half-adjusted.
+        let mut adjusted_named_ranges = self.named_ranges.clone();
+        let mut adjusted_sheet_named_ranges = self.sheet_named_ranges.clone();
+        for named_range in adjusted_named_ranges.values_mut() {
+            adjust_named_definition(
+                &mut named_range.definition,
+                &adjuster,
+                operation,
+                &workbook_context,
+            )?;
         }
 
-        // Adjust sheet-scoped names
-        for named_range in self.sheet_named_ranges.values_mut() {
-            adjust_named_definition(&mut named_range.definition, &adjuster, operation)?;
+        // Sheet-scoped formulas bind unqualified references to their scope sheet.
+        for ((scope_sheet_id, _), named_range) in adjusted_sheet_named_ranges.iter_mut() {
+            let context = crate::engine::graph::editor::reference_adjuster::ReferenceContext::new(
+                *scope_sheet_id,
+                &self.sheet_reg,
+            );
+            adjust_named_definition(&mut named_range.definition, &adjuster, operation, &context)?;
+        }
+        let changed_names: Vec<_> = adjusted_named_ranges
+            .iter()
+            .filter_map(|(key, adjusted)| {
+                self.named_ranges
+                    .get(key)
+                    .is_some_and(|current| current.definition != adjusted.definition)
+                    .then_some((adjusted.vertex, adjusted.scope, adjusted.definition.clone()))
+            })
+            .chain(
+                adjusted_sheet_named_ranges
+                    .iter()
+                    .filter_map(|(key, adjusted)| {
+                        self.sheet_named_ranges
+                            .get(key)
+                            .is_some_and(|current| current.definition != adjusted.definition)
+                            .then_some((
+                                adjusted.vertex,
+                                adjusted.scope,
+                                adjusted.definition.clone(),
+                            ))
+                    }),
+            )
+            .collect();
+        self.named_ranges = adjusted_named_ranges;
+        self.sheet_named_ranges = adjusted_sheet_named_ranges;
+        for &(vertex, scope, ref definition) in &changed_names {
+            self.detach_vertex_from_names(vertex);
+            self.store.set_kind(
+                vertex,
+                if matches!(definition, NamedDefinition::Range(_)) {
+                    VertexKind::NamedArray
+                } else {
+                    VertexKind::NamedScalar
+                },
+            );
+            let referenced_names = self.rebuild_name_dependencies(vertex, definition, scope)?;
+            if !referenced_names.is_empty() {
+                self.attach_vertex_to_names(vertex, &referenced_names);
+            }
+        }
+        self.mark_dirty_many(
+            &changed_names
+                .iter()
+                .map(|(vertex, _, _)| *vertex)
+                .collect::<Vec<_>>(),
+        );
+        if changed {
+            self.bump_symbol_revision();
         }
 
         Ok(())
@@ -710,7 +946,7 @@ impl DependencyGraph {
         self.store.mark_deleted(named_range.vertex, true);
         self.vertex_values.remove(&named_range.vertex);
         self.vertex_formulas.remove(&named_range.vertex);
-        self.dirty_vertices.remove(&named_range.vertex);
+        self.clear_formula_vertex_dirty(named_range.vertex);
         self.volatile_vertices.remove(&named_range.vertex);
         self.vertex_to_names.remove(&named_range.vertex);
         self.name_vertex_lookup.remove(&named_range.vertex);

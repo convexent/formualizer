@@ -1,4 +1,8 @@
 use crate::function::{FnCaps, Function};
+use crate::function_contract::{
+    FunctionArgumentDependencyContract, FunctionArityRule, FunctionDependencyClass,
+    FunctionDependencyContract,
+};
 use crate::interpreter::{LocalBinding, LocalEnv};
 use crate::traits::{ArgumentHandle, CalcValue, CustomCallable, FunctionContext};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
@@ -22,7 +26,7 @@ fn local_name_from_ast(node: &ASTNode) -> Result<String, ExcelError> {
 
 fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
     match cv {
-        CalcValue::Scalar(v) => LocalBinding::Value(v),
+        CalcValue::Scalar(v) | CalcValue::AnnotatedScalar(v, _) => LocalBinding::Value(v),
         CalcValue::Range(rv) => {
             let (rows, cols) = rv.dims();
             if rows == 1 && cols == 1 {
@@ -97,13 +101,13 @@ pub struct LetFn;
 /// Min args: 3
 /// Max args: variadic
 /// Variadic: true
-/// Signature: LET(<schema unavailable>)
-/// Arg schema: <unavailable: arg_schema panicked>
+/// Signature: LET(arg1...: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for LetFn {
     fn caps(&self) -> FnCaps {
-        FnCaps::PURE | FnCaps::SHORT_CIRCUIT
+        FnCaps::PURE | FnCaps::SHORT_CIRCUIT | FnCaps::LOCAL_ENVIRONMENT | FnCaps::MAY_SPILL
     }
 
     fn name(&self) -> &'static str {
@@ -116,6 +120,21 @@ impl Function for LetFn {
 
     fn variadic(&self) -> bool {
         true
+    }
+
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract {
+            class: FunctionDependencyClass::StaticScalarAllArgs,
+            arity: FunctionArityRule::OddAtLeast(3),
+            arguments: FunctionArgumentDependencyContract::LocalBindingPairs,
+        }
+        .for_arity(arity)
+    }
+
+    fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+        static SCHEMA: std::sync::LazyLock<Vec<crate::args::ArgSchema>> =
+            std::sync::LazyLock::new(|| vec![crate::args::ArgSchema::any()]);
+        &SCHEMA
     }
 
     fn dispatch<'a, 'b, 'c>(
@@ -243,13 +262,13 @@ pub struct LambdaFn;
 /// Min args: 1
 /// Max args: variadic
 /// Variadic: true
-/// Signature: LAMBDA(<schema unavailable>)
-/// Arg schema: <unavailable: arg_schema panicked>
+/// Signature: LAMBDA(arg1...: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for LambdaFn {
     fn caps(&self) -> FnCaps {
-        FnCaps::PURE | FnCaps::SHORT_CIRCUIT
+        FnCaps::PURE | FnCaps::SHORT_CIRCUIT | FnCaps::LOCAL_ENVIRONMENT | FnCaps::MAY_SPILL
     }
 
     fn name(&self) -> &'static str {
@@ -262,6 +281,21 @@ impl Function for LambdaFn {
 
     fn variadic(&self) -> bool {
         true
+    }
+
+    fn dependency_contract(&self, arity: usize) -> Option<FunctionDependencyContract> {
+        FunctionDependencyContract {
+            class: FunctionDependencyClass::StaticScalarAllArgs,
+            arity: FunctionArityRule::AtLeast(1),
+            arguments: FunctionArgumentDependencyContract::LambdaParameters,
+        }
+        .for_arity(arity)
+    }
+
+    fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+        static SCHEMA: std::sync::LazyLock<Vec<crate::args::ArgSchema>> =
+            std::sync::LazyLock::new(|| vec![crate::args::ArgSchema::any()]);
+        &SCHEMA
     }
 
     fn dispatch<'a, 'b, 'c>(
@@ -310,8 +344,8 @@ impl Function for LambdaFn {
 }
 
 pub fn register_builtins() {
-    crate::function_registry::register_function(Arc::new(LetFn));
-    crate::function_registry::register_function(Arc::new(LambdaFn));
+    crate::function_registry::register_builtin(Arc::new(LetFn));
+    crate::function_registry::register_builtin(Arc::new(LambdaFn));
 }
 
 #[cfg(test)]

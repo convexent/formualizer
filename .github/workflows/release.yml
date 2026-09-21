@@ -17,11 +17,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Set up pinned preflight Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.93.0
 
       - name: Verify product tag versions match manifests
         shell: bash
@@ -71,17 +78,27 @@ jobs:
           print(f"OK: v{tag_version} matches product manifests")
           PY
 
+      - name: Verify staged product package chain
+        run: python3 scripts/release-preflight.py --track product
+
   verify-parse:
     if: startsWith(github.ref_name, 'parse-v')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Set up pinned preflight Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.93.0
 
       - name: Verify parse/common tag versions match manifests
         shell: bash
@@ -125,17 +142,27 @@ jobs:
           print(f"OK: parse-v{tag_version} matches parser/common manifests")
           PY
 
+      - name: Verify staged parser/SDK package chain
+        run: python3 scripts/release-preflight.py --track parse
+
   verify-spec:
     if: startsWith(github.ref_name, 'sheetport-spec-v')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Set up pinned preflight Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.93.0
 
       - name: Verify spec tag version matches manifest
         shell: bash
@@ -161,6 +188,9 @@ jobs:
           print(f"OK: sheetport-spec-v{tag_version} matches manifest")
           PY
 
+      - name: Verify SheetPort spec package boundary
+        run: python3 scripts/release-preflight.py --track spec
+
   publish-parse-crates:
     if: startsWith(github.ref_name, 'parse-v')
     needs: verify-parse
@@ -174,7 +204,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
 
       - name: Publish parser/common crates
         env:
@@ -317,7 +347,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
 
       - name: Publish product crates
         env:
@@ -398,7 +428,9 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.11.5
           target: ${{ matrix.platform.target }}
+          rust-toolchain: 1.93.0
           args: --release --out dist --manifest-path bindings/python/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
@@ -427,7 +459,9 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.11.5
           target: ${{ matrix.platform.target }}
+          rust-toolchain: 1.93.0
           args: --release --out dist --manifest-path bindings/python/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
@@ -449,7 +483,9 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.11.5
           target: x64
+          rust-toolchain: 1.93.0
           args: --release --out dist --manifest-path bindings/python/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
@@ -477,7 +513,9 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.11.5
           target: ${{ matrix.platform.target }}
+          rust-toolchain: 1.93.0
           args: --release --out dist --manifest-path bindings/python/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
@@ -495,6 +533,7 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.11.5
           command: sdist
           args: --out dist --manifest-path bindings/python/Cargo.toml
       - name: Upload sdist
@@ -589,6 +628,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -596,7 +636,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -625,9 +665,7 @@ jobs:
 
       - name: Publish to npm
         working-directory: bindings/wasm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --ignore-scripts --access public
+        run: npm publish --ignore-scripts --access public --provenance
 
   github-release:
     if: startsWith(github.ref_name, 'v')

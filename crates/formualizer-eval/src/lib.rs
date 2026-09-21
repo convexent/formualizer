@@ -4,7 +4,10 @@ pub mod args;
 pub mod broadcast;
 pub mod coercion;
 pub mod error_policy;
+pub mod format;
+pub mod formula_plane;
 pub mod function;
+pub mod function_contract;
 pub mod function_registry;
 pub mod instant;
 pub mod interpreter;
@@ -25,6 +28,8 @@ pub use reference::SheetId;
 mod macros;
 #[cfg(test)]
 pub mod test_utils;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub mod test_workbook;
 
 pub mod engine;
