@@ -3240,3 +3240,64 @@ fn indexed_shared_admission_and_cancellation_do_not_publish_consumed_proof() {
     engine.build_graph_all().unwrap();
     assert_eq!(engine.baseline_stats().formula_plane_active_span_count, 2);
 }
+
+#[test]
+fn targeted_evaluation_materializes_cone_and_retains_unrelated_staging() {
+    // Regression for the 0.5.x -> 0.9.x `evaluate_cell` slowdown: clean
+    // re-reads must not re-pay per-call staged-region preparation, and
+    // must not drain unrelated staged formulas either.
+    let mut engine = engine(FormulaPlaneMode::Off);
+    engine.stage_formula_text("Inputs", 1, 1, "=1".into());
+    engine.stage_formula_text("Middle", 1, 2, "=Inputs!A1+1".into());
+    engine.stage_formula_text("Outputs", 1, 3, "=Middle!B1+1".into());
+    engine.stage_formula_text("Inputs", 10, 10, "=99".into());
+
+    assert_eq!(
+        engine.evaluate_cell("Outputs", 1, 3).unwrap(),
+        Some(LiteralValue::Number(3.0))
+    );
+    // The demanded chain is materialized; the unrelated staged formula is
+    // retained, matching the deferred-ingest contract.
+    assert_eq!(engine.staged_formula_count(), 1);
+    // A clean re-read computes nothing.
+    let reread = engine.evaluate_until(&[("Outputs", 1, 3)]).unwrap();
+    assert_eq!(reread.computed_vertices, 0);
+    // Staging a new formula at a precedent coordinate revokes the stamp:
+    // the next read materializes it and recomputes the dependent.
+    engine.stage_formula_text("Inputs", 1, 1, "=10".into());
+    assert_eq!(
+        engine.evaluate_cell("Outputs", 1, 3).unwrap(),
+        Some(LiteralValue::Number(12.0))
+    );
+}
+
+#[test]
+fn clean_targeted_evaluation_computes_nothing() {
+    // With no dirty or volatile vertices, `evaluate_until`/`evaluate_cell`
+    // must not recompute: the recipe fast path returns zero computed
+    // vertices and callers read stored values.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.add_sheet("S").unwrap();
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(2.0))
+        .unwrap();
+    engine
+        .set_cell_formula("S", 1, 2, formualizer_parse::parse("=A1*3").unwrap())
+        .unwrap();
+
+    let first = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert!(first.computed_vertices > 0);
+    let second = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert_eq!(second.computed_vertices, 0);
+
+    // A write re-dirties the cone; the next targeted eval computes again.
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    let third = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert!(third.computed_vertices > 0);
+    assert_eq!(
+        engine.evaluate_cell("S", 1, 2).unwrap(),
+        Some(LiteralValue::Number(15.0))
+    );
+}

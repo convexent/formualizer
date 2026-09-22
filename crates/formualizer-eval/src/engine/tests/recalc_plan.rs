@@ -565,10 +565,12 @@ fn target_probe_keeps_clean_ancestry_discovery_and_sparse_dirty_ownership() {
             0
         );
         let clean = engine.recalc_reuse_probe();
-        assert_eq!(clean.legacy_target_requests, 1);
-        assert_eq!(clean.demand_builds, 1);
-        assert_eq!(clean.demand_vertices, depth as usize + 4);
-        assert_eq!(clean.demand_clean_formulas, depth as usize + 2);
+        // Verified-clean targeted requests take the recipe fast path and
+        // skip ancestry discovery entirely — nothing could have computed.
+        assert_eq!(clean.legacy_target_requests, 0);
+        assert_eq!(clean.demand_builds, 0);
+        assert_eq!(clean.demand_vertices, 0);
+        assert_eq!(clean.demand_clean_formulas, 0);
         assert_eq!(clean.target_schedule_builds, 0);
         assert_eq!(clean.schedule_requests, 0);
 
