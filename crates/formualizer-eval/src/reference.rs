@@ -64,6 +64,17 @@ impl Coord {
         Self(RelativeCoord::new(row0, col0, row_abs, col_abs))
     }
 
+    /// Fallible 0-based constructor: reports overflow instead of panicking.
+    #[inline]
+    pub fn try_new(
+        row: u32,
+        col: u32,
+        row_abs: bool,
+        col_abs: bool,
+    ) -> Result<Self, formualizer_common::CoordError> {
+        RelativeCoord::try_new(row, col, row_abs, col_abs).map(Self)
+    }
+
     #[inline]
     pub fn row(self) -> u32 {
         self.0.row()

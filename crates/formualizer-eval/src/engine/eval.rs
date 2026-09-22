@@ -3515,9 +3515,19 @@ where
             )
         {
             // A completed full-workbook evaluation verifies every vertex
-            // against the staged formula index at once, so clean targeted
-            // reads can skip preparation until the index changes again.
-            self.staged_rev_at_last_full_eval = Some(self.staged_formula_index.revision());
+            // against the staged formula index at once — but only if it left
+            // nothing staged. Deferred builds drain staging during the pass;
+            // formulas staged explicitly under a non-deferred config survive
+            // evaluate_all and must still be materialized by targeted
+            // preparation, so the request-kind label alone is not proof.
+            self.staged_rev_at_last_full_eval = if self.staged_formulas.is_empty()
+                && self.staged_formula_index.ordinary_count() == 0
+                && !self.staged_formula_index.has_packages()
+            {
+                Some(self.staged_formula_index.revision())
+            } else {
+                None
+            };
         }
         result
     }
@@ -20602,8 +20612,17 @@ where
         self.prepare_and_execute_target_recipe(targets, &options, delta)
     }
 
-    /// Resolve a cell target's existing, non-tombstoned vertex.
+    /// Resolve a cell target's existing, non-tombstoned vertex. Returns None
+    /// for anything target preparation would reject — unknown sheet, zero or
+    /// out-of-range 1-based coordinates — so invalid targets fall through to
+    /// the normal path's own validation rather than being served (or aliased)
+    /// by the fast path. `Coord::from_excel` saturates zero to A1 and
+    /// `Coord::new` panics past the coordinate limits, so the bounds check
+    /// must run first.
     fn staged_verified_vertex(&self, sheet: &str, row: u32, col: u32) -> Option<VertexId> {
+        if row == 0 || col == 0 || Coord::try_new(row - 1, col - 1, true, true).is_err() {
+            return None;
+        }
         let sheet_id = self.graph.sheet_id(sheet)?;
         let coord = Coord::from_excel(row, col, true, true);
         self.graph
@@ -20642,15 +20661,19 @@ where
             // full path and its cycle-telemetry bookkeeping.
             return false;
         }
+        // Target validation stays ahead of the cache decision: every target
+        // must be a well-formed cell resolving to a live vertex, so invalid
+        // coordinates, unknown sheets, and non-cell targets (ranges, names,
+        // tables — including unresolved ones under OpaquePreparePolicy::Error)
+        // fall through to preparation's own error paths unchanged.
         let revision = self.staged_formula_index.revision();
-        if self.staged_rev_at_last_full_eval == Some(revision) {
-            return true;
-        }
+        let verified_by_full_eval = self.staged_rev_at_last_full_eval == Some(revision);
         targets.iter().all(|target| match target {
             crate::engine::EvaluationTarget::Cell { sheet, row, col } => self
                 .staged_verified_vertex(sheet, *row, *col)
                 .is_some_and(|vertex| {
-                    self.staged_verified_rev.get(&vertex).copied() == Some(revision)
+                    verified_by_full_eval
+                        || self.staged_verified_rev.get(&vertex).copied() == Some(revision)
                 }),
             _ => false,
         })
@@ -20683,6 +20706,11 @@ where
         // nothing. Callers then read stored values via get_cell_value,
         // which is what the full path would leave behind anyway.
         if self.targeted_request_is_clean(targets) {
+            // Keep the per-request lifecycle: telemetry reset, volatile clock
+            // sample, and iterative-redirty hygiene run even when the request
+            // computes nothing, so a zero-work read can't leak the previous
+            // request's cycle telemetry into last_cycle_telemetry().
+            self.begin_evaluation_request();
             return Ok(EvalResult {
                 computed_vertices: 0,
                 cycle_errors: 0,
