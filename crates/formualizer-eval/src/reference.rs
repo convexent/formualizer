@@ -66,7 +66,7 @@ impl Coord {
 
     /// Fallible 0-based constructor: reports overflow instead of panicking.
     #[inline]
-    pub fn try_new(
+    pub(crate) fn try_new(
         row: u32,
         col: u32,
         row_abs: bool,

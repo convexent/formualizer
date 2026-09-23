@@ -3403,10 +3403,12 @@ fn clean_targeted_read_resets_cycle_telemetry() {
     // The zero-work fast path still runs begin_evaluation_request, so a
     // clean re-read reports this request's telemetry rather than leaking
     // the previous request's cycle counts.
-    let mut config = EvalConfig::default();
-    config.cycle = crate::engine::CycleConfig {
-        detection: crate::engine::CycleDetection::Runtime,
-        policy: crate::engine::CyclePolicy::Error,
+    let config = EvalConfig {
+        cycle: crate::engine::CycleConfig {
+            detection: crate::engine::CycleDetection::Runtime,
+            policy: crate::engine::CyclePolicy::Error,
+        },
+        ..EvalConfig::default()
     };
     let mut engine = Engine::new(TestWorkbook::new(), config);
     engine.add_sheet("S").unwrap();
