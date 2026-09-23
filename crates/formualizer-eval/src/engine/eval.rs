@@ -1159,6 +1159,16 @@ pub struct Engine<R> {
     staged_formulas: StagedFormulaMap,
     /// Presence and generation authority for ordinary staged formula discovery.
     staged_formula_index: StagedFormulaIndex,
+    /// Staged-index revision at which each vertex's stored value was last
+    /// verified: a successful exact-scope targeted preparation proves the
+    /// target's precedent cone holds no unmaterialized staged formulas, so
+    /// while the index stays at that revision the stored value is final.
+    /// VertexIds are append-only and tombstoned in place, so stale entries
+    /// can never alias a different vertex.
+    staged_verified_rev: FxHashMap<VertexId, u64>,
+    /// Staged-index revision captured at the end of the last successful
+    /// full-workbook evaluation; a full pass verifies every vertex at once.
+    staged_rev_at_last_full_eval: Option<u64>,
     // Occupancy invalidation only: never a formula/read dependency.
     blocked_pending_spills: Vec<(VertexId, CellRef, Region)>,
     /// Per-sheet row visibility sidecar state.
@@ -3061,6 +3071,8 @@ where
             recalc_plan_token: Arc::new(()),
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
+            staged_verified_rev: FxHashMap::default(),
+            staged_rev_at_last_full_eval: None,
             blocked_pending_spills: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
@@ -3229,6 +3241,8 @@ where
             recalc_plan_token: Arc::new(()),
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
+            staged_verified_rev: FxHashMap::default(),
+            staged_rev_at_last_full_eval: None,
             blocked_pending_spills: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
@@ -3489,6 +3503,31 @@ where
             stats.phases.evaluation_ns = total_ns.saturating_sub(attributed);
             self.evaluation_resource_baseline.record_finished(&stats);
             self.last_evaluation_resource_request = Some(stats);
+        }
+        if outermost
+            && result.is_ok()
+            && matches!(
+                kind,
+                EvaluationRequestKind::Full
+                    | EvaluationRequestKind::FullCancellable
+                    | EvaluationRequestKind::FullWithDelta
+                    | EvaluationRequestKind::FullLogged
+            )
+        {
+            // A completed full-workbook evaluation verifies every vertex
+            // against the staged formula index at once — but only if it left
+            // nothing staged. Deferred builds drain staging during the pass;
+            // formulas staged explicitly under a non-deferred config survive
+            // evaluate_all and must still be materialized by targeted
+            // preparation, so the request-kind label alone is not proof.
+            self.staged_rev_at_last_full_eval = if self.staged_formulas.is_empty()
+                && self.staged_formula_index.ordinary_count() == 0
+                && !self.staged_formula_index.has_packages()
+            {
+                Some(self.staged_formula_index.revision())
+            } else {
+                None
+            };
         }
         result
     }
@@ -20573,14 +20612,126 @@ where
         self.prepare_and_execute_target_recipe(targets, &options, delta)
     }
 
+    /// Resolve a cell target's existing, non-tombstoned vertex. Returns None
+    /// for anything target preparation would reject — unknown sheet, zero or
+    /// out-of-range 1-based coordinates — so invalid targets fall through to
+    /// the normal path's own validation rather than being served (or aliased)
+    /// by the fast path. `Coord::from_excel` saturates zero to A1 and
+    /// `Coord::new` panics past the coordinate limits, so the bounds check
+    /// must run first.
+    fn staged_verified_vertex(&self, sheet: &str, row: u32, col: u32) -> Option<VertexId> {
+        if row == 0 || col == 0 || Coord::try_new(row - 1, col - 1, true, true).is_err() {
+            return None;
+        }
+        let sheet_id = self.graph.sheet_id(sheet)?;
+        let coord = Coord::from_excel(row, col, true, true);
+        self.graph
+            .get_vertex_id_for_address(&CellRef::new(sheet_id, coord))
+            .copied()
+            .filter(|&vertex| self.graph.vertex_exists_active(vertex))
+    }
+
+    /// True when a targeted evaluation request can only observe stored
+    /// values: no dirty or volatile vertices anywhere, no pending dirty
+    /// events or edge deltas, no deferred-dirty scope, no FormulaPlane spans
+    /// tracking their own freshness, and every target already verified
+    /// against the staged formula index at its current revision. Volatile
+    /// cells and non-retained iterating SCC members are re-dirtied at the
+    /// end of every recalc (`redirty_for_next_recalc`), so an empty
+    /// evaluation set means the full recipe below would compute nothing.
+    ///
+    /// The staged check is what makes this sound with `defer_graph_building`:
+    /// a staged formula at a still-unmaterialized precedent coordinate does
+    /// not dirty its dependents, so "clean" alone cannot rule out pending
+    /// staged work in a target's cone. Successful exact-scope preparation
+    /// stamps the target vertex at `staged_verified_rev`; any later staging
+    /// bumps the index revision and revokes the stamp.
+    fn targeted_request_is_clean(&self, targets: &[crate::engine::EvaluationTarget]) -> bool {
+        if !self.graph.get_evaluation_vertices().is_empty()
+            || self.graph.pending_formula_dirty_event_count() != 0
+            || self.graph.edges_delta_size() != 0
+            || self.graph.deferred_dirty_active()
+            || self.graph.formula_authority().active_span_count() != 0
+            || !self.retained_scc_members.is_empty()
+            || !self.iterative_state_values.is_empty()
+        {
+            // Retained converged SCC members stay clean by design, so an
+            // empty evaluation set cannot distinguish "nothing pending"
+            // from "iterative state to serve"; those workbooks keep the
+            // full path and its cycle-telemetry bookkeeping.
+            return false;
+        }
+        // Target validation stays ahead of the cache decision: every target
+        // must be a well-formed cell resolving to a live vertex, so invalid
+        // coordinates, unknown sheets, and non-cell targets (ranges, names,
+        // tables — including unresolved ones under OpaquePreparePolicy::Error)
+        // fall through to preparation's own error paths unchanged.
+        let revision = self.staged_formula_index.revision();
+        let verified_by_full_eval = self.staged_rev_at_last_full_eval == Some(revision);
+        targets.iter().all(|target| match target {
+            crate::engine::EvaluationTarget::Cell { sheet, row, col } => self
+                .staged_verified_vertex(sheet, *row, *col)
+                .is_some_and(|vertex| {
+                    verified_by_full_eval
+                        || self.staged_verified_rev.get(&vertex).copied() == Some(revision)
+                }),
+            _ => false,
+        })
+    }
+
+    /// Record that each cell target's stored value was verified against the
+    /// staged formula index at its current revision, so clean re-reads can
+    /// skip preparation entirely.
+    fn stamp_targets_staged_verified(&mut self, targets: &[crate::engine::EvaluationTarget]) {
+        let revision = self.staged_formula_index.revision();
+        for target in targets {
+            if let crate::engine::EvaluationTarget::Cell { sheet, row, col } = target
+                && let Some(vertex) = self.staged_verified_vertex(sheet, *row, *col)
+            {
+                self.staged_verified_rev.insert(vertex, revision);
+            }
+        }
+    }
+
     fn prepare_and_execute_target_recipe(
         &mut self,
         targets: &[crate::engine::EvaluationTarget],
         options: &crate::engine::TargetEvalOptions<'_>,
         delta: Option<&mut DeltaCollector>,
     ) -> Result<EvalResult, ExcelError> {
+        // Fast path: with no evaluation work pending and every target
+        // verified against the staged formula index, recipe preparation and
+        // the per-target cone walk are pure overhead — both are
+        // O(precedent cone) per call even when the request computes
+        // nothing. Callers then read stored values via get_cell_value,
+        // which is what the full path would leave behind anyway.
+        if self.targeted_request_is_clean(targets) {
+            // Keep the per-request lifecycle: telemetry reset, volatile clock
+            // sample, and iterative-redirty hygiene run even when the request
+            // computes nothing, so a zero-work read can't leak the previous
+            // request's cycle telemetry into last_cycle_telemetry().
+            self.begin_evaluation_request();
+            return Ok(EvalResult {
+                computed_vertices: 0,
+                cycle_errors: 0,
+                elapsed: crate::instant::FzInstant::now().elapsed(),
+            });
+        }
         let preparation = self.prepare_graph_for_routed_evaluation(targets, options)?;
-        self.execute_prepared_target_recipe(targets, &preparation.widened_scope, delta)
+        let exact = matches!(
+            preparation.widened_scope,
+            crate::engine::PrepareScope::Exact
+        );
+        let result =
+            self.execute_prepared_target_recipe(targets, &preparation.widened_scope, delta)?;
+        if exact {
+            // An exact-scope preparation walked the whole cone without
+            // hitting dynamic references, opaque constructs, or staged
+            // packages — the targets' values are verified against the
+            // staged index at its current revision.
+            self.stamp_targets_staged_verified(targets);
+        }
+        Ok(result)
     }
 
     fn execute_prepared_target_recipe(

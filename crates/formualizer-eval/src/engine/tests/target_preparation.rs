@@ -3240,3 +3240,191 @@ fn indexed_shared_admission_and_cancellation_do_not_publish_consumed_proof() {
     engine.build_graph_all().unwrap();
     assert_eq!(engine.baseline_stats().formula_plane_active_span_count, 2);
 }
+
+#[test]
+fn targeted_evaluation_materializes_cone_and_retains_unrelated_staging() {
+    // Regression for the 0.5.x -> 0.9.x `evaluate_cell` slowdown: clean
+    // re-reads must not re-pay per-call staged-region preparation, and
+    // must not drain unrelated staged formulas either.
+    let mut engine = engine(FormulaPlaneMode::Off);
+    engine.stage_formula_text("Inputs", 1, 1, "=1".into());
+    engine.stage_formula_text("Middle", 1, 2, "=Inputs!A1+1".into());
+    engine.stage_formula_text("Outputs", 1, 3, "=Middle!B1+1".into());
+    engine.stage_formula_text("Inputs", 10, 10, "=99".into());
+
+    assert_eq!(
+        engine.evaluate_cell("Outputs", 1, 3).unwrap(),
+        Some(LiteralValue::Number(3.0))
+    );
+    // The demanded chain is materialized; the unrelated staged formula is
+    // retained, matching the deferred-ingest contract.
+    assert_eq!(engine.staged_formula_count(), 1);
+    // A clean re-read computes nothing.
+    let reread = engine.evaluate_until(&[("Outputs", 1, 3)]).unwrap();
+    assert_eq!(reread.computed_vertices, 0);
+    // Staging a new formula at a precedent coordinate revokes the stamp:
+    // the next read materializes it and recomputes the dependent.
+    engine.stage_formula_text("Inputs", 1, 1, "=10".into());
+    assert_eq!(
+        engine.evaluate_cell("Outputs", 1, 3).unwrap(),
+        Some(LiteralValue::Number(12.0))
+    );
+}
+
+#[test]
+fn clean_targeted_evaluation_computes_nothing() {
+    // With no dirty or volatile vertices, `evaluate_until`/`evaluate_cell`
+    // must not recompute: the recipe fast path returns zero computed
+    // vertices and callers read stored values.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.add_sheet("S").unwrap();
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(2.0))
+        .unwrap();
+    engine
+        .set_cell_formula("S", 1, 2, formualizer_parse::parse("=A1*3").unwrap())
+        .unwrap();
+
+    let first = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert!(first.computed_vertices > 0);
+    let second = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert_eq!(second.computed_vertices, 0);
+
+    // A write re-dirties the cone; the next targeted eval computes again.
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    let third = engine.evaluate_until(&[("S", 1, 2)]).unwrap();
+    assert!(third.computed_vertices > 0);
+    assert_eq!(
+        engine.evaluate_cell("S", 1, 2).unwrap(),
+        Some(LiteralValue::Number(15.0))
+    );
+}
+
+#[test]
+fn full_eval_stamp_does_not_skip_target_validation() {
+    // A completed evaluate_all publishes the global staged-verification
+    // stamp, but the clean fast path must still route invalid or non-cell
+    // targets through preparation's own validation — a blanket
+    // Ok(computed: 0) would silently drop the errors the normal path
+    // produces for them.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.add_sheet("S").unwrap();
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_formula("S", 1, 2, formualizer_parse::parse("=A1+1").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.evaluate_cell("S", 1, 2).unwrap(),
+        Some(LiteralValue::Number(2.0))
+    );
+
+    // Unknown sheet and zero coordinate keep producing preparation's
+    // #REF errors rather than a clean no-op result.
+    for target in [cell("Missing", 1, 1), cell("S", 0, 1)] {
+        assert_eq!(
+            engine.evaluate_targets(&[target]).unwrap_err().kind,
+            formualizer_common::ExcelErrorKind::Ref
+        );
+    }
+    // A range on a missing sheet errors the same way.
+    assert_eq!(
+        engine
+            .evaluate_targets(&[EvaluationTarget::Range(
+                RangeAddress::new("Missing", 1, 1, 2, 2).unwrap()
+            )])
+            .unwrap_err()
+            .kind,
+        formualizer_common::ExcelErrorKind::Ref
+    );
+    // Unresolved name and table targets under the strict opaque policy
+    // still error instead of being served as clean.
+    let strict = TargetEvalOptions {
+        opaque_policy: OpaquePreparePolicy::Error,
+        ..Default::default()
+    };
+    for target in [
+        EvaluationTarget::Name {
+            name: "NoSuchName".into(),
+            scope_sheet: None,
+        },
+        EvaluationTarget::Table {
+            name: "NoSuchTable".into(),
+            selection: TableSelection::Whole,
+        },
+    ] {
+        assert!(
+            engine
+                .evaluate_targets_with_options(&[target], strict.clone())
+                .is_err(),
+            "unresolved target must error under OpaquePreparePolicy::Error"
+        );
+    }
+}
+
+#[test]
+fn staged_formulas_surviving_full_eval_are_not_globally_verified() {
+    // With defer_graph_building off (the default), stage_formula_text
+    // content survives evaluate_all — the pass never verified vertices
+    // against it, so it must not publish the global staged-verification
+    // stamp. The targeted read then materializes the staged precedent and
+    // recomputes the dependent instead of serving the stale value.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.add_sheet("S").unwrap();
+    engine
+        .set_cell_value("S", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_formula("S", 1, 2, formualizer_parse::parse("=A1+1").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.evaluate_cell("S", 1, 2).unwrap(),
+        Some(LiteralValue::Number(2.0))
+    );
+
+    engine.stage_formula_text("S", 1, 1, "=10".into());
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.staged_formula_count(), 1);
+
+    assert_eq!(
+        engine.evaluate_cell("S", 1, 2).unwrap(),
+        Some(LiteralValue::Number(11.0))
+    );
+    assert_eq!(engine.staged_formula_count(), 0);
+}
+
+#[test]
+fn clean_targeted_read_resets_cycle_telemetry() {
+    // The zero-work fast path still runs begin_evaluation_request, so a
+    // clean re-read reports this request's telemetry rather than leaking
+    // the previous request's cycle counts.
+    let config = EvalConfig {
+        cycle: crate::engine::CycleConfig {
+            detection: crate::engine::CycleDetection::Runtime,
+            policy: crate::engine::CyclePolicy::Error,
+        },
+        ..EvalConfig::default()
+    };
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    engine.add_sheet("S").unwrap();
+    engine
+        .set_cell_formula("S", 1, 1, formualizer_parse::parse("=B1+1").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("S", 1, 2, formualizer_parse::parse("=A1+1").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert!(engine.last_cycle_telemetry().circ_cells_stamped > 0);
+
+    let result = engine.evaluate_until(&[("S", 1, 1)]).unwrap();
+    assert_eq!(result.computed_vertices, 0);
+    assert_eq!(
+        engine.last_cycle_telemetry(),
+        &crate::engine::CycleTelemetry::default()
+    );
+}
