@@ -4,6 +4,12 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+## [0.9.5] - 2026-09-23
+
+### Fixed
+
+- **Restored the clean-cell fast path for targeted evaluation.** Since the 0.9.x transactional-target-preparation rework, every `evaluate_cell`/`evaluate_cells` call re-ran routed recipe preparation — an O(precedent-cone) walk with per-vertex staged-formula lease checks — even when the request computed nothing, contrary to the documented "clean and non-volatile → no recomputation" contract. On a 3,800-cell deferred-build workbook a clean second pass cost ~2.1s vs ~0s on 0.5.12 (p50 ~30µs, tail ~360ms per call). Targeted reads now skip preparation when nothing is pending and each target's cone is verified against the `StagedFormulaIndex` at its current revision: exact-scope preparations stamp target vertices, a fully-drained `evaluate_all` verifies all vertices at once, and any staging mutation bumps the revision and revokes the proof. Lazy staging is preserved — unrelated staged formulas are never materialized by a targeted read — and retained iterative SCCs, FormulaPlane spans, pending dirty events/edge deltas, and non-cell targets all keep the full path. Clean re-read pass: ~0.15s vs 2.06s; repeated same-cell reads ~0.6µs vs 2.4µs. (#26)
+
 ## [0.9.4] - 2026-09-21
 
 - Aligned Rust product crates and Python/npm bindings at 0.9.4 (bumped from 0.9.3, which was already published on crates.io with different source, to publish this fork's changes). Parser/common remain at 3.1.2, SheetPort spec remains 0.3.1.
