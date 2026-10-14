@@ -2844,58 +2844,48 @@ impl Function for UniqueFn {
         };
 
         if by_col {
-            #[derive(Hash, Eq, PartialEq, Clone)]
-            struct ColKey(Vec<LiteralValue>);
-
-            let mut order: Vec<ColKey> = Vec::new();
-            let mut counts: HashMap<ColKey, usize> = HashMap::new();
-
-            for c in 0..cols {
-                let mut col_vals: Vec<LiteralValue> = Vec::with_capacity(rows);
-                for r in 0..rows {
-                    col_vals.push(view.get_cell(r, c));
-                }
-                let key = ColKey(col_vals);
-                if !counts.contains_key(&key) {
-                    order.push(key.clone());
-                }
-                *counts.entry(key).or_insert(0) += 1;
-            }
-
-            let mut out: Vec<Vec<LiteralValue>> = Vec::new();
-            for k in order {
-                if !exactly_once || counts.get(&k) == Some(&1) {
-                    out.push(k.0);
-                }
-            }
+            let entries = (0..cols)
+                .map(|c| (0..rows).map(|r| view.get_cell(r, c)).collect())
+                .collect();
+            let out = unique_entries(entries, exactly_once);
             return Ok(collapse_if_scalar(out, _ctx.date_system()));
         }
 
-        #[derive(Hash, Eq, PartialEq, Clone)]
-        struct RowKey(Vec<LiteralValue>);
-
-        let mut order: Vec<RowKey> = Vec::new();
-        let mut counts: HashMap<RowKey, usize> = HashMap::new();
-        for r in 0..rows {
-            let mut row_vals: Vec<LiteralValue> = Vec::with_capacity(cols);
-            for c in 0..cols {
-                row_vals.push(view.get_cell(r, c));
-            }
-            let key = RowKey(row_vals);
-            if !counts.contains_key(&key) {
-                order.push(key.clone());
-            }
-            *counts.entry(key).or_insert(0) += 1;
-        }
-
-        let mut out: Vec<Vec<LiteralValue>> = Vec::new();
-        for k in order {
-            if !exactly_once || counts.get(&k) == Some(&1) {
-                out.push(k.0);
-            }
-        }
+        let entries = (0..rows)
+            .map(|r| (0..cols).map(|c| view.get_cell(r, c)).collect())
+            .collect();
+        let out = unique_entries(entries, exactly_once);
         Ok(collapse_if_scalar(out, _ctx.date_system()))
     }
+}
+
+/// Distinct rows (or columns) in first-occurrence order, as Excel's UNIQUE
+/// returns them. Text compares case-insensitively, as in Excel: "Alpha" and
+/// "alpha" are one entry, and the first spelling seen is the one returned.
+fn unique_entries(entries: Vec<Vec<LiteralValue>>, exactly_once: bool) -> Vec<Vec<LiteralValue>> {
+    fn fold(v: &LiteralValue) -> LiteralValue {
+        match v {
+            LiteralValue::Text(s) => LiteralValue::Text(s.to_lowercase()),
+            other => other.clone(),
+        }
+    }
+
+    let mut order: Vec<(Vec<LiteralValue>, Vec<LiteralValue>)> = Vec::new();
+    let mut counts: HashMap<Vec<LiteralValue>, usize> = HashMap::new();
+    for entry in entries {
+        let key: Vec<LiteralValue> = entry.iter().map(fold).collect();
+        let count = counts.entry(key.clone()).or_insert(0);
+        if *count == 0 {
+            order.push((key, entry));
+        }
+        *count += 1;
+    }
+
+    order
+        .into_iter()
+        .filter(|(key, _)| !exactly_once || counts.get(key) == Some(&1))
+        .map(|(_, entry)| entry)
+        .collect()
 }
 
 /* ───────────────────────── SEQUENCE() ───────────────────────── */
@@ -4197,6 +4187,86 @@ mod tests {
             }
             _ => panic!("expected array"),
         }
+    }
+
+    #[test]
+    fn unique_ignores_letter_case_like_excel() {
+        let wb = TestWorkbook::new().with_function(Arc::new(UniqueFn));
+        let wb = wb
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Text("Alpha".into()))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Text("alpha".into()))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Text("ALPHA".into()))
+            .with_cell_a1("Sheet1", "A4", LiteralValue::Text("Beta".into()))
+            .with_cell_a1("Sheet1", "A5", LiteralValue::Text("Gamma".into()))
+            .with_cell_a1("Sheet1", "A6", LiteralValue::Text("gAMMA".into()))
+            .with_cell_a1("Sheet1", "A7", LiteralValue::Text("Émile".into()))
+            .with_cell_a1("Sheet1", "A8", LiteralValue::Text("émile".into()));
+        let ctx = wb.interpreter();
+        let range = range("A1:A8", 1, 1, 8, 1);
+        let f = ctx.context.get_function("", "UNIQUE").unwrap();
+
+        let args = vec![ArgumentHandle::new(&range, &ctx)];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        let text = |s: &str| vec![LiteralValue::Text(s.into())];
+        match v {
+            LiteralValue::Array(a) => assert_eq!(
+                a,
+                vec![text("Alpha"), text("Beta"), text("Gamma"), text("Émile")],
+                "first spelling of each case-insensitive value, in order"
+            ),
+            other => panic!("expected array got {other:?}"),
+        }
+
+        // exactly_once counts case variants as repeats of one value.
+        let by_col = lit(LiteralValue::Boolean(false));
+        let once = lit(LiteralValue::Boolean(true));
+        let args = vec![
+            ArgumentHandle::new(&range, &ctx),
+            ArgumentHandle::new(&by_col, &ctx),
+            ArgumentHandle::new(&once, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Text("Beta".into()));
+    }
+
+    #[test]
+    fn unique_by_col_ignores_letter_case() {
+        let wb = TestWorkbook::new().with_function(Arc::new(UniqueFn));
+        let wb = wb
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Text("North".into()))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Text("NORTH".into()))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Text("South".into()));
+        let ctx = wb.interpreter();
+        let range = range("A1:C1", 1, 1, 1, 3);
+        let f = ctx.context.get_function("", "UNIQUE").unwrap();
+        let by_col = lit(LiteralValue::Boolean(true));
+        let args = vec![
+            ArgumentHandle::new(&range, &ctx),
+            ArgumentHandle::new(&by_col, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        // Only which columns survive is asserted here; by_col results are
+        // emitted one column per output row, which predates this test.
+        let kept: Vec<LiteralValue> = match v {
+            LiteralValue::Array(a) => a.into_iter().flatten().collect(),
+            other => panic!("expected array got {other:?}"),
+        };
+        assert_eq!(
+            kept,
+            vec![
+                LiteralValue::Text("North".into()),
+                LiteralValue::Text("South".into())
+            ]
+        );
     }
 
     #[test]
