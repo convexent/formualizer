@@ -4,6 +4,12 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+## [0.9.6] - 2026-10-14
+
+### Fixed
+
+- **`UNIQUE` compares text case-insensitively, as Excel does.** Rows (or columns, with `by_col`) were keyed on the raw cell values, so `"Alpha"`, `"alpha"` and `"ALPHA"` were three entries where Excel returns one. Text is now folded with the same lower-casing the lookup functions use, for the comparison only: the first spelling seen is the one returned, and `exactly_once` counts case variants as repeats of one value. (#28)
+
 ## [0.9.5] - 2026-09-23
 
 ### Fixed
