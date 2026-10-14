@@ -2844,16 +2844,12 @@ impl Function for UniqueFn {
         };
 
         if by_col {
-            let entries = (0..cols)
-                .map(|c| (0..rows).map(|r| view.get_cell(r, c)).collect())
-                .collect();
+            let entries = (0..cols).map(|c| (0..rows).map(|r| view.get_cell(r, c)).collect());
             let out = unique_entries(entries, exactly_once);
             return Ok(collapse_if_scalar(out, _ctx.date_system()));
         }
 
-        let entries = (0..rows)
-            .map(|r| (0..cols).map(|c| view.get_cell(r, c)).collect())
-            .collect();
+        let entries = (0..rows).map(|r| (0..cols).map(|c| view.get_cell(r, c)).collect());
         let out = unique_entries(entries, exactly_once);
         Ok(collapse_if_scalar(out, _ctx.date_system()))
     }
@@ -2862,7 +2858,11 @@ impl Function for UniqueFn {
 /// Distinct rows (or columns) in first-occurrence order, as Excel's UNIQUE
 /// returns them. Text compares case-insensitively, as in Excel: "Alpha" and
 /// "alpha" are one entry, and the first spelling seen is the one returned.
-fn unique_entries(entries: Vec<Vec<LiteralValue>>, exactly_once: bool) -> Vec<Vec<LiteralValue>> {
+/// Entries are consumed one at a time, so only distinct entries are retained.
+fn unique_entries(
+    entries: impl IntoIterator<Item = Vec<LiteralValue>>,
+    exactly_once: bool,
+) -> Vec<Vec<LiteralValue>> {
     fn fold(v: &LiteralValue) -> LiteralValue {
         match v {
             LiteralValue::Text(s) => LiteralValue::Text(s.to_lowercase()),
